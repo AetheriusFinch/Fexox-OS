@@ -12,6 +12,16 @@ mkdir -p build
 CFLAGS_KERN="-I. -IResources -target x86_64-unknown-none-elf -ffreestanding -fno-builtin -mno-red-zone -mcmodel=kernel -fno-pie -fno-stack-protector -mgeneral-regs-only -O0 -g -Wall -Wextra -std=c11"
 LDFLAGS_KERN="-m elf_x86_64 -nostdlib -T kernel.ld"
 
+# Userspace-приложения (калькулятор и т.п.) — ОТДЕЛЬНАЯ цель от ядра:
+# без -mcmodel=kernel (это не kernel-модуль, а обычный ET_EXEC для
+# ring3), без -mgeneral-regs-only (не нужно — не ISR), статическая
+# линковка без libc, свой _start (см. SysApps/calc.c). ELF64.c поддерживает
+# только статический ET_EXEC/ET_DYN без PT_INTERP — поэтому -static
+# -fno-pic -no-pie: обычный non-PIE исполняемый файл с фиксированными
+# адресами по умолчанию (ld.lld сам выберет типичную базу ~0x400000).
+CFLAGS_USER="-target x86_64-unknown-none-elf -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -O0 -g -Wall -Wextra -std=c11"
+LDFLAGS_USER="-m elf_x86_64 -static -nostdlib -e _start"
+
 MGW="x86_64-w64-mingw32-gcc"
 command -v $MGW >/dev/null || { echo "[!] $MGW не найден"; exit 1; }
 
@@ -57,6 +67,11 @@ $LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
     build/PS2Mouse.o        \
 	build/AcpiControl.o     \
 	build/fxapp.o
+
+echo "[*] Калькулятор (userspace, отдельно от ядра)..."
+$CC $CFLAGS_USER -c SysApps/calc.c -o build/calc.o
+$LD_KERN $LDFLAGS_USER -o build/calc.elf build/calc.o
+ls -lh build/calc.elf
 
 echo "[*] Загрузчик UEFI..."
 $MGW $CFLAGS_BOOT -c bootloader.c -o build/bootloader.o
@@ -128,9 +143,16 @@ if command -v mformat >/dev/null; then
     else
         echo "[!] Папка APPS/ не найдена — .fxapp манифесты не будут скопированы (не критично)"
     fi
+
+    # calc.elf — собранный ВЫШЕ (см. секцию "Калькулятор"), кладём его в
+    # ::APPS независимо от того, есть ли локальная папка APPS/ — это
+    # артефакт сборки, а не файл из исходников.
+    mmd -i build/data.img ::APPS 2>/dev/null || true
+    mcopy -i build/data.img build/calc.elf ::APPS/calc.elf
+    echo "[OK] build/calc.elf -> ::APPS/calc.elf"
 else
     echo "[!] mtools нет — pacman -S mingw-w64-ucrt-x86_64-mtools"
 fi
 
-echo "[+] build/kernel.bin  build/bootloader.efi  build/esp.img  build/data.img"
+echo "[+] build/kernel.bin  build/bootloader.efi  build/esp.img  build/data.img  build/calc.elf"
 echo "=== Готово ==="

@@ -35,6 +35,11 @@
  *   503 — sys_shm_get
  *   504 — sys_shm_at
  *   505 — sys_shm_detach
+ *   600 — sys_win_create   (кастомный FEXOS: title, w, h -> win_id)
+ *   601 — sys_win_close    (win_id)
+ *   602 — sys_win_move     (win_id, x, y)
+ *   603 — sys_win_get_rect (win_id, sc_win_rect_t* out)
+ *   604 — sys_input_poll   (sc_input_t* out — мышь: x/y экранные + кнопки)
  *
  * Соглашение о вызовах (System V AMD64):
  *   syscall#  : rax
@@ -90,6 +95,11 @@
 #define SYS_SHM_GET       503
 #define SYS_SHM_AT        504
 #define SYS_SHM_DETACH    505
+#define SYS_WIN_CREATE    600  /* кастомный: создать окно (title, w, h) -> win_id */
+#define SYS_WIN_CLOSE     601  /* win_id */
+#define SYS_WIN_MOVE      602  /* win_id, x, y */
+#define SYS_WIN_GET_RECT  603  /* win_id, sc_win_rect_t* — область содержимого окна */
+#define SYS_INPUT_POLL    604  /* sc_input_t* — позиция мыши (экранные координаты) + кнопки */
 
 /* =========================================================================
  * Коды ошибок (отрицательные, как в POSIX)
@@ -219,7 +229,38 @@ typedef struct {
     uint32_t pitch;       /* байт на строку */
     uint32_t bpp;         /* бит на пиксель (4 = VGA text, 32 = linear) */
     uint8_t  mode;        /* 0 = VGA text 80x25, 1 = linear framebuffer */
+    /* Сдвиги R/G/B каналов внутри 32-битного пикселя (mode == 1 —
+     * реальный GOP framebuffer; для VGA text не имеют смысла, оба 0).
+     * native_pixel = (r << r_shift) | (g << g_shift) | (b << b_shift).
+     * Порядок каналов зависит от прошивки/видеокарты и заранее
+     * НЕ гарантирован — всегда собирать пиксель через эти сдвиги, а не
+     * предполагать фиксированный RGBA/BGRA. */
+    uint8_t  r_shift, g_shift, b_shift;
 } sc_framebuffer_t;
+
+/* =========================================================================
+ * sys_win_get_rect (603) — область содержимого окна (НИЖЕ заголовка),
+ * в АБСОЛЮТНЫХ координатах экрана/framebuffer — то же пространство
+ * координат, в котором лежит указатель из sys_get_framebuffer.
+ * ========================================================================= */
+typedef struct {
+    int32_t  x, y;
+    uint32_t w, h;
+} sc_win_rect_t;
+
+/* =========================================================================
+ * sys_input_poll (604) — состояние мыши. x/y — АБСОЛЮТНЫЕ экранные
+ * координаты (как и sc_win_rect_t выше) — приложение само вычитает
+ * координаты своего окна, чтобы получить локальные. buttons — те же
+ * биты, что у ps2_mouse_buttons() (bit0=LMB, bit1=RMB, bit2=MMB).
+ * Курсорной "истории"/очереди событий нет — только текущее сырое
+ * состояние; edge-detection (клик = переход "не было -> есть")
+ * приложение делает само, сравнивая с предыдущим опросом.
+ * ========================================================================= */
+typedef struct {
+    int32_t x, y;
+    uint8_t buttons;
+} sc_input_t;
 
 /* =========================================================================
  * Публичный API (вызывается из syscall_dispatch в main.c)

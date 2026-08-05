@@ -23,6 +23,11 @@ int ui_extra_init(void);
 /* Текущая позиция курсора (top-left угла картинки курсора) */
 void ui_set_mouse_pos(int32_t x, int32_t y);
 
+/* Текущая позиция курсора (та же, что установлена последним
+ * ui_set_mouse_pos) — используется sc_input_poll() в Syscall.c, чтобы
+ * отдавать позицию мыши userspace-приложениям. */
+void ui_get_mouse_pos(int32_t *out_x, int32_t *out_y);
+
 /* Вызывать из таймерного тика (ожидается ~100 Гц / SCHED_TIMESLICE).
  * Сама определяет, когда обновлять часы (1 раз/сек) и курсор. */
 void ui_tick(void);

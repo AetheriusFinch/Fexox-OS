@@ -76,14 +76,34 @@ static inline uint32_t ctz64(uint64_t v) {
 #endif
 }
 
-/* Spinlock — пустая реализация для UP (прерывания запрещены на уровне ядра) */
+/* Spinlock — раньше был пустой no-op в расчёте на то, что "прерывания
+ * запрещены на уровне ядра" (UP). Это допущение перестало выполняться, как
+ * только где-то в main.c начинает работать sti() — kmalloc/pmm/vmm-код
+ * вызывается постоянно и дальше, уже с ВКЛЮЧЁННЫМИ прерываниями. Клик мышью
+ * обрабатывается в IRQ-контексте и может дойти до elf64_spawn() (масса
+ * kmalloc-вызовов) прямо ПОСРЕДИ kmalloc()/pmm/vmm-вызова в основном потоке
+ * — без реальной блокировки это рекурсивно ломает внутренние структуры кучи
+ * на середине обновления. Теперь acquire реально выключает прерывания (и
+ * запоминает, был ли включён IF), release включает обратно только если он
+ * был включён — безопасно и при вызове изнутри уже прерванного контекста. */
 typedef volatile uint32_t spinlock_t;
 static inline void spinlock_init(spinlock_t *l) { *l = 0; }
 static inline void spinlock_acquire(spinlock_t *l) {
-    (void)l;
+    uint64_t flags;
+    __asm__ volatile (
+        "pushfq\n\t"
+        "pop %0\n\t"
+        "cli\n\t"
+        : "=r"(flags)
+        :
+        : "memory"
+    );
+    *l = (uint32_t)flags;
 }
 static inline void spinlock_release(spinlock_t *l) {
-    (void)l;
+    if (*l & 0x200) {
+        __asm__ volatile ("sti" ::: "memory");
+    }
 }
 
 /* ==========================================================================
@@ -167,7 +187,15 @@ int pmm_init_from_efi(const efi_memory_desc_t *map, size_t map_size, size_t desc
     g_pmm.words = (uint64_t *)(uintptr_t)bm_pa;
 
     kmemset(g_pmm.words, 0xFF, g_pmm.num_words * sizeof(uint64_t));
-    for (size_t i = 0; i < bm_pages; i++) pmm_clear((bm_pa >> PAGE_SHIFT) + i);
+    /* ВАЖНО: страницы, на которых лежит сам битмап (g_pmm.words), должны
+     * остаться "занятыми" — они и так помечены как used исходным
+     * 0xFF-заполнением выше. Раньше здесь стоял pmm_clear() по этим же
+     * страницам, то есть аллокатор считал их свободными и мог выдать их
+     * pmm_alloc_frame()'ом под что угодно (PML4, kmalloc-кучу, сегмент
+     * ELF и т.д.) — первая же запись в такую "свежевыделенную" страницу
+     * стирала бы часть самого битмапа, после чего pmm начинал путать
+     * занято/свободно и выдавать одну и ту же физическую страницу
+     * дважды под разные структуры. Никакого действия здесь не требуется. */
 
     spinlock_init(&g_pmm.lock);
     for (size_t i = 0; i < map_size; i += desc_size) {
@@ -300,36 +328,100 @@ static inline void *phys_access(phys_addr_t pa) {
 int vmm_map(virt_addr_t va, phys_addr_t pa, uint64_t flags);
 int vmm_unmap(virt_addr_t va);
 
+/* pa_in_ram — физический адрес реально лежит в границах RAM, которую
+ * нашёл pmm_init_from_efi (total_frames). Используется И для "уже
+ * присутствующих" записей (см. комментарий ниже), И — что оказалось
+ * важнее — для СВЕЖЕВЫДЕЛЕННЫХ pmm_alloc_frame(): раньше код проверял
+ * только pa == (phys_addr_t)-1 (полный отказ выделить), но НЕ проверял
+ * что успешно "выделенный" pa вообще похож на разумный адрес внутри
+ * реальной памяти — если тут баг где-то в pmm-аллокаторе (или просто
+ * физическая память кончилась не тем способом, что даёт чистый -1),
+ * kmemset() на такой pa падает тем же самым #GP, но ещё ДО того как
+ * запись вообще попадает в таблицу — то есть первая версия проверки
+ * (только на "уже присутствует") эту ветку вообще не защищала. */
+static inline bool pa_in_ram(phys_addr_t pa) {
+    return (pa >> PAGE_SHIFT) < g_pmm.total_frames;
+}
+
 static pte_t *vmm_walk_table(pte_t *pml4, virt_addr_t va, bool create) {
     size_t idx_p4 = PML4_IDX(va);
     size_t idx_p3 = PDPT_IDX(va);
     size_t idx_p2 = PD_IDX(va);
     size_t idx_p1 = PT_IDX(va);
 
+    /* ВАЖНО: PTE_U здесь, на ПРОМЕЖУТОЧНЫХ уровнях (PML4E/PDPTE/PDE) —
+     * не опционально. У x86-64 бит User/Supervisor проверяется на КАЖДОМ
+     * уровне трансляции адреса, а не только в конечном PTE: если хотя бы
+     * один уровень выше не имеет PTE_U, весь путь трактуется как
+     * supervisor-only и ring3-доступ по нему получит page fault,
+     * независимо от того, что выставлено в листовом PTE у vmm_map_user().
+     * Раньше здесь стояло PTE_P | PTE_W без PTE_U — то есть ЛЮБАЯ user
+     * страница, для которой требовалось впервые создать промежуточные
+     * таблицы (что происходит для каждого нового процесса/региона
+     * адресного пространства, ранее не тронутого), реально оставалась
+     * недоступной из ring3. Здесь это не ослабляет защиту ядра: PTE_U
+     * на промежуточном уровне лишь РАЗРЕШАЕТ user-доступ, если он ЕЩЁ
+     * разрешён и на конечном PTE — chisto kernel-only маппинги
+     * (vmm_map(), а не vmm_map_user()) листовой PTE_U не ставят вообще,
+     * так что для них ничего не меняется. */
     if (!(pml4[idx_p4] & PTE_P)) {
         if (!create) return NULL;
         phys_addr_t pa = pmm_alloc_frame();
-        if (pa == (phys_addr_t)-1) return NULL;
+        if (pa == (phys_addr_t)-1 || !pa_in_ram(pa)) {
+            DBG_VAL("VMM", "vmm_walk_table: pmm_alloc_frame(PML4E) вернул мусор, pa", (uint64_t)pa);
+            return NULL;
+        }
         kmemset(phys_access(pa), 0, PAGE_SIZE);
-        pml4[idx_p4] = pte_make(pa, PTE_P | PTE_W);
+        pml4[idx_p4] = pte_make(pa, PTE_P | PTE_W | PTE_U);
     }
-    pte_t *p3t = (pte_t *)phys_access(pml4[idx_p4] & PTE_ADDR_MASK);
+    /* Защита от "мусорной" записи: если под каким-то индексом лежит
+     * непроинициализированная физическая память вида 0xFFFFFFFF...
+     * (бывает при нехватке физической памяти на pmm_alloc_frame или при
+     * первом же обращении к ранее нетронутой ветке адресного
+     * пространства), бит Present (bit0) у неё СЛУЧАЙНО тоже окажется 1 —
+     * код ниже принял бы её за валидную таблицу и разыменовал
+     * phys_access() от бессмысленного адреса, получив неканонический
+     * указатель и #GP без единой диагностической строки в логе. Вместо
+     * слепого доверия проверяем, что извлечённый физический адрес
+     * реально лежит в границах памяти, которую нашёл pmm_init_from_efi. */
+    phys_addr_t p3_pa = pml4[idx_p4] & PTE_ADDR_MASK;
+    if (!pa_in_ram(p3_pa)) {
+        DBG_VAL("VMM", "vmm_walk_table: PML4E указывает за пределы RAM, pa", (uint64_t)p3_pa);
+        return NULL;
+    }
+    pte_t *p3t = (pte_t *)phys_access(p3_pa);
     if (!(p3t[idx_p3] & PTE_P)) {
         if (!create) return NULL;
         phys_addr_t pa = pmm_alloc_frame();
-        if (pa == (phys_addr_t)-1) return NULL;
+        if (pa == (phys_addr_t)-1 || !pa_in_ram(pa)) {
+            DBG_VAL("VMM", "vmm_walk_table: pmm_alloc_frame(PDPTE) вернул мусор, pa", (uint64_t)pa);
+            return NULL;
+        }
         kmemset(phys_access(pa), 0, PAGE_SIZE);
-        p3t[idx_p3] = pte_make(pa, PTE_P | PTE_W);
+        p3t[idx_p3] = pte_make(pa, PTE_P | PTE_W | PTE_U);
     }
-    pte_t *p2t = (pte_t *)phys_access(p3t[idx_p3] & PTE_ADDR_MASK);
+    phys_addr_t p2_pa = p3t[idx_p3] & PTE_ADDR_MASK;
+    if (!pa_in_ram(p2_pa)) {
+        DBG_VAL("VMM", "vmm_walk_table: PDPTE указывает за пределы RAM, pa", (uint64_t)p2_pa);
+        return NULL;
+    }
+    pte_t *p2t = (pte_t *)phys_access(p2_pa);
     if (!(p2t[idx_p2] & PTE_P)) {
         if (!create) return NULL;
         phys_addr_t pa = pmm_alloc_frame();
-        if (pa == (phys_addr_t)-1) return NULL;
+        if (pa == (phys_addr_t)-1 || !pa_in_ram(pa)) {
+            DBG_VAL("VMM", "vmm_walk_table: pmm_alloc_frame(PDE) вернул мусор, pa", (uint64_t)pa);
+            return NULL;
+        }
         kmemset(phys_access(pa), 0, PAGE_SIZE);
-        p2t[idx_p2] = pte_make(pa, PTE_P | PTE_W);
+        p2t[idx_p2] = pte_make(pa, PTE_P | PTE_W | PTE_U);
     }
-    pte_t *p1t = (pte_t *)phys_access(p2t[idx_p2] & PTE_ADDR_MASK);
+    phys_addr_t p1_pa = p2t[idx_p2] & PTE_ADDR_MASK;
+    if (!pa_in_ram(p1_pa)) {
+        DBG_VAL("VMM", "vmm_walk_table: PDE указывает за пределы RAM, pa", (uint64_t)p1_pa);
+        return NULL;
+    }
+    pte_t *p1t = (pte_t *)phys_access(p1_pa);
     return &p1t[idx_p1];
 }
 
@@ -451,6 +543,36 @@ int vmm_unmap(virt_addr_t va) {
     if (g_vmm.paging_active) cpu_invlpg(va);
     spinlock_release(&g_vmm.lock);
     return 0;
+}
+
+/* vmm_virt_to_phys — настоящий перевод kva -> pa через обход таблиц
+ * страниц, а НЕ через "kva - DIRECT_MAP_OFFSET".
+ *
+ * ВАЖНО: последнее верно ТОЛЬКО для памяти, попавшей в исходные
+ * статические 4 ГиБ direct-map, установленные один раз в vmm_init()
+ * строго 1:1 (pa -> DIRECT_MAP_OFFSET+pa). Как только куча (kmalloc)
+ * растёт за эти 4 ГиБ через km_expand(), это перестаёт быть верным:
+ * km_expand берёт физический фрейм через pmm_alloc_frames() (может
+ * оказаться где угодно в физической памяти), а виртуальный адрес
+ * просто монотонно продолжает g_km.heap_end — соответствия "смещение
+ * = разница" для такой памяти в общем случае НЕТ. Именно на этом
+ * ошибочном допущении раньше был построен sc_get_framebuffer() в
+ * Syscall.c: back buffer (kmalloc'нутый, а к моменту его выделения
+ * куча УЖЕ выросла за 4 ГиБ) переводился в "pa" неверно, из-за чего
+ * userspace-маппинг framebuffer'а указывал на случайную чужую
+ * физическую страницу — писать в неё можно было без page fault (это
+ * просто другая валидная RAM-страница), но эффекта на экране это не
+ * давало, потому что fb_flip() копирует совсем другую физическую
+ * страницу (ту, что реально стоит в PTE у back-buffer'а).
+ *
+ * Возвращает (phys_addr_t)-1, если va не замаплен вообще. */
+phys_addr_t vmm_virt_to_phys(virt_addr_t va) {
+    spinlock_acquire(&g_vmm.lock);
+    pte_t *entry = vmm_walk_table(g_vmm.kernel_pml4, va & PAGE_MASK, false);
+    if (!entry || !(*entry & PTE_P)) { spinlock_release(&g_vmm.lock); return (phys_addr_t)-1; }
+    phys_addr_t pa = (*entry & PTE_ADDR_MASK) | (va & ~PAGE_MASK);
+    spinlock_release(&g_vmm.lock);
+    return pa;
 }
 
 void vmm_activate(void) {
@@ -701,6 +823,25 @@ void kfree(void *ptr) {
         return;
     }
     km_block_t *b = (km_block_t *)((uint8_t *)ptr - sizeof(km_block_t));
+
+    /* ВРЕМЕННЫЙ дамп — убрать после отладки. Печатаем ВСЁ содержимое
+     * заголовка блока ДО того, как что-либо с ним делаем — если тут
+     * мусор (не 0/1 в free, огромный/нулевой size, дикие адреса в
+     * next/prev/phys_prev), значит заголовок был испорчен ДО вызова
+     * kfree (переполнение буфера где-то в самой структуре, например в
+     * elf64_spawn_arg_t) — и падать будем на первой же операции с этим
+     * мусором, независимо от того, насколько "правильно" защищён сам
+     * kfree/km_list_unlink. */
+    DBG_VAL("KM", "kfree: ptr", (uint64_t)(uintptr_t)ptr);
+    DBG_VAL("KM", "kfree: block hdr addr", (uint64_t)(uintptr_t)b);
+    DBG_VAL("KM", "kfree: b->size", (uint64_t)b->size);
+    DBG_VAL("KM", "kfree: b->free", (uint64_t)b->free);
+    DBG_VAL("KM", "kfree: b->next", (uint64_t)(uintptr_t)b->next);
+    DBG_VAL("KM", "kfree: b->prev", (uint64_t)(uintptr_t)b->prev);
+    DBG_VAL("KM", "kfree: b->phys_prev", (uint64_t)(uintptr_t)b->phys_prev);
+    DBG_VAL("KM", "kfree: g_km.heap_end", (uint64_t)g_km.heap_end);
+    DBG_VAL("KM", "kfree: g_km.last_block", (uint64_t)(uintptr_t)g_km.last_block);
+
     if (b->free) return; /* защита от double-free */
 
     spinlock_acquire(&g_km.lock);
@@ -708,8 +849,10 @@ void kfree(void *ptr) {
     g_km.heap_used -= b->size + sizeof(km_block_t);
 
     /* --- Слияние с физически СЛЕДУЮЩИМ блоком (если он свободен) --- */
+    DBG_MSG("KM", "kfree: checkpoint before next-merge");
     km_block_t *next = (km_block_t *)((uint8_t *)b + sizeof(km_block_t) + b->size);
     if ((uint8_t *)next < (uint8_t *)g_km.heap_end && next->free) {
+        DBG_MSG("KM", "kfree: checkpoint next-merge taken");
         km_list_unlink(next);           /* корректно убираем next из ЛЮБОЙ позиции в его free-list */
         b->size += sizeof(km_block_t) + next->size;
 
@@ -719,13 +862,16 @@ void kfree(void *ptr) {
         } else {
             g_km.last_block = b;         /* next был последним блоком кучи */
         }
+        DBG_MSG("KM", "kfree: checkpoint next-merge done");
     }
 
     /* --- Слияние с физически ПРЕДЫДУЩИМ блоком (если он свободен) ---
      * Используем НАСТОЯЩИЙ физический указатель phys_prev, а не next/prev
      * (которые относятся только к free-list и могут быть "грязными"). */
+    DBG_MSG("KM", "kfree: checkpoint before prev-merge");
     km_block_t *prevb = b->phys_prev;
     if (prevb && prevb->free) {
+        DBG_MSG("KM", "kfree: checkpoint prev-merge taken");
         km_list_unlink(prevb);
         prevb->size += sizeof(km_block_t) + b->size;
 
@@ -736,9 +882,12 @@ void kfree(void *ptr) {
             g_km.last_block = prevb;
         }
         b = prevb; /* объединённый блок теперь представлен prevb */
+        DBG_MSG("KM", "kfree: checkpoint prev-merge done");
     }
 
+    DBG_MSG("KM", "kfree: checkpoint before km_insert_free");
     km_insert_free(b);
+    DBG_MSG("KM", "kfree: checkpoint done, releasing lock");
     spinlock_release(&g_km.lock);
 }
 

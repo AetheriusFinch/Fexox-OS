@@ -57,17 +57,34 @@ extern uint32_t fb_height(void);
 extern uint64_t fb_phys_addr(void);
 extern uint32_t fb_pitch(void);
 extern uint8_t  fb_bpp(void);
+extern void    *fb_back_ptr(void);   /* задний буфер — ИМЕННО его должен
+                                       * видеть userspace, а не фронт-буфер
+                                       * (fb_phys_addr): в ЭТОТ буфер рисует
+                                       * ядро и его же fb_flip() каждый тик
+                                       * копирует на реальный экран — если
+                                       * замаппить userspace фронт-буфер,
+                                       * следующий тик тут же затрёт всё,
+                                       * что нарисовало приложение. */
+extern void     fb_get_channel_shifts(uint8_t *r_shift, uint8_t *g_shift, uint8_t *b_shift);
 #define FB_MODE_LINEAR_ 2   /* совпадает с FB_MODE_LINEAR из Framebuffer.h */
 
 extern int  ui_win_create(const char *title, uint32_t w, uint32_t h, int32_t owner_pid);
 extern int  ui_win_close(int win_id);
 extern int  ui_win_move(int win_id, int32_t x, int32_t y);
 extern void ui_win_close_all_owned_by(int32_t owner_pid);
+extern bool ui_win_get_rect(int win_id, int32_t *out_x, int32_t *out_y,
+                            uint32_t *out_w, uint32_t *out_h);
+
+/* --- PS2Mouse.c: состояние кнопок мыши; позиция — из ui_extra.c --- */
+extern uint8_t ps2_mouse_buttons(void);
+extern void    ui_get_mouse_pos(int32_t *out_x, int32_t *out_y);
 extern uint64_t pmm_alloc_frames(size_t count, size_t align);
 extern void     pmm_free_frames(uint64_t pa, size_t count);
 extern int      vmm_map_user(uint64_t va, uint64_t pa, bool rw, bool exec);
 extern int      vmm_map(uint64_t va, uint64_t pa, uint64_t flags);
 extern int      vmm_unmap(uint64_t va);
+extern uint64_t vmm_virt_to_phys(uint64_t va);  /* реальный обход таблиц страниц,
+                                                     см. комментарий в MemoryControl.c */
 
 /* klibc */
 extern void  *memset(void *dst, int c, size_t n);
@@ -89,25 +106,10 @@ extern int    strncmp(const char *a, const char *b, size_t n);
 /* Граница user virtual address space */
 #define USER_VIRT_LIMIT     0x00007FFFFFFFFFFFULL
 
-/* =========================================================================
- * Оконные системные вызовы — номера.
- *
- * ВАЖНО: определены здесь через #ifndef, чтобы не конфликтовать, если
- * они уже объявлены в Syscall.h. Правильное место для них — Syscall.h
- * (вместе с остальными SYS_*), рядом с SYS_GET_FRAMEBUFFER; секцию ниже
- * стоит перенести туда же при следующей правке заголовка, а также
- * продублировать в userspace libc-заголовке syscall-номеров, которым
- * пользуются .fxapp/ELF-приложения.
- * ========================================================================= */
-#ifndef SYS_WIN_CREATE
-#define SYS_WIN_CREATE   600
-#endif
-#ifndef SYS_WIN_CLOSE
-#define SYS_WIN_CLOSE    601
-#endif
-#ifndef SYS_WIN_MOVE
-#define SYS_WIN_MOVE     602
-#endif
+/* Оконные/input syscall'ы (SYS_WIN_CREATE/CLOSE/MOVE/GET_RECT,
+ * SYS_INPUT_POLL) и структуры sc_win_rect_t/sc_input_t для них теперь
+ * определены в Syscall.h — как и остальные SYS_*, рядом с
+ * SYS_GET_FRAMEBUFFER. */
 
 /* Heap растёт вверх от этой базы (per-process в реальном ядре — здесь глобально) */
 #define USER_HEAP_BASE      0x0000000010000000ULL
@@ -1251,12 +1253,22 @@ static int64_t sc_shm_detach(uint64_t va, uint64_t shm_idx_arg) {
 /* -----------------------------------------------------------------------
  * sys_get_framebuffer (500)
  *
- * Возвращает реальный GOP linear framebuffer (см. Framebuffer.c: g_fb),
- * если экран инициализирован в FB_MODE_LINEAR — то есть настоящие
- * width/height/pitch/bpp и физический адрес буфера. Именно это нужно
- * userspace-приложениям (в т.ч. будущему полноценному My Computer.elf),
- * чтобы рисовать напрямую в кадр через собственный mmap физического
- * адреса (sc_mmap с MAP_PHYS/аналогом — см. память ниже).
+ * Возвращает реальный GOP linear framebuffer (см. Framebuffer.c: g_fb) и
+ * — что раньше НЕ делалось — реально маппит его в адресное пространство
+ * ВЫЗЫВАЮЩЕГО процесса через vmm_map_user, так что fb->virt_addr — это
+ * настоящий, разыменовываемый из userspace указатель, а не просто
+ * "значение для справки" (как было в старом комментарии здесь).
+ *
+ * ВАЖНО: маппим ЗАДНИЙ буфер (fb_back_ptr), а НЕ физический адрес
+ * переднего/видимого буфера (fb_phys_addr). Это разные вещи, если
+ * включен двойной буфер (fb_enable_double_buffer — на нём же рисует и
+ * само ядро): в задний буфер пишет ядро (fb_put_pixel и т.п.), а
+ * fb_flip() каждый тик копирует его целиком на реальный экран. Если бы
+ * userspace писал прямо в передний буфер, следующий же fb_flip()
+ * затёр бы нарисованное содержимым заднего буфера, ничего не зная про
+ * чужие пиксели. А раз пишем в ТОТ ЖЕ буфер, что и ядро — тиковый
+ * fb_flip() подхватывает нарисованное само, без отдельного syscall'а
+ * "показать кадр".
  *
  * Если экран не в linear-режиме (например ещё не инициализирован, или
  * GOP недоступен) — отдаём VGA text buffer (0xB8000, 80x25) как и раньше,
@@ -1264,6 +1276,8 @@ static int64_t sc_shm_detach(uint64_t va, uint64_t shm_idx_arg) {
  *
  * a1 = sc_framebuffer_t* (из user space)
  * ----------------------------------------------------------------------- */
+#define FB_USER_VA_BASE   0x0000700000000000ULL
+
 static int64_t sc_get_framebuffer(uint64_t fb_ptr) {
     if (!syscall_validate_ptr((void *)(uintptr_t)fb_ptr, sizeof(sc_framebuffer_t)))
         return -(int64_t)EFAULT;
@@ -1271,21 +1285,61 @@ static int64_t sc_get_framebuffer(uint64_t fb_ptr) {
     sc_framebuffer_t *fb = (sc_framebuffer_t *)(uintptr_t)fb_ptr;
 
     if (fb_get_mode() == FB_MODE_LINEAR_ && fb_phys_addr() != 0) {
-        fb->phys_addr = fb_phys_addr();
-        /* virt_addr — DIRECT_MAP-адрес того же физического буфера в
-         * адресном пространстве ЯДРА; userspace всё равно должен сам
-         * замаппить fb->phys_addr к себе через sc_mmap (физический
-         * маппинг), поэтому здесь достаточно продублировать phys_addr —
-         * значение поля "для справки", не для прямого разыменования
-         * из userspace. */
-        fb->virt_addr = fb_phys_addr();
+        void *back = fb_back_ptr();
+        if (!back) {
+            DBG_MSG("SC", "sys_get_framebuffer: double-buffer выключен, нечего маппить");
+            return -(int64_t)ENOMEM;
+        }
+
+        /* ВАЖНО: раньше здесь стояло "back_pa = back - DIRECT_MAP_OFFSET",
+         * в предположении kva = pa + DIRECT_MAP_OFFSET. Это верно ТОЛЬКО
+         * для исходных статических 4 ГиБ direct-map (vmm_init, строго
+         * 1:1). Как только куча kmalloc растёт за эти 4 ГиБ через
+         * km_expand() (MemoryControl.c) — а back buffer выделяется
+         * именно оттуда, куча к этому моменту уже давно больше 4 ГиБ —
+         * km_expand берёт физический фрейм через pmm_alloc_frames()
+         * (может оказаться где угодно в RAM) и просто монотонно
+         * продолжает виртуальный адрес; "смещение = разница" для такой
+         * памяти в общем случае НЕ держится. Из-за этого userspace-
+         * маппинг framebuffer'а указывал на случайную чужую физическую
+         * страницу — писать в неё можно было без page fault (валидная
+         * RAM), но эффекта на экране это не давало: fb_flip() копирует
+         * совсем другую физическую страницу — ту, что реально стоит в
+         * PTE у back buffer'а. Настоящий физический адрес можно узнать
+         * только обходом таблиц страниц. */
+        uint64_t back_pa = vmm_virt_to_phys((uint64_t)(uintptr_t)back);
+        if (back_pa == (uint64_t)-1) {
+            DBG_MSG("SC", "sys_get_framebuffer: vmm_virt_to_phys(back) failed — back buffer не замаплен?!");
+            return -(int64_t)ENOMEM;
+        }
+        uint32_t pitch     = fb_pitch();
+        uint32_t height    = fb_height();
+        uint64_t fb_bytes  = (uint64_t)pitch * (uint64_t)height;
+
+        uint64_t page_base = ROUND_DOWN(back_pa, PAGE_SIZE);
+        uint64_t page_off  = back_pa - page_base;
+        uint64_t npages    = (fb_bytes + page_off + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        for (uint64_t i = 0; i < npages; i++) {
+            int r = vmm_map_user(FB_USER_VA_BASE + (i << PAGE_SHIFT),
+                                 page_base + (i << PAGE_SHIFT),
+                                 true /* rw */, false /* exec */);
+            if (r != 0) {
+                DBG_MSG("SC", "sys_get_framebuffer: vmm_map_user failed");
+                return -(int64_t)ENOMEM;
+            }
+        }
+
+        fb->phys_addr = back_pa;
+        fb->virt_addr = FB_USER_VA_BASE + page_off;  /* реальный юзер-указатель */
         fb->width     = fb_width();
-        fb->height    = fb_height();
-        fb->pitch     = fb_pitch();
+        fb->height    = height;
+        fb->pitch     = pitch;
         fb->bpp       = fb_bpp();
         fb->mode      = 1;   /* 1 = linear GOP framebuffer */
+        fb_get_channel_shifts(&fb->r_shift, &fb->g_shift, &fb->b_shift);
 
-        DBG_MSG("SC", "sys_get_framebuffer: linear GOP");
+        DBG_MSG("SC", "sys_get_framebuffer: linear GOP (back buffer mapped)");
         return 0;
     }
 
@@ -1296,6 +1350,7 @@ static int64_t sc_get_framebuffer(uint64_t fb_ptr) {
     fb->pitch     = VGA_TEXT_COLS * 2;  /* 2 байта на символ */
     fb->bpp       = 4;                  /* VGA text: 4 bpp (2 байта: char + attr) */
     fb->mode      = 0;                  /* 0 = VGA text mode 80x25 */
+    fb->r_shift = fb->g_shift = fb->b_shift = 0;   /* не имеет смысла для VGA text */
 
     DBG_MSG("SC", "sys_get_framebuffer: VGA fallback (linear FB не готов)");
     return 0;
@@ -1358,6 +1413,40 @@ static int64_t sc_win_move(uint64_t win_id, uint64_t x, uint64_t y) {
     return 0;
 }
 
+/* sys_win_get_rect (603, a1 = win_id, a2 = sc_win_rect_t*) — область
+ * содержимого окна (ниже заголовка), нужна userspace-приложению, чтобы
+ * знать, по каким координатам в общем framebuffer'е (см.
+ * sys_get_framebuffer) рисовать себя — окна создаются с автоматическим
+ * каскадным смещением (см. ui_win_create), заранее координаты неизвестны. */
+static int64_t sc_win_get_rect(uint64_t win_id, uint64_t rect_ptr) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)rect_ptr, sizeof(sc_win_rect_t)))
+        return -(int64_t)EFAULT;
+
+    sc_win_rect_t *out = (sc_win_rect_t *)(uintptr_t)rect_ptr;
+    int32_t x, y; uint32_t w, h;
+    if (!ui_win_get_rect((int)win_id, &x, &y, &w, &h))
+        return -(int64_t)EINVAL;
+
+    out->x = x; out->y = y; out->w = w; out->h = h;
+    return 0;
+}
+
+/* sys_input_poll (604, a1 = sc_input_t*) — текущее сырое состояние
+ * мыши (см. sc_input_t в Syscall.h). Единственный источник ввода,
+ * доступный userspace-приложениям на сегодня — клавиатуры пока нет. */
+static int64_t sc_input_poll(uint64_t input_ptr) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)input_ptr, sizeof(sc_input_t)))
+        return -(int64_t)EFAULT;
+
+    sc_input_t *out = (sc_input_t *)(uintptr_t)input_ptr;
+    int32_t x, y;
+    ui_get_mouse_pos(&x, &y);
+    out->x = x;
+    out->y = y;
+    out->buttons = ps2_mouse_buttons();
+    return 0;
+}
+
 /* =========================================================================
  * Главный диспетчер
  * ========================================================================= */
@@ -1408,6 +1497,8 @@ int64_t syscall_dispatch(uint64_t nr,
     case SYS_WIN_CREATE:      return sc_win_create(a1, a2, a3, a4);
     case SYS_WIN_CLOSE:       return sc_win_close(a1);
     case SYS_WIN_MOVE:        return sc_win_move(a1, a2, a3);
+    case SYS_WIN_GET_RECT:    return sc_win_get_rect(a1, a2);
+    case SYS_INPUT_POLL:      return sc_input_poll(a1);
     default:
         DBG_VAL("SC", "unknown syscall", nr);
         return -(int64_t)ENOSYS;

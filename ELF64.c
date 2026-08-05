@@ -140,6 +140,7 @@ int elf64_validate_header(const Elf64_Ehdr *ehdr) {
  * ========================================================================= */
 extern void *memset(void *dst, int c, size_t n);
 extern void *memcpy(void *dst, const void *src, size_t n);
+extern size_t strlen(const char *s);
 
 /* =========================================================================
  * elf64_load
@@ -150,8 +151,23 @@ int elf64_load(const char *path, elf64_image_t *out) {
     /* --- Обнуляем результат --- */
     memset(out, 0, sizeof(elf64_image_t));
 
-    /* --- Открываем файл --- */
+    /* --- Открываем файл ---
+     * ВАЖНО: vfs_open() в этой VFS не резолвит путь без ведущего "/"
+     * (тот же паттерн уже встречался с UI/cursor.png и иконками —
+     * см. fxapp_load_png_asset в Framebuffer.c, которая пробует оба
+     * варианта). Делаем то же самое здесь сами: если путь без "/" не
+     * открылся, пробуем с ним — тогда вызывающему коду (fxapp/.fxapp
+     * манифесты, APPS/*.elf) не нужно об этом помнить самому. */
     int fd = vfs_open(path, O_RDONLY);
+    if (fd < 0 && path[0] != '/') {
+        char abspath[256];
+        size_t n = strlen(path);
+        if (n < sizeof(abspath) - 1) {
+            abspath[0] = '/';
+            memcpy(abspath + 1, path, n + 1);
+            fd = vfs_open(abspath, O_RDONLY);
+        }
+    }
     if (fd < 0) {
         DBG_MSG("ELF", "vfs_open failed");
         return ELF_ERR_IO;
@@ -444,8 +460,29 @@ static void user_entry_trampoline(void *arg) {
         "pop %%rax\n\t"
         "or $0x200, %%rax\n\t"      /* IF=1 */
         "push %%rax\n\t"            /* RFLAGS обратно */
-        "push $0x1B\n\t"            /* CS: user code DPL=3 (0x18 | 3) */
+        "push $0x2B\n\t"            /* CS: user code DPL=3 (0x28 | 3) — 0x18 это padding-слот STAR, там нет валидного дескриптора */
         "push %[urip]\n\t"          /* RIP: точка входа */
+
+        /* КРИТИЧНО: перед прыжком в ring3 нужен swapgs.
+         *
+         * usermode_init() (main.c) выставляет MSR_GS_BASE=&g_percpu
+         * (активно ПРЯМО СЕЙЧАС, пока мы в ядре) и MSR_KERNEL_GS=0
+         * (shadow, должен стать активным ПОСЛЕ swapgs у пользователя).
+         * Без swapgs здесь GS.base так и остаётся &g_percpu всё время,
+         * пока userspace-код работает в ring3. На первом же syscall
+         * syscall_entry_stub (main.c) сам делает swapgs — и меняет
+         * местами: GS.base становится 0 (то, что должно было быть
+         * user-стороной, а по факту никогда не выставлялось), а
+         * &g_percpu улетает в shadow. Следующая же строчка стаба,
+         * "mov %%rsp, %%gs:0", пишет user rsp по адресу [0+0] = 0x0 —
+         * отсюда page fault CR2=0, ERR=W (запись, ring0).
+         *
+         * swapgs здесь ставит всё по местам: GS.base становится 0
+         * (user-сторона), &g_percpu уходит в shadow — и когда
+         * syscall_entry_stub потом сделает СВОЙ swapgs, GS.base
+         * корректно вернётся к &g_percpu. */
+        "swapgs\n\t"
+
         /* Обнуляем регистры перед передачей управления */
         "xor %%rax, %%rax\n\t"
         "xor %%rbx, %%rbx\n\t"

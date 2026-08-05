@@ -29,7 +29,9 @@ extern uint8_t ps2_mouse_buttons(void);
  * Частота таймерного тика (см. interrupt_init(..., timer_freq_hz) —
  * по умолчанию 100 Гц). Используется только для определения "раз в секунду".
  * ========================================================================= */
-#define UI_TICK_HZ          100
+/* Часы теперь перерисовываются по факту смены секунды в RTC (см.
+ * ui_clock_tick() в Framebuffer.c), а не по счётчику тиков — см.
+ * комментарий у ui_tick() ниже. */
 
 /* Ограничение размера курсора — стандартные размеры 16x16/24x24/32x32 */
 #define CURSOR_MAX_W        32
@@ -53,8 +55,6 @@ static fb_color_t g_saved_bg[CURSOR_MAX_W * CURSOR_MAX_H];
 static int32_t    g_saved_x = -1, g_saved_y = -1;
 static uint32_t   g_saved_w = 0,  g_saved_h = 0;
 static int        g_saved_valid = 0;
-
-static uint32_t   g_tick_counter = 0;
 
 /* =========================================================================
  * Загрузка cursor.png через VFS
@@ -138,6 +138,17 @@ int ui_extra_init(void) {
 void ui_set_mouse_pos(int32_t x, int32_t y) {
     g_mouse_x = x;
     g_mouse_y = y;
+}
+
+/* ui_get_mouse_pos — текущая позиция курсора в экранных координатах.
+ * Нужна sc_input_poll() в Syscall.c: userspace-приложение (например
+ * калькулятор) само переводит абсолютные координаты в относительные
+ * своему окну (см. sys_win_get_rect), и само делает edge-detection
+ * клика (сравнивая с предыдущим опросом), поэтому здесь достаточно
+ * отдать сырые x/y без какой-либо дополнительной логики. */
+void ui_get_mouse_pos(int32_t *out_x, int32_t *out_y) {
+    if (out_x) *out_x = g_mouse_x;
+    if (out_y) *out_y = g_mouse_y;
 }
 
 /* =========================================================================
@@ -268,17 +279,96 @@ void ui_tick(void) {
      * (кусочки синего заголовка/красной кнопки close). Стирая курсор
      * ДО перерисовки окна, мы гарантируем, что сохранение/восстановление
      * фона окна всегда работает с чистым содержимым рабочего стола. */
+
+    /* Область старого курсора (то, что cursor_restore_bg() сейчас вернёт
+     * на стол) — запоминаем ДО восстановления, чтобы включить в дирти-
+     * прямоугольник ниже. */
+    int32_t old_x = g_saved_x, old_y = g_saved_y;
+    uint32_t old_w = g_saved_w, old_h = g_saved_h;
+    int had_old = g_saved_valid;
+
     cursor_restore_bg();
 
-    ui_desktop_handle_mouse(g_mouse_x, g_mouse_y, ps2_mouse_buttons());
+    /* Клик/зажатая кнопка — потенциально меняют что угодно на столе
+     * (иконки, окна, меню, перетаскивание), поэтому такие тики
+     * по-прежнему обходятся полным fb_flip() ниже, а не частичным. */
+    uint8_t buttons = ps2_mouse_buttons();
+    bool lmb_down = (buttons & 1) != 0;
+
+    /* ВАЖНО: приложения (например calc.c) перерисовывают себя
+     * КООПЕРАТИВНО — когда их поток в очередной раз получит время
+     * планировщика и заметит, что окно подвинули. Раньше full-flip
+     * шёл только пока кнопка мыши физически зажата (big_change =
+     * buttons&1). Первый же тик ПОСЛЕ отпускания кнопки уже не делал
+     * fb_flip() вообще — а именно в этот момент back buffer чаще
+     * всего ещё не успел получить свежую перерисовку от приложения
+     * (это гонка планировщика). В итоге на экране "застревал" пустой
+     * кадр, и он лишь постепенно "проявлялся" маленькими кусочками —
+     * через частичные flip'ы вслед за курсором. Держим полный flip ещё
+     * несколько тиков после отпускания, чтобы дать приложению реально
+     * успеть перерисоваться и попасть в кадр. */
+    static int s_release_grace = 0;
+    static bool s_prev_lmb_down = false;
+    if (s_prev_lmb_down && !lmb_down) s_release_grace = 3;
+    s_prev_lmb_down = lmb_down;
+
+    /* Клик/зажатая кнопка — потенциально меняют что угодно на столе
+     * (иконки, окна, меню, перетаскивание), поэтому такие тики
+     * по-прежнему обходятся полным fb_flip() ниже, а не частичным. */
+    int big_change = lmb_down || (s_release_grace > 0);
+    if (s_release_grace > 0) s_release_grace--;
+
+    ui_desktop_handle_mouse(g_mouse_x, g_mouse_y, buttons);
 
     cursor_draw(g_mouse_x, g_mouse_y);
 
-    g_tick_counter++;
-    if (g_tick_counter >= UI_TICK_HZ) {
-        g_tick_counter = 0;
-        ui_redraw_clock();
+    /* Новая область курсора — cursor_draw() выше уже обновил
+     * g_saved_x/y/w/h через свой собственный cursor_save_bg(). */
+    int32_t new_x = g_saved_x, new_y = g_saved_y;
+    uint32_t new_w = g_saved_w, new_h = g_saved_h;
+
+    int clock_drawn = ui_clock_tick();
+
+    /* ГЛАВНЫЙ ФИКС (см. подробности в fb_flip_rect() в Framebuffer.c):
+     * раньше тут был безусловный fb_flip() — полное копирование кадра
+     * КАЖДЫЙ таймерный тик. Под QEMU без аппаратного ускорения это
+     * стоило ~1 секунды за тик и не оставляло процессору времени вообще
+     * ни на что другое — включая только что созданный поток
+     * калькулятора. Теперь в подавляющем большинстве тиков (просто
+     * движение мыши, ничего не нажато) переносим в VRAM только реально
+     * изменившийся маленький прямоугольник — курсор ± область часов раз
+     * в секунду. Полный кадр гоняем ТОЛЬКО когда что-то могло измениться
+     * по-крупному (клик/drag). */
+    if (big_change) {
+        fb_flip();
+    } else {
+        /* Объединяем старую и новую область курсора в один прямоугольник */
+        int32_t ux = old_x, uy = old_y, uw2 = (int32_t)old_w, uh2 = (int32_t)old_h;
+        if (had_old) {
+            int32_t ox2 = old_x + (int32_t)old_w, oy2 = old_y + (int32_t)old_h;
+            int32_t nx2 = new_x + (int32_t)new_w, ny2 = new_y + (int32_t)new_h;
+            int32_t left   = old_x < new_x ? old_x : new_x;
+            int32_t top    = old_y < new_y ? old_y : new_y;
+            int32_t right  = ox2 > nx2 ? ox2 : nx2;
+            int32_t bottom = oy2 > ny2 ? oy2 : ny2;
+            ux = left; uy = top; uw2 = right - left; uh2 = bottom - top;
+        } else {
+            ux = new_x; uy = new_y; uw2 = (int32_t)new_w; uh2 = (int32_t)new_h;
+        }
+        if (uw2 > 0 && uh2 > 0)
+            fb_flip_rect(ux, uy, (uint32_t)uw2, (uint32_t)uh2);
+
+        if (clock_drawn)
+            fb_flip_clock_area();
     }
 
-    fb_flip();
+    /* Окна независимых userspace-процессов (calc.c и т.п.) рисуют себя
+     * асинхронно в back-buffer и не сигналят ядру о перерисовке — без
+     * этого их видно на экране только там, где случайно прошёл курсор
+     * или совпал полный fb_flip() (см. подробный комментарий у
+     * ui_flip_userspace_windows() в Framebuffer.c). Переносим их
+     * прямоугольники в VRAM КАЖДЫЙ тик, независимо от big_change —
+     * дёшево (размер = окно, не экран), поэтому не выполняется
+     * условно, как основной "big change" fb_flip() выше. */
+    ui_flip_userspace_windows();
 }

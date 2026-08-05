@@ -16,10 +16,11 @@ static inline uint8_t dbg_inb(uint16_t port) {
 }
 
 static inline void dbg_putc(char c) {
-    /* Только COM1 — не дублировать с debugcon на одном chardev */
-    uint32_t timeout = 0x100000;
-    while ((dbg_inb(0x3F8 + 5) & 0x20) == 0 && timeout--)
-        ;
+    /* COM1 (0x3F8) — пишем напрямую без проверки готовности.
+     * QEMU -serial stdio берёт байт в любом случае, проверка LSR
+     * не помогает (порт не инициализирован и может вообще не отвечать
+     * на inb). На реальном железе здесь нужна была бы настоящая проверка
+     * готовности, но для QEMU debug-вывода это мешает больше, чем помогает. */
     dbg_outb(0x3F8, (uint8_t)c);
 }
 

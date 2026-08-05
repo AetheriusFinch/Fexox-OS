@@ -143,6 +143,40 @@ typedef struct __attribute__((packed)) {
 static uint64_t  g_gdt[8] __attribute__((aligned(16)));
 static tss64_t   g_tss    __attribute__((aligned(16)));
 
+/*
+ * tss_set_rsp0 — обновить RSP0 в TSS.
+ *
+ * ВАЖНО (баг, из-за которого калькулятор пропадал без следа): g_tss.rsp0
+ * раньше выставлялся ОДИН раз в usermode_init() на g_syscall_kstack — общий
+ * "чужой" стек ядра — и больше никогда не менялся. RSP0 — это стек, который
+ * CPU АППАРАТНО подставляет при ЛЮБОМ входе в ring0 из ring3 (не только
+ * syscall, но и ЛЮБОЕ прерывание/исключение, в т.ч. таймерный тик
+ * планировщика). Пока ring3-задач не было (только "My Computer", живущий
+ * целиком в ядре), это было незаметно.
+ *
+ * Как только появился НАСТОЯЩИЙ ring3-процесс (calc.elf): elf64_spawn его
+ * запускает, iretq уходит в ring3 — и на первом же таймерном прерывании
+ * планировщик строит кадр прерывания (context_switch: prev->ctx.rsp =
+ * frame_rsp) ПОВЕРХ этого общего g_syscall_kstack. При следующем же входе
+ * в ядро (уже от ДРУГОЙ задачи) это место затирается — сохранённый контекст
+ * calc портится, и при попытке вернуться в него планировщик прыгает в
+ * мусор. Результат ровно такой, как наблюдался: "elf64_spawn: spawned tid"
+ * в логе — и полная тишина, без единого сообщения о падении (сама порча
+ * происходит раньше, чем успевает сработать что-либо, что могло бы
+ * залогировать ошибку).
+ *
+ * Фикс: RSP0 должен указывать на СОБСТВЕННЫЙ kernel-стек ТЕКУЩЕЙ задачи, а
+ * не быть общим на все. У task_t такой стек уже есть (kstack_base/kstack_top
+ * из setup_kstack — тот самый, на котором изначально жил trampoline перед
+ * iretq и который свободен для повторного использования как приёмник кадра
+ * прерывания, пока задача в ring3). Scheduler.c (context_switch) обязан
+ * вызывать tss_set_rsp0(next->kstack_top) при каждом переключении на
+ * задачу — см. правку в Scheduler.c.
+ */
+void tss_set_rsp0(uint64_t rsp0) {
+    g_tss.rsp0 = rsp0;
+}
+
 /* Стек ядра для ring-3 syscall/interrupt входов */
 #define SYSCALL_KSTACK_SIZE (16 * 1024)
 static uint8_t g_syscall_kstack[SYSCALL_KSTACK_SIZE] __attribute__((aligned(16)));
@@ -218,10 +252,16 @@ static void syscall_entry_stub(void) {
          *   rdi=nr(rax), rsi=a1(rdi), rdx=a2(rsi), rcx=a3(rdx),
          *   r8=a4(r10),  r9=a5(r8)
          * Нам нужно переставить: rdi=rax, rsi=rdi, rdx=rsi, rcx=rdx, r8=r10, r9=r8 */
-        "mov %%rax, %%rdi\n\t"             /* nr */
-        /* rsi уже = a1 (rdi пользователя... нет, мы затёрли rdi) */
-        /* Используем стек для сохранения оригинальных значений */
-        "push %%rdi\n\t"                   /* сохраняем оригинальный rdi (= nr уже в rdi) */
+
+        /* ВАЖНО (баг, из-за которого падал sc_win_create): rdi нужно
+         * сохранить НА СТЕК ДО того, как rdi будет затёрт номером
+         * сисколла — иначе на стек попадёт уже nr, а не настоящий a1.
+         * Раньше push %%rdi стоял ПОСЛЕ "mov %%rax, %%rdi", то есть
+         * сохранял уже испорченное значение (nr вместо a1) — и
+         * syscall_dispatch получал a1==nr, отсюда чтение по адресу,
+         * равному самому номеру сисколла (CR2 == nr в панике). */
+        "push %%rdi\n\t"                   /* сохраняем оригинальный a1 */
+        "mov %%rax, %%rdi\n\t"             /* rdi = nr */
 
         /* Перестройка аргументов без затирания:
          * на входе: rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4, r8=a5
@@ -230,7 +270,7 @@ static void syscall_entry_stub(void) {
         "mov %%r10, %%r8\n\t"   /* r8  = a4 */
         "mov %%rdx, %%rcx\n\t"  /* rcx = a3 */
         "mov %%rsi, %%rdx\n\t"  /* rdx = a2 */
-        "pop %%rsi\n\t"         /* rsi = rdi_orig = a1 (pop того что пушнули) */
+        "pop %%rsi\n\t"         /* rsi = a1 (снятый со стека настоящий оригинал) */
         /* rdi уже = nr (мы сделали mov %%rax, %%rdi выше) */
 
         "call syscall_dispatch\n\t"
@@ -260,6 +300,30 @@ typedef struct {
 } percpu_t;
 
 static percpu_t g_percpu __attribute__((aligned(16)));
+
+/* syscall_set_kstack — аналог tss_set_rsp0(), но для ВТОРОГО, отдельного
+ * механизма входа в ring0 — инструкции SYSCALL (см. syscall_entry_stub
+ * выше, читает стек из GS:8, а не из TSS.RSP0, который используется
+ * только для входа через IDT/прерывания).
+ *
+ * БАГ (падение при двух одновременно живых ring3-процессах, garbage
+ * RIP/RSP/CS при возврате из syscall): GS:8 (g_percpu.kernel_rsp)
+ * раньше выставлялся ОДИН раз при загрузке на общий g_syscall_kstack —
+ * и, в отличие от TSS.RSP0 (который уже чинили от этого же класса
+ * бага), никогда не переключался на стек ТЕКУЩЕЙ задачи. Пока жил один
+ * ring3-процесс, коллизий не было. Но если два процесса оба уходят в
+ * блокирующий sys_yield() (там sti;hlt — прерывания разрешены прямо
+ * ВНУТРИ тела syscall, стек ещё не отдан обратно userspace) и
+ * планировщик их чередует — второй просто пишет НОВЫЙ syscall-кадр
+ * поверх ещё не завершённого кадра первого на ОДНОМ общем буфере,
+ * затирая ему адрес возврата в userspace. Нужно звать эту функцию
+ * везде, где уже зовётся tss_set_rsp0(next->kstack_top) — тем же
+ * значением: у входа через IDT и через SYSCALL нет причин иметь разные
+ * стеки для ОДНОЙ и той же задачи, разными они должны быть только
+ * МЕЖДУ задачами. */
+void syscall_set_kstack(uint64_t rsp0) {
+    g_percpu.kernel_rsp = rsp0;
+}
 
 #define MSR_GS_BASE      0xC0000101
 #define MSR_KERNEL_GS    0xC0000102
@@ -473,6 +537,18 @@ void kernel_entry(BOOT_INFO *info) {
     kprint("=== FEXOS Kernel ===\n");
     DBG_MSG("KR", "11 BOOT_INFO ok");
 
+    /* ВАЖНО: 'info' указывает на физический адрес (~0x1000Bxxx), доступный
+     * только через identity-таблицы ЗАГРУЗЧИКА. mem_control_init() внутри
+     * себя вызывает vmm_activate(), который переключает CR3 на СОВЕРШЕННО
+     * НОВЫЙ PML4 ядра (только direct-map + 8 МиБ самого ядра) — низкий
+     * identity-диапазон туда не входит вообще. Любое обращение к *info
+     * (и к чему-либо внутри него, включая info->fb) ПОСЛЕ этого момента —
+     * гарантированный #PF по несуществующему маппингу. Поэтому всё, что
+     * нужно после mem_control_init(), копируем в локальные переменные
+     * ЗАРАНЕЕ, пока старые таблицы ещё активны. */
+    uint64_t   saved_rsdp_phys = info->rsdp_phys;
+    fb_info_t  saved_fb        = info->fb;
+
     /* --- Память --- */
     DBG_MSG("KR", "12 mem_control_init...");
     int ret = mem_control_init(info->mem_map, info->mem_map_size, info->desc_size);
@@ -489,7 +565,7 @@ void kernel_entry(BOOT_INFO *info) {
      * Не фатально при ошибке — Menu Shutdown/Reboot тогда просто
      * останутся на старых фолбэках (QEMU debug-порт / 8042 / triple fault). */
     DBG_MSG("KR", "13a acpi_init...");
-    if (acpi_init(info->rsdp_phys) == 0) {
+    if (acpi_init(saved_rsdp_phys) == 0) {
         kprint("[OK] acpi\n");
     } else {
         kprint("[INFO] no ACPI (rsdp not found / parse failed)\n");
@@ -497,7 +573,7 @@ void kernel_entry(BOOT_INFO *info) {
 
     /* --- Framebuffer --- */
     DBG_MSG("KR", "13b fb_init...");
-    int fb_mode = fb_init(&info->fb);
+    int fb_mode = fb_init(&saved_fb);
     if (fb_mode == FB_MODE_LINEAR) {
         /* Double-buffer включаем ПОСЛЕ ui_draw_desktop, когда рабочий стол
          * уже нарисован. До этого пишем прямо во front-буфер.
@@ -514,6 +590,27 @@ void kernel_entry(BOOT_INFO *info) {
         DBG_MSG("KR", "13b fb VGA fallback");
     }
 
+    /* --- User mode инфраструктура ---
+     * ВАЖНО: должно идти ДО interrupt_init(). usermode_init() делает lgdt
+     * на g_gdt — обычный статический массив ядра, он лежит в .bss/.data
+     * образа ядра и замаплен всегда (KERNEL_VIRT_BASE, всегда в page-table).
+     * До этого lgdt GDTR всё ещё указывает на ВРЕМЕННУЮ GDT загрузчика —
+     * она лежит в той же низкой identity-области, что и boot_info
+     * (~0x1000Bxxx), и после vmm_activate() (внутри mem_control_init) эта
+     * область НИГДЕ не замаплена. interrupt_init() внутри себя калибрует
+     * таймер и для этого коротко включает прерывания (sti/cli) — первое
+     * же прерывание требует от CPU прочитать дескриптор целевого CS из
+     * GDT (это часть стандартной доставки прерывания через IDT gate), а
+     * GDT в этот момент ещё старая и уже недоступна → #PF → рекурсивный
+     * #PF при попытке обработать первый #PF (обработчику тоже нужен GDT)
+     * → #DF → triple fault. Именно это и происходило на этапе "14d timer
+     * calibrate". Переставляем usermode_init() раньше interrupt_init() —
+     * тогда к моменту калибровки таймера GDTR уже указывает на g_gdt. */
+    DBG_MSG("KR", "16 usermode_init...");
+    usermode_init();
+    kout("[OK] usermode\n");
+    DBG_MSG("KR", "17 usermode ok");
+
     /* --- Прерывания --- */
     DBG_MSG("KR", "14 interrupt_init...");
     ret = interrupt_init(0xFEC00000ULL, 100);
@@ -523,12 +620,6 @@ void kernel_entry(BOOT_INFO *info) {
     }
     kout("[OK] interrupts\n");
     DBG_MSG("KR", "15 interrupts ok");
-
-    /* --- User mode инфраструктура --- */
-    DBG_MSG("KR", "16 usermode_init...");
-    usermode_init();
-    kout("[OK] usermode\n");
-    DBG_MSG("KR", "17 usermode ok");
 
     /*
      * VFS + блочный слой ДО планировщика.
@@ -638,7 +729,9 @@ void kernel_entry(BOOT_INFO *info) {
             }
 
             /* --- ELF64: попытка запустить /init --- */
+            DBG_MSG("KR", "DIAG: before try_spawn_init");
             try_spawn_init();
+            DBG_MSG("KR", "DIAG: after try_spawn_init");
 
         } else {
             kout("[WARN] no root filesystem mounted\n");
@@ -683,12 +776,17 @@ skip_fs:;
     kout("[OK] scheduler\n");
     DBG_MSG("KR", "19 sched ok");
 
+    DBG_MSG("KR", "DIAG: before worker_a create");
     sched_create_kthread(worker_a, NULL, "worker_a",  0);
+    DBG_MSG("KR", "DIAG: after worker_a create, before worker_b");
     sched_create_kthread(worker_b, NULL, "worker_b", -5);
+    DBG_MSG("KR", "DIAG: after worker_b create");
     kout("[OK] kthreads\n");
 
     /* --- Запускаем --- */
+    DBG_MSG("KR", "DIAG: before sti");
     __asm__ volatile ("sti" ::: "memory");
+    DBG_MSG("KR", "DIAG: after sti");
     kout(">>> FEXOS running <<<\n");
     DBG_MSG("KR", "99 idle loop");
 

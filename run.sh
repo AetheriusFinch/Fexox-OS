@@ -19,7 +19,7 @@ mkdir -p /c/fos
 cp -f "$VARS" /c/fos/OVMF_VARS.fd
 
 exec "$(to_win "$QEMU")" \
-  -machine q35 -m 256M -cpu qemu64 -vga std \
+  -machine q35 -m 768M -cpu qemu64 -vga std \
   \
   `# UEFI firmware` \
   -drive "if=pflash,format=raw,readonly=on,file=$(to_win "$CODE")" \

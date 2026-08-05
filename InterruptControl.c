@@ -143,16 +143,21 @@ static void format_hex(uint64_t val, char *buf) {
 
 __attribute__((interrupt))
 void page_fault_handler(cpu_frame_t *frame, uint64_t err) {
-    (void)frame;
     uint64_t cr2 = read_cr2();
-    char addr_buf[20], err_buf[20];
+    char addr_buf[20], err_buf[20], rip_buf[20], cs_buf[20], rsp_buf[20];
     format_hex(cr2, addr_buf);
     format_hex(err, err_buf);
+    /* ВРЕМЕННО: raw frame->rip/cs/rsp вместо (void)frame — нужно узнать
+     * ТОЧНЫЙ адрес падения (и был ли это ring0/ring3), а не гадать по
+     * контексту в логе. Сверить потом с nm/symbols.txt. */
+    format_hex(frame->rip, rip_buf);
+    format_hex(frame->cs,  cs_buf);
+    format_hex(frame->rsp, rsp_buf);
     const char *p = (err & 1) ? "P" : "NP";
     const char *wr = (err & 2) ? "W" : "R";
     const char *us = (err & 4) ? "U" : "S";
 
-    static char panic_msg[256];
+    static char panic_msg[400];
     int pos = 0;
 
     const char *prefix = "KERNEL PAGE FAULT\nADDR: 0x";
@@ -173,7 +178,20 @@ void page_fault_handler(cpu_frame_t *frame, uint64_t err) {
 
     const char *us_str = "U/S= ";
     for (int i = 0; us_str[i]; i++) panic_msg[pos++] = us_str[i];
-    panic_msg[pos++] = us[0]; panic_msg[pos++] = '\0';
+    panic_msg[pos++] = us[0];
+
+    const char *rip_lbl = "\nRIP : 0x";
+    for (int i = 0; rip_lbl[i]; i++) panic_msg[pos++] = rip_lbl[i];
+    for (int i = 0; rip_buf[i]; i++) panic_msg[pos++] = rip_buf[i];
+
+    const char *cs_lbl = "\nCS  : 0x";
+    for (int i = 0; cs_lbl[i]; i++) panic_msg[pos++] = cs_lbl[i];
+    for (int i = 0; cs_buf[i]; i++) panic_msg[pos++] = cs_buf[i];
+
+    const char *rsp_lbl = "\nRSP : 0x";
+    for (int i = 0; rsp_lbl[i]; i++) panic_msg[pos++] = rsp_lbl[i];
+    for (int i = 0; rsp_buf[i]; i++) panic_msg[pos++] = rsp_buf[i];
+    panic_msg[pos] = '\0';
 
     vga_panic(panic_msg);
 }
@@ -449,7 +467,17 @@ static void apic_calibrate_timer(void) {
     pic_disable();
 
     if (g_pit_calib_done && elapsed > 1000) {
-        g_apic_bus_freq = elapsed * 100;  /* elapsed за 10мс -> частота в Гц */
+        /* ВАЖНО (баг): APIC_DIV_CONF был выставлен в 0x03 (÷16) ДО отсчёта,
+         * поэтому elapsed тикал на частоте bus_freq/16, а не bus_freq.
+         * "elapsed*100" даёт именно bus_freq/16, а не bus_freq/16/16, как
+         * ошибочно предполагалось в комментарии ниже (закомментированная
+         * строка). apic_timer_start() ниже делит на div=16 ЕЩЁ РАЗ — если
+         * здесь хранить bus_freq/16, таймер получается в 16 раз быстрее
+         * запрошенных 100 Гц (и это ещё не считая совпадения по времени с
+         * другими провалами калибровки). Умножаем обратно на 16, чтобы
+         * g_apic_bus_freq всегда означал ИСТИННУЮ (неделённую) частоту шины
+         * APIC — ровно как в fallback-ветке ниже (100 МГц, тоже неделённая) */
+        g_apic_bus_freq = elapsed * 100 * 16;  /* elapsed был на bus_freq/16 за 10мс */
     } else {
         /* Калибровка не удалась — используем типичное значение для QEMU */
         g_apic_bus_freq = 100000000;  /* 100 МГц */
@@ -460,6 +488,11 @@ static void apic_timer_start(uint32_t freq_hz) {
     if (g_apic_bus_freq == 0) g_apic_bus_freq = 100000000;
     uint32_t div = 16;
     uint32_t init_cnt = (g_apic_bus_freq / div) / freq_hz;
+
+    /* ВРЕМЕННЫЙ диагностический принт — убрать после отладки. */
+    DBG_VAL("KR", "apic_timer_start: g_apic_bus_freq", (uint64_t)g_apic_bus_freq);
+    DBG_VAL("KR", "apic_timer_start: init_cnt", (uint64_t)init_cnt);
+
     lapic_write(APIC_DIV_CONF, 0x03);
     lapic_write(APIC_INIT_CNT, init_cnt);
     lapic_write(APIC_LVT_TIMER, 0x20000 | TIMER_VECTOR);

@@ -39,13 +39,39 @@ extern void   interrupt_set_scheduler_tick(uint64_t (*fn)(uint64_t frame_rsp));
 typedef volatile int spinlock_t;
 
 static inline void spinlock_acquire(spinlock_t *l) {
-    (void)l;
-    __asm__ volatile ("pushfq\n\tcli\n\tpopfq" ::: "memory");
+    /* ВАЖНО: раньше здесь было "pushfq; cli; popfq" — popfq тут же
+     * восстанавливал флаги, СОХРАНЁННЫЕ ДО cli, то есть откатывал IF
+     * обратно и cli не имел вообще никакого эффекта. Прерывания во
+     * время "захваченной" секции никогда реально не выключались.
+     * Из-за этого таймерное прерывание могло прилететь прямо посреди
+     * rq_push()/сплайса списка (например в sched_create_kthread при
+     * добавлении только что созданной задачи) и рекурсивно войти в
+     * ЭТУ ЖЕ (ничего не блокирующую) секцию — куча очереди готовности
+     * портилась на середине обновления, и свежесозданный поток мог
+     * молча пропасть из планирования без единого краша или строки в
+     * логе. Теперь реально сохраняем текущий IF и выключаем прерывания;
+     * *l используется как хранилище сохранённых флагов (на UP-ядре с
+     * cli-блокировками отдельный атомарный флаг не нужен). */
+    uint64_t flags;
+    __asm__ volatile (
+        "pushfq\n\t"
+        "pop %0\n\t"
+        "cli\n\t"
+        : "=r"(flags)
+        :
+        : "memory"
+    );
+    *l = (int)flags;
 }
 
 static inline void spinlock_release(spinlock_t *l) {
-    (void)l;
-    __asm__ volatile ("pushfq\n\tsti\n\tpopfq" ::: "memory");
+    /* Восстанавливаем IF, только если он реально был установлен —
+     * иначе (например при вызове изнутри interrupt-gate обработчика,
+     * где IF аппаратно уже 0) мы бы включили прерывания раньше времени,
+     * прямо посреди обработки текущего прерывания. */
+    if (*l & 0x200) {
+        __asm__ volatile ("sti" ::: "memory");
+    }
 }
 
 /* TSC для измерения времени */
@@ -274,6 +300,22 @@ typedef struct __attribute__((packed)) {
 
 /* Обёртка: задача завершилась нормально → вызываем sched_exit */
 static void task_wrapper(void (*fn)(void *), void *arg) {
+    /* ВРЕМЕННЫЙ диагностический маркер — убрать после отладки. Сырой
+     * dbg_putc САМЫМ ПЕРВЫМ, до любого другого кода: DBG_MSG сам по себе
+     * делает call/несколько push'ей, так что если стек ещё сломан, он
+     * может не дожить даже до записи в лог. Если 'W' не появляется —
+     * не доходим вообще ни до одной инструкции C-тела task_wrapper
+     * (значит проблема в asm-стабе/iretq/бутстрап-кадре). Если 'W' есть,
+     * а следующей строки ("entered") — нет, ломается уже на первом call
+     * (т.е. именно на текущем RSP). */
+    dbg_putc('W');   /* dbg_putc уже доступен через #include "debug_out.h" выше */
+
+    /* ВРЕМЕННЫЙ диагностический принт — убрать после отладки. Если эта
+     * строка НЕ появляется в логе, значит система виснет/падает ДО того,
+     * как новая задача вообще успевает начать выполняться (т.е. где-то
+     * в самом механизме переключения — asm-стаб/iretq/RSP0), а не внутри
+     * calc_main/user_entry_trampoline. */
+    DBG_MSG("SC", "task_wrapper: entered");
     fn(arg);
     sched_exit();
 }
@@ -290,12 +332,27 @@ static int setup_kstack(task_t *t, void (*fn)(void *), void *arg) {
     kmemset_s(stack, 0, t->kstack_size);
     t->kstack_base = stack;
 
-    /* Вершина стека (выровнена на 16) */
-    uint8_t *top = stack + t->kstack_size;
-    top = (uint8_t *)((uint64_t)top & ~0xFULL);
+    /* ИСТИННАЯ вершина стека (выровнена на 16) — это и есть то, что должно
+     * идти в TSS.RSP0 (см. tss_set_rsp0() в main.c). RSP0 — стек, который
+     * CPU АППАРАТНО подставляет при входе в ring0 из ring3 (в т.ч. на
+     * каждом таймерном тике, пока задача работает в ring3) — он должен
+     * указывать на ПУСТУЮ, ничем не занятую вершину, а не внутрь уже
+     * использованной области. */
+    uint8_t *stack_top = stack + t->kstack_size;
+    stack_top = (uint8_t *)((uint64_t)stack_top & ~0xFULL);
 
-    /* Резервируем место под sched_frame_t */
-    top -= sizeof(sched_frame_t);
+    /* Резервируем место под sched_frame_t (одноразовый bootstrap-кадр —
+     * нужен только для самого первого переключения на task_wrapper).
+     * ВАЖНО (баг, из-за которого калькулятор пропадал без следа №2):
+     * раньше t->kstack_top присваивался ЭТОТ, УЖЕ ПОНИЖЕННЫЙ на
+     * sizeof(sched_frame_t) адрес (базу bootstrap-кадра), а не истинную
+     * вершину (stack_top выше). TSS.RSP0 в итоге указывал на 168 байт
+     * НИЖЕ настоящего верха стека — то есть ровно на то место, которое
+     * уже было "использовано" при самом первом входе в task_wrapper,
+     * а не на свободную область. Тот же класс ошибки, что уже чинили
+     * для общего g_syscall_kstack (см. комментарий у tss_set_rsp0 в
+     * main.c) — только на этот раз внутри одного и того же стека задачи. */
+    uint8_t *top = stack_top - sizeof(sched_frame_t);
     sched_frame_t *frame = (sched_frame_t *)top;
     kmemset_s(frame, 0, sizeof(sched_frame_t));
 
@@ -303,7 +360,7 @@ static int setup_kstack(task_t *t, void (*fn)(void *), void *arg) {
     frame->rip    = (uint64_t)(uintptr_t)task_wrapper;
     frame->cs     = 0x08;                  /* kernel code segment */
     frame->rflags = 0x202;                 /* IF=1, reserved=1 */
-    frame->rsp    = (uint64_t)(uintptr_t)(top + sizeof(sched_frame_t));
+    frame->rsp    = (uint64_t)(uintptr_t)stack_top;
     frame->ss     = 0x10;                  /* kernel data segment */
 
     /* Аргументы task_wrapper через регистры (System V AMD64 ABI):
@@ -311,9 +368,9 @@ static int setup_kstack(task_t *t, void (*fn)(void *), void *arg) {
     frame->rdi = (uint64_t)(uintptr_t)fn;
     frame->rsi = (uint64_t)(uintptr_t)arg;
 
-    t->ctx.rsp = (uint64_t)(uintptr_t)top;
+    t->ctx.rsp = (uint64_t)(uintptr_t)top;         /* для ПЕРВОГО переключения на задачу */
     t->ctx.cr3 = 0; /* kernel PML4 — берётся из CR3 текущего контекста */
-    t->kstack_top = (uint64_t)(uintptr_t)top;
+    t->kstack_top = (uint64_t)(uintptr_t)stack_top; /* для TSS.RSP0 — ИСТИННАЯ вершина */
     return 0;
 }
 
@@ -430,6 +487,17 @@ int sched_create_kthread(void (*fn)(void *), void *arg,
  * Мы не переключаем CR3 здесь, т.к. все kernel-потоки в одном адресном
  * пространстве. Для user-mode нужно добавить переключение CR3.
  * ------------------------------------------------------------------------- */
+/* tss_set_rsp0 (main.c) — переставляет RSP0 в TSS на стек ядра ТЕКУЩЕЙ
+ * задачи. Раньше RSP0 был зафиксирован один раз при загрузке на общий
+ * g_syscall_kstack — из-за этого кадр прерывания ring3-процесса (calc.elf)
+ * при каждом таймерном тике строился поверх ЧУЖОГО стека и затирался
+ * следующим же входом в ядро другой задачи (см. подробный комментарий в
+ * main.c рядом с tss_set_rsp0). Без этого вызова RSP3-процесс переживает
+ * максимум один квант — после первого же переключения его сохранённый
+ * context_switch-контекст оказывается мусором. */
+extern void tss_set_rsp0(uint64_t rsp0);
+extern void syscall_set_kstack(uint64_t rsp0);  /* см. main.c — тот же баг, что и с RSP0, но для входа через SYSCALL */
+
 static uint64_t context_switch(uint64_t frame_rsp) {
     task_t *prev = g_sched.current;
     uint64_t now_tsc = rdtsc();
@@ -467,6 +535,25 @@ static uint64_t context_switch(uint64_t frame_rsp) {
     g_sched.current = next;
     g_sched.slice_start_tsc = now_tsc;
 
+    /* ВРЕМЕННЫЙ диагностический принт — убрать после отладки. Показывает,
+     * доходит ли планировщик вообще до выбора tid только что созданной
+     * задачи, и на каком именно тике. */
+    DBG_VAL("SC", "context_switch: next tid", (uint64_t)next->tid);
+
+    /* КРИТИЧНО для ring3-задач (см. комментарий у extern-объявления выше и
+     * у tss_set_rsp0() в main.c): следующая задача может в любой момент
+     * получить прерывание из ring3 (или уже сейчас в ring3, если это
+     * возобновление). RSP0 обязан указывать на её СОБСТВЕННЫЙ kernel-стек
+     * (kstack_top из setup_kstack), а не оставаться на чужом/общем — иначе
+     * следующий же таймерный тик построит кадр прерывания поверх памяти,
+     * которую использует кто-то другой, и контекст задачи будет испорчен
+     * без единого сообщения об ошибке (именно так "пропадал" калькулятор:
+     * лог показывал "spawned tid" и тишину). Для чисто kernel-потоков
+     * (никогда не идущих в ring3) эта установка безвредна и просто не
+     * используется процессором. */
+    tss_set_rsp0(next->kstack_top);
+    syscall_set_kstack(next->kstack_top);
+
     /* Возвращаем RSP следующей задачи — на него переключится сам стек
      * (не данные) в naked-стабе irq0_timer_isr, после чего оттуда же
      * будут выполнены pop регистров и iretq. */
@@ -483,10 +570,39 @@ static uint64_t context_switch(uint64_t frame_rsp) {
 uint64_t sched_tick(uint64_t frame_rsp) {
     if (!g_sched.ready) return frame_rsp;
 
+    /* ВРЕМЕННЫЙ диагностический heartbeat — убрать после отладки.
+     * Печатает раз в ~50 тиков: тикает ли таймер вообще после спавна
+     * калькулятора, кто сейчас current и сколько задач в очереди. Если
+     * это перестаёт печататься сразу после "[ELF] spawned tid" — значит
+     * система виснет целиком ДО следующего тика (например, ещё внутри
+     * обработчика клика/elf64_spawn или сразу на sti()), а не в
+     * механизме переключения контекста. */
+    {
+        static uint32_t hb = 0;
+        if ((hb++ % 50) == 0) {
+            DBG_VAL("SC", "sched_tick: hb, cur tid", (uint64_t)(g_sched.current ? g_sched.current->tid : 0xFFFFFFFF));
+            DBG_VAL("SC", "sched_tick: hb, rq.size", (uint64_t)g_sched.rq.size);
+        }
+    }
+
     /* Курсор (PNG + альфа) и "тикающие" часы — рисуются вне блокировки
      * планировщика, чтобы не задерживать переключение контекста. */
     extern void ui_tick(void);
+
+    /* ВРЕМЕННЫЙ замер — убрать после отладки. Проверяем гипотезу: не
+     * стал ли ui_tick() занимать ДОЛЬШЕ периода таймера (~10мс при
+     * 100Гц) — если так, следующий тик оказывается просрочен ещё ДО
+     * iretq в задачу, и ни один пользовательский поток не получает ни
+     * одного такта (ровно то, что видно в qemu.log: RIP/RSP заморожены
+     * на входе в task_wrapper). Печатаем только "медленные" вызовы
+     * (>= 1мс), чтобы не утопить лог: если такие строки посыпятся
+     * массово именно после спавна калькулятора — гипотеза подтверждена.
+     */
+    uint64_t ui_t0 = rdtsc();
     ui_tick();
+    uint64_t ui_ns = tsc_to_ns(rdtsc() - ui_t0);
+    if (ui_ns >= 1000000ULL) /* >= 1 мс */
+        DBG_VAL("SC", "sched_tick: ui_tick() SLOW, ns", ui_ns);
 
     spinlock_acquire(&g_sched.lock);
 
@@ -528,8 +644,19 @@ void sched_yield(void) {
     spinlock_acquire(&g_sched.lock);
     g_sched.slice_start_tsc = 0;
     spinlock_release(&g_sched.lock);
-    /* Прерывание таймера само переключит контекст при следующем тике */
-    __asm__ volatile ("hlt");
+    /* Прерывание таймера само переключит контекст при следующем тике.
+     *
+     * КРИТИЧНО: мы попали сюда из syscall_entry_stub (main.c), а вход
+     * через инструкцию SYSCALL маскирует IF аппаратно (MSR_SFMASK =
+     * (1<<9)) — флаги восстанавливаются только в sysretq, ДО которого
+     * мы ещё не дошли. Если выполнить голый "hlt" здесь, IF всё ещё
+     * равен 0 — таймерное прерывание физически не может прийти, CPU
+     * останавливается НАВСЕГДА (ровно то зависание "намертво", которое
+     * видно в логе: последняя строка — syscall nr=0x18=SYS_SCHED_YIELD,
+     * дальше тишина, ни одного тика). "sti; hlt" — атомарная пара на
+     * x86: между их выполнением прерывание гарантированно не может
+     * "проскочить" мимо hlt, так что гонки здесь нет. */
+    __asm__ volatile ("sti\n\thlt" ::: "memory");
 }
 
 /* -------------------------------------------------------------------------
@@ -553,8 +680,11 @@ void sched_exit(void) {
     g_sched.slice_start_tsc = 0;
     spinlock_release(&g_sched.lock);
 
-    /* Ждём пока таймер нас переключит — мы уже ZOMBIE, в очередь не вернёмся */
-    while (1) __asm__ volatile ("hlt");
+    /* Ждём пока таймер нас переключит — мы уже ZOMBIE, в очередь не вернёмся.
+     * Тот же баг с маскированием IF на входе в syscall, что и в
+     * sched_yield() выше — sti обязателен перед hlt, иначе зависаем
+     * навсегда вместо ожидания следующего тика. */
+    while (1) __asm__ volatile ("sti\n\thlt" ::: "memory");
 }
 
 /* -------------------------------------------------------------------------
@@ -569,8 +699,10 @@ void sched_sleep_ns(uint64_t ns) {
     (void)ns;
     g_sched.slice_start_tsc = 0;
     spinlock_release(&g_sched.lock);
+    /* См. комментарий в sched_yield() — вход через syscall маскирует
+     * IF, без sti тут тоже будет вечный hlt. */
     while (t->state == TASK_SLEEPING)
-        __asm__ volatile ("hlt");
+        __asm__ volatile ("sti\n\thlt" ::: "memory");
 }
 
 /* -------------------------------------------------------------------------
@@ -606,6 +738,19 @@ task_t *sched_find(uint32_t tid) {
         t = t->next_all;
     }
     return NULL;
+}
+
+/* sched_task_alive — true, если tid существует и ещё не ZOMBIE.
+ * Отдельная bool-функция (а не sched_find + разбор task_t снаружи),
+ * чтобы вызывать её из файлов, которым не нужен (и не должен быть
+ * виден) полный layout task_t — например из Framebuffer.c, чтобы не
+ * запускать calc.elf повторно, пока предыдущий экземпляр ещё жив
+ * (несколько одновременных ring3-процессов — источник гонок при
+ * спавне/переключении контекста, которые лечить куда сложнее, чем
+ * просто не создавать эту ситуацию). */
+bool sched_task_alive(uint32_t tid) {
+    task_t *t = sched_find(tid);
+    return t && t->state != TASK_ZOMBIE;
 }
 
 uint32_t sched_task_count(void) { return g_sched.task_count; }

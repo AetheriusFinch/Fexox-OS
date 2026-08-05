@@ -339,6 +339,20 @@ uint64_t fb_phys_addr(void)  { return (g_fb.mode == FB_MODE_LINEAR) ? g_fb.phys_
 uint32_t fb_pitch(void)      { return (g_fb.mode == FB_MODE_LINEAR) ? g_fb.pitch     : 0; }
 uint8_t  fb_bpp(void)        { return (g_fb.mode == FB_MODE_LINEAR) ? g_fb.bpp       : 0; }
 
+/* Сдвиги R/G/B каналов в "родном" 32-битном пикселе GOP (см.
+ * rgb_to_native выше) — берутся из реального EFI_GRAPHICS_PIXEL_FORMAT
+ * при инициализации и МОГУТ отличаться между прошивками (BGRA/RGBA/
+ * произвольные битовые маски). userspace-приложениям, рисующим прямо в
+ * маппленный framebuffer (см. sys_get_framebuffer/sys_win_get_rect в
+ * Syscall.c), эти сдвиги нужны, чтобы правильно собрать 32-битный
+ * пиксель самим — без них цвета "поплывут" на любой прошивке, где
+ * порядок каналов не совпадает с тем, что было при разработке. */
+void fb_get_channel_shifts(uint8_t *r_shift, uint8_t *g_shift, uint8_t *b_shift) {
+    if (r_shift) *r_shift = g_fb.r_shift;
+    if (g_shift) *g_shift = g_fb.g_shift;
+    if (b_shift) *b_shift = g_fb.b_shift;
+}
+
 /* =========================================================================
  * Double-buffering
  * ========================================================================= */
@@ -410,7 +424,50 @@ void fb_flip(void) {
     memcpy_nt(g_fb.front, g_fb.back, (size_t)g_fb.pitch * g_fb.height);
 }
 
+/* fb_flip_rect — переносит на экран ТОЛЬКО прямоугольник [x,y,w,h],
+ * а не весь кадр целиком.
+ *
+ * ВАЖНО (баг, из-за которого калькулятор не открывался): ui_tick()
+ * вызывал ПОЛНЫЙ fb_flip() КАЖДЫЙ таймерный тик — даже когда реально
+ * поменялся только курсор 32x32. Под QEMU без аппаратного ускорения
+ * (см. run.sh: -cpu qemu64 без -accel kvm/whpx — чистый TCG) копирование
+ * ~8 МБ в VRAM `-vga std` через movnti стоит около 1 СЕКУНДЫ за кадр —
+ * при таймере ~100Гц это гарантированно съедает вообще весь процессор:
+ * ни один пользовательский поток (включая только что созданный
+ * task_wrapper калькулятора) физически не успевал получить ни одного
+ * такта между двумя таймерными прерываниями. Отсюда и картина в
+ * qemu.log — RIP/RSP заморожены ровно на входе в task_wrapper,
+ * тысячи тиков подряд.
+ *
+ * Решение — переносить в VRAM только реально изменившийся регион
+ * (курсор +, раз в секунду, часы), а не весь экран. Полный fb_flip()
+ * по-прежнему используется там, где меняется весь стол/окно (клик,
+ * перетаскивание — см. вызов в ui_tick() ниже). */
+void fb_flip_rect(int32_t x, int32_t y, uint32_t w, uint32_t h) {
+    if (!g_fb.back || !g_fb.front) return;
+    if (w == 0 || h == 0) return;
+
+    if (x < 0) { if ((uint32_t)(-x) >= w) return; w += (uint32_t)x; x = 0; }
+    if (y < 0) { if ((uint32_t)(-y) >= h) return; h += (uint32_t)y; y = 0; }
+    if ((uint32_t)x >= g_fb.width || (uint32_t)y >= g_fb.height) return;
+    if ((uint64_t)x + w > g_fb.width)  w = g_fb.width  - (uint32_t)x;
+    if ((uint64_t)y + h > g_fb.height) h = g_fb.height - (uint32_t)y;
+
+    size_t row_bytes = (size_t)w * g_fb.bytes_pp;
+    for (uint32_t row = 0; row < h; row++) {
+        uint8_t *dst = (uint8_t *)g_fb.front + (uint64_t)(y + row) * g_fb.pitch + (uint64_t)x * g_fb.bytes_pp;
+        uint8_t *src = (uint8_t *)g_fb.back  + (uint64_t)(y + row) * g_fb.pitch + (uint64_t)x * g_fb.bytes_pp;
+        memcpy_nt(dst, src, row_bytes);
+    }
+}
+
 void *fb_back_ptr(void) { return g_fb.back; }
+
+/* ui_flip_userspace_windows — объявлена здесь как forward declaration,
+ * реализация перенесена ниже (после определения UI_MAX_WINDOWS /
+ * ui_window_t / g_windows, которые ей нужны). См. определение рядом с
+ * g_windows. */
+void ui_flip_userspace_windows(void);
 
 /* =========================================================================
  * Примитивы рисования
@@ -836,6 +893,10 @@ static png_image_t g_fxapp_icon_img;              /* MyPC.png (или из ма�
 static int          g_fxapp_icon_loaded  = 0;
 static png_image_t g_fxapp_close_img;             /* close.png — общая иконка закрытия для ЛЮБОГО окна */
 static int          g_fxapp_close_loaded = 0;
+static png_image_t g_fxapp_expand_img;             /* expand.png — развернуть/восстановить окно */
+static int          g_fxapp_expand_loaded = 0;
+static png_image_t g_fxapp_minimize_img;           /* minimize.png — свернуть окно в панель задач */
+static int          g_fxapp_minimize_loaded = 0;
 
 static char g_fxapp_title[FXAPP_NAME_MAX] = "My Computer";
 static char g_fxapp_icon_rel[FXAPP_ICON_MAX] = "MyPC.png";
@@ -849,10 +910,34 @@ static bool         g_fxapp_icon_hover = false;
  * и его кнопка на панели задач ведёт общий for-all-apps код. */
 static int g_fxapp_win_id = -1; /* UI_WIN_INVALID */
 
+/* ---- Калькулятор — вторая иконка рабочего стола, НО в отличие от
+ * "My Computer" (который просто открывает встроенное окно ядра) это
+ * настоящее userspace-приложение: клик по иконке запускает APPS/calc.elf
+ * через elf64_spawn (см. calc_icon_click ниже) — тот же путь, каким
+ * .fxapp-манифесты запускают себя через fxapp_launch(). Своё окно и
+ * рисование в нём калькулятор делает сам через syscall'ы
+ * SYS_WIN_CREATE/SYS_WIN_GET_RECT/SYS_GET_FRAMEBUFFER/SYS_INPUT_POLL. */
+static png_image_t g_calc_icon_img;                /* calc.png (или из манифеста) */
+static int          g_calc_icon_loaded = 0;
+static char g_calc_title[FXAPP_NAME_MAX] = "Calculator";
+static char g_calc_icon_rel[FXAPP_ICON_MAX] = "calc.png";
+static char g_calc_elf_path[FXAPP_PATH_MAX] = "/APPS/calc.elf";  /* ВАЖНО: с ведущим
+    слэшем — vfs_open() в этой VFS не резолвит относительные пути без "/"
+    (см. тот же паттерн у cursor.png/UI-иконок: "UI/x" не находится,
+    "/UI/x" — находится; elf64_spawn->vfs_open здесь не делает fallback
+    сам, поэтому путь сразу должен быть абсолютным). */
+static fb_color_t *g_calc_icon_clean_bg = NULL;
+static bool         g_calc_icon_hover = false;
+static int32_t      g_calc_running_tid = -1;  /* -1 = сейчас никакого экземпляра не запущено */
+extern bool sched_task_alive(uint32_t tid);   /* Scheduler.c */
+
 static void icon_rect(int32_t *ix, int32_t *iy);
+static void calc_icon_rect(int32_t *ix, int32_t *iy);
 static void fxapp_ensure_assets_loaded(void);
 static void fxapp_capture_icon_bg(void);
 static void fxapp_draw_icon(bool hovered);
+static void calc_capture_icon_bg(void);
+static void calc_draw_icon(bool hovered);
 
 /* =========================================================================
  * Генерический оконный менеджер — см. Framebuffer.h: ui_win_create/
@@ -865,6 +950,9 @@ static void fxapp_draw_icon(bool hovered);
 
 #define UI_WIN_TITLEBAR_H     28u
 #define UI_WIN_CLOSE_SZ       20u
+#define UI_WIN_EXPAND_SZ      20u
+#define UI_WIN_MIN_SZ         20u
+#define UI_WIN_BTN_GAP         4u   /* зазор между кнопками close/expand/minimize */
 #define UI_WIN_TITLEBAR_BG    0x2255AAU
 #define UI_WIN_TITLEBAR_FG    FB_WHITE
 #define UI_WIN_BODY_BG        FB_WHITE
@@ -889,15 +977,85 @@ typedef struct {
     int32_t  owner_pid;      /* -1 = встроенное окно ядра */
 
     uint8_t    *saved_bg;    /* фон под окном (сырые байты кадра), для переноса при drag */
+    uint8_t    *content_bak; /* СВОИ пиксели окна (рамка+тело как есть на
+                               * экране) — захватываются перед перемещением
+                               * и переносятся на новое место как картинка,
+                               * вместо стирания тела в белый и ожидания,
+                               * пока приложение (кооперативно!) не
+                               * перерисуется само. См. ui_win_move_ex. */
     bool        dragging;
     int32_t     drag_off_x, drag_off_y;
+
+    bool        minimized;   /* окно скрыто с экрана, но живо (см. кнопку
+                               * на панели задач) — used/open НЕ трогаем,
+                               * иначе кнопка тоже пропадёт с панели */
+    bool        maximized;   /* развёрнуто на весь экран (кроме панели
+                               * задач); rest_* — геометрия для возврата */
+    int32_t     rest_x, rest_y;
+    uint32_t    rest_w, rest_h;
 } ui_window_t;
 
 static ui_window_t g_windows[UI_MAX_WINDOWS];
 
+/* ui_flip_userspace_windows — переносит в VRAM тело КАЖДОГО открытого
+ * окна, которым владеет независимый userspace-процесс (owner_pid >= 0,
+ * т.е. запущен через elf64_spawn + SYS_WIN_CREATE, как calc.c — см.
+ * ui_win_create() ниже).
+ *
+ * ПОЧЕМУ ЭТО НУЖНО (баг "калькулятор открывается с белым фоном, кнопки
+ * проявляются только под курсором"): такие окна рисуют пиксели прямо в
+ * back-buffer САМИ, асинхронно, в СВОЁМ потоке — приложение получает
+ * через SYS_GET_FRAMEBUFFER указатель на back-buffer и пишет пиксели
+ * через put_px() (calc.c), но никакого "я перерисовался, перенеси меня
+ * на экран" события ядро от него не получает (такого syscall'а просто
+ * нет). До сих пор перенос back->front для таких окон происходил
+ * СЛУЧАЙНО:
+ *  - либо через частичный fb_flip_rect() под курсором (ui_tick) — тогда
+ *    видна только та часть, по которой физически прошёл курсор,
+ *  - либо через полный fb_flip() на "big change" (клик/drag), но только
+ *    если он успевает произойти ПОСЛЕ того, как поток calc.c реально
+ *    получил время на планировщике и дорисовал кнопки — иначе окно так
+ *    и остаётся с пустым (белым, см. UI_WIN_BODY_BG) телом, нарисованным
+ *    в ui_win_draw() при создании окна.
+ *
+ * Решение — не гадать, когда приложение перерисовалось, а на КАЖДОМ
+ * таймерном тике безусловно копировать в VRAM ровно прямоугольник
+ * каждого такого окна. Это дёшево даже под TCG QEMU (см. комментарий у
+ * fb_flip_rect выше про полный fb_flip() ценой ~1с) — копируется
+ * маленькая область размером с окно, а не весь экран, поэтому не
+ * воспроизводит проблему "зависаний", ради которой когда-то убрали
+ * безусловный fb_flip() каждый тик. */
+void ui_flip_userspace_windows(void) {
+    for (int i = 0; i < (int)UI_MAX_WINDOWS; i++) {
+        ui_window_t *win = &g_windows[i];
+        if (!win->used || !win->open || win->minimized) continue;
+        if (win->owner_pid < 0) continue; /* окна ядра сами делают fb_flip() при своих изменениях */
+        fb_flip_rect(win->x, win->y, win->w, win->h);
+    }
+}
+
 static void ui_win_draw(int id);
 static void ui_win_save_bg(int id, int32_t wx, int32_t wy);
 static void ui_win_restore_bg(int id, int32_t wx, int32_t wy);
+
+/* Координаты трёх кнопок заголовка — close (крайняя справа), expand
+ * (левее close), minimize (левее expand). Общая функция для отрисовки
+ * (ui_win_draw) и обработки кликов (ui_desktop_handle_mouse), чтобы
+ * геометрия не могла разъехаться между рисованием и хит-тестом. */
+static void ui_win_btn_rects(const ui_window_t *win,
+                             int32_t *close_x, int32_t *close_y,
+                             int32_t *expand_x, int32_t *expand_y,
+                             int32_t *min_x, int32_t *min_y) {
+    int32_t wx = win->x, wy = win->y;
+    *close_x  = wx + (int32_t)win->w - (int32_t)UI_WIN_CLOSE_SZ - 4;
+    *close_y  = wy + (int32_t)((UI_WIN_TITLEBAR_H - UI_WIN_CLOSE_SZ) / 2u);
+
+    *expand_x = *close_x - (int32_t)UI_WIN_BTN_GAP - (int32_t)UI_WIN_EXPAND_SZ;
+    *expand_y = wy + (int32_t)((UI_WIN_TITLEBAR_H - UI_WIN_EXPAND_SZ) / 2u);
+
+    *min_x    = *expand_x - (int32_t)UI_WIN_BTN_GAP - (int32_t)UI_WIN_MIN_SZ;
+    *min_y    = wy + (int32_t)((UI_WIN_TITLEBAR_H - UI_WIN_MIN_SZ) / 2u);
+}
 static void ui_taskbar_draw_app_buttons(int32_t panel_y);
 static void ui_taskbar_app_btn_rect(int slot_idx, int32_t panel_y,
                                     int32_t *bx, int32_t *by, uint32_t *bw, uint32_t *bh);
@@ -911,6 +1069,10 @@ static void ui_taskbar_app_btn_rect(int slot_idx, int32_t panel_y,
  * и новые vfs_mount_count()/vfs_mount_info().
  * ========================================================================= */
 #include "VFS.h"
+
+/* ELF64.c — нужен только для запуска калькулятора (elf64_spawn), см.
+ * calc_icon_rect/g_calc_* блок выше. */
+extern int elf64_spawn(const char *path, const char *name, int prio);
 
 /* См. fm_reset()/fm_handle_click() ниже: блокирующая загрузка с диска
  * (иконки + перечисление дисков/директорий) должна быть неделима
@@ -1051,6 +1213,16 @@ static void ui_draw_taskbar_clock(int32_t panel_y) {
     fb_draw_digit2(cx + 16 + 8 + 24, cy, ss, CLOCK_FG, CLOCK_BG);
 }
 
+/* fb_flip_clock_area — переносит в VRAM только полосу часов на taskbar.
+ * Вызывается из ui_tick() (ui_extra.c) когда ui_clock_tick() вернул 1
+ * (секунда действительно сменилась). Геометрия (TASKBAR_H и т.п.)
+ * приватна для этого файла, поэтому обёрнута в отдельную функцию, а не
+ * задублирована в ui_extra.c. */
+void fb_flip_clock_area(void) {
+    uint32_t panel_y = (g_fb.height >= TASKBAR_H) ? g_fb.height - TASKBAR_H : 0;
+    fb_flip_rect(0, (int32_t)panel_y, g_fb.width, TASKBAR_H);
+}
+
 void ui_redraw_clock(void) {
     if (g_fb.mode != FB_MODE_LINEAR) return;
     if (!g_fb.width || !g_fb.height) return;
@@ -1062,6 +1234,39 @@ void ui_redraw_clock(void) {
     fb_fill_rect(cx, (int32_t)panel_y, (uint32_t)cw + 8, TASKBAR_H, CLOCK_BG);
     ui_draw_taskbar_clock((int32_t)panel_y);
     fb_flip();
+}
+
+/* ui_clock_tick — вызывать КАЖДЫЙ таймерный тик (не раз в UI_TICK_HZ
+ * тиков, как раньше). Раньше часы перерисовывались по счётчику "прошло
+ * 100 тиков" — но во время блокирующего чтения диска (см. fm_reset()/
+ * fm_handle_click() в "My Computer", там теперь весь I/O под cli())
+ * таймер физически не тикает, счётчик отстаёт от реального времени.
+ * Когда cli() снимается, RTC уже показывает актуальное (ушедшее вперёд)
+ * время — на экране это выглядело как "часы замерли, потом скакнули
+ * на несколько секунд". Читаем реальное текущее значение RTC каждый
+ * тик и перерисовываем ТОЛЬКО когда секунда действительно изменилась —
+ * так экран всегда синхронен с настоящим временем независимо от того,
+ * сколько тиков было физически потеряно. */
+int ui_clock_tick(void) {
+    if (g_fb.mode != FB_MODE_LINEAR) return 0;
+    if (!g_fb.width || !g_fb.height) return 0;
+
+    static int last_h = -1, last_m = -1, last_s = -1;
+    int hh, mm, ss;
+    rtc_get_msk(&hh, &mm, &ss);
+
+    if (hh == last_h && mm == last_m && ss == last_s) return 0;
+    last_h = hh; last_m = mm; last_s = ss;
+
+    uint32_t panel_y = (g_fb.height >= TASKBAR_H) ? g_fb.height - TASKBAR_H : 0;
+    int32_t cw = 8 * FB_FONT_W;
+    int32_t cx = (int32_t)g_fb.width - cw - 8;
+
+    fb_fill_rect(cx, (int32_t)panel_y, (uint32_t)cw + 8, TASKBAR_H, CLOCK_BG);
+    ui_draw_taskbar_clock((int32_t)panel_y);
+    /* fb_flip()/fb_flip_rect() не нужен — вызывающий ui_tick() и так
+     * переносит область часов в VRAM сам, увидев, что мы вернули 1. */
+    return 1;
 }
 
 /* Целочисленный квадратный корень (метод Ньютона) — нет плавающей точки
@@ -1203,6 +1408,16 @@ static void icon_rect(int32_t *ix, int32_t *iy) {
     *iy = FXAPP_ICON_MARGIN;
 }
 
+/* Калькулятор — иконка "рядом с MyPC": тот же X (правый край), но ниже —
+ * под иконкой MyPC вместе с её halo и подписью (halo снизу занимает
+ * FXAPP_ICON_HALO_PAD, подпись — ещё ~4+16px, берём запас в 40px). */
+static void calc_icon_rect(int32_t *ix, int32_t *iy) {
+    int32_t mx, my;
+    icon_rect(&mx, &my);
+    *ix = mx;
+    *iy = my + (int32_t)FXAPP_ICON_H + 40;
+}
+
 /* Отрисовать декодированный PNG (RGBA) с альфа-блендингом по фону экрана.
  * Общая функция для иконки на рабочем столе и кнопки close.png. */
 static void fxapp_blit_png(int32_t x, int32_t y, const png_image_t *img) {
@@ -1310,47 +1525,77 @@ static void fxapp_ensure_assets_loaded(void) {
     g_fxapp_close_img.pixels = NULL;
     if (fxapp_load_png_asset("close.png", FXAPP_WIN_CLOSE_SZ, FXAPP_WIN_CLOSE_SZ, &g_fxapp_close_img))
         g_fxapp_close_loaded = 1;
+
+    g_fxapp_expand_img.pixels = NULL;
+    if (fxapp_load_png_asset("expand.png", UI_WIN_EXPAND_SZ, UI_WIN_EXPAND_SZ, &g_fxapp_expand_img))
+        g_fxapp_expand_loaded = 1;
+
+    g_fxapp_minimize_img.pixels = NULL;
+    if (fxapp_load_png_asset("minimize.png", UI_WIN_MIN_SZ, UI_WIN_MIN_SZ, &g_fxapp_minimize_img))
+        g_fxapp_minimize_loaded = 1;
+
+    /* Калькулятор — манифест необязателен (как и у My Computer): если
+     * APPS/Calculator.fxapp есть на диске, берём оттуда имя/иконку/путь
+     * к ELF; если нет — используются значения по умолчанию, заданные
+     * при инициализации g_calc_* выше. */
+    fxapp_t capp;
+    if (fxapp_load("APPS/Calculator.fxapp", &capp) == 0 ||
+        fxapp_load("/APPS/Calculator.fxapp", &capp) == 0) {
+        if (capp.header.name[0] != '\0')
+            strlcpy(g_calc_title, capp.header.name, sizeof(g_calc_title));
+        if (capp.header.icon[0] != '\0')
+            strlcpy(g_calc_icon_rel, capp.header.icon, sizeof(g_calc_icon_rel));
+        if (capp.header.elf_path[0] != '\0')
+            strlcpy(g_calc_elf_path, capp.header.elf_path, sizeof(g_calc_elf_path));
+        DBG_MSG("FXA", "Calculator.fxapp manifest loaded");
+    } else {
+        DBG_MSG("FXA", "Calculator.fxapp manifest not found, using defaults");
+    }
+
+    g_calc_icon_img.pixels = NULL;
+    if (fxapp_load_png_asset(g_calc_icon_rel, FXAPP_ICON_W, FXAPP_ICON_H, &g_calc_icon_img))
+        g_calc_icon_loaded = 1;
 }
 
 /* Захватить "чистый" фон под иконкой+halo сразу после отрисовки обоев/
  * taskbar — используется, чтобы дёшево перерисовывать иконку при смене
- * hover-состояния, не трогая обои (без повторного декодирования PNG). */
-static void fxapp_capture_icon_bg(void) {
-    int32_t icx, icy;
-    icon_rect(&icx, &icy);
+ * hover-состояния, не трогая обои (без повторного декодирования PNG).
+ * bg_slot — указатель на per-иконку статический буфер (свой у каждой
+ * иконки рабочего стола — MyPC, калькулятор, ...), выделяется лениво
+ * при первом вызове. */
+static void fxapp_capture_icon_bg_generic(int32_t icx, int32_t icy, fb_color_t **bg_slot) {
     int32_t  hx = icx - FXAPP_ICON_HALO_PAD;
     int32_t  hy = icy - FXAPP_ICON_HALO_PAD;
     uint32_t hw = FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD;
     uint32_t hh = FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD;
 
-    if (!g_fxapp_icon_clean_bg) {
-        g_fxapp_icon_clean_bg = (fb_color_t *)kmalloc((uint64_t)hw * hh * sizeof(fb_color_t));
+    if (!*bg_slot) {
+        *bg_slot = (fb_color_t *)kmalloc((uint64_t)hw * hh * sizeof(fb_color_t));
     }
-    if (!g_fxapp_icon_clean_bg) return;
+    if (!*bg_slot) return;
 
     for (uint32_t row = 0; row < hh; row++)
         for (uint32_t col = 0; col < hw; col++)
-            g_fxapp_icon_clean_bg[row * hw + col] =
-                fb_get_pixel(hx + (int32_t)col, hy + (int32_t)row);
+            (*bg_slot)[row * hw + col] = fb_get_pixel(hx + (int32_t)col, hy + (int32_t)row);
 }
 
-/* Нарисовать иконку (и, если hovered, полупрозрачный фиолетовый halo
- * вокруг неё). Сначала восстанавливает чистый фон, захваченный
- * fxapp_capture_icon_bg(), затем рисует halo (если нужен) и саму
- * иконку поверх. Не делает fb_flip() — вызывающий код решает сам. */
-static void fxapp_draw_icon(bool hovered) {
-    int32_t icx, icy;
-    icon_rect(&icx, &icy);
+/* Нарисовать одну иконку рабочего стола (и, если hovered, полупрозрачный
+ * halo вокруг неё) + подпись под ней. Сначала восстанавливает чистый фон,
+ * захваченный fxapp_capture_icon_bg_generic(), затем halo (если нужен) и
+ * саму иконку (PNG, либо fallback-квадрат с fallback_text, если PNG не
+ * загружен) поверх. Не делает fb_flip() — вызывающий код решает сам. */
+static void fxapp_draw_icon_generic(int32_t icx, int32_t icy, fb_color_t *clean_bg,
+                                    bool hovered, bool loaded, const png_image_t *img,
+                                    const char *fallback_text, const char *label) {
     int32_t  hx = icx - FXAPP_ICON_HALO_PAD;
     int32_t  hy = icy - FXAPP_ICON_HALO_PAD;
     uint32_t hw = FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD;
     uint32_t hh = FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD;
 
-    if (g_fxapp_icon_clean_bg) {
+    if (clean_bg) {
         for (uint32_t row = 0; row < hh; row++)
             for (uint32_t col = 0; col < hw; col++)
-                fb_put_pixel(hx + (int32_t)col, hy + (int32_t)row,
-                            g_fxapp_icon_clean_bg[row * hw + col]);
+                fb_put_pixel(hx + (int32_t)col, hy + (int32_t)row, clean_bg[row * hw + col]);
     }
 
     if (hovered) {
@@ -1374,32 +1619,54 @@ static void fxapp_draw_icon(bool hovered) {
         }
     }
 
-    if (g_fxapp_icon_loaded && g_fxapp_icon_img.pixels) {
-        fxapp_blit_png(icx, icy, &g_fxapp_icon_img);
+    if (loaded && img && img->pixels) {
+        fxapp_blit_png(icx, icy, img);
     } else {
-        /* fallback, если MyPC.png не найден на диске */
+        /* fallback, если соответствующий .png не найден на диске */
         fb_fill_rect(icx, icy, FXAPP_ICON_W, FXAPP_ICON_H, FB_LIGHT_GRAY);
         fb_draw_rect(icx, icy, FXAPP_ICON_W, FXAPP_ICON_H, FB_DARK_GRAY, 2);
-        fb_draw_string(icx + 20, icy + (int32_t)(FXAPP_ICON_H / 2u) - 8,
-                       "PC", FB_BLACK, FB_LIGHT_GRAY);
+        int32_t tw = (int32_t)fb_text_width(fallback_text);
+        fb_draw_string(icx + (int32_t)((FXAPP_ICON_W - (uint32_t)(tw > 0 ? tw : 0)) / 2),
+                       icy + (int32_t)(FXAPP_ICON_H / 2u) - 8,
+                       fallback_text, FB_BLACK, FB_LIGHT_GRAY);
     }
 
-    /* Подпись под иконкой (как под disk.png/folder.png/file.png в самом
-     * окне "My Computer" — см. fm_draw), тем же именем, что и в шапке
-     * окна (g_fxapp_title, по умолчанию "My Computer" или из манифеста
-     * APPS/MyComputer.fxapp). Рисуем поверх WALLPAPER_COLOR/обоев —
-     * fxapp_capture_icon_bg() уже захватил фон под халом иконки ДО этой
-     * подписи, так что при повторной перерисовке (hover) текст тоже
-     * корректно восстановится вместе с остальным захваченным фоном
-     * только если попадает в захваченную область — halo сверху покрывает
-     * иконку с запасом FXAPP_ICON_HALO_PAD, а подпись ниже иконки в эту
-     * область не входит, поэтому просто перерисовываем её каждый раз. */
+    /* Подпись под иконкой — прозрачный фон (см. FB_TRANSPARENT_BG в
+     * fb_draw_char), чтобы не закрывать обои непрозрачным прямоугольником. */
     {
-        int32_t lw = (int32_t)fb_text_width(g_fxapp_title);
+        int32_t lw = (int32_t)fb_text_width(label);
         int32_t lx = icx + (int32_t)((FXAPP_ICON_W - (uint32_t)(lw > 0 ? lw : 0)) / 2);
         int32_t ly = icy + (int32_t)FXAPP_ICON_H + FXAPP_ICON_HALO_PAD + 4;
-        fb_draw_string(lx, ly, g_fxapp_title, FB_WHITE, FB_TRANSPARENT_BG);
+        fb_draw_string(lx, ly, label, FB_WHITE, FB_TRANSPARENT_BG);
     }
+}
+
+/* ---- MyPC: тонкие обёртки над generic-версиями выше ---- */
+static void fxapp_capture_icon_bg(void) {
+    int32_t icx, icy;
+    icon_rect(&icx, &icy);
+    fxapp_capture_icon_bg_generic(icx, icy, &g_fxapp_icon_clean_bg);
+}
+
+static void fxapp_draw_icon(bool hovered) {
+    int32_t icx, icy;
+    icon_rect(&icx, &icy);
+    fxapp_draw_icon_generic(icx, icy, g_fxapp_icon_clean_bg, hovered,
+                            g_fxapp_icon_loaded, &g_fxapp_icon_img, "PC", g_fxapp_title);
+}
+
+/* ---- Калькулятор: тонкие обёртки над generic-версиями выше ---- */
+static void calc_capture_icon_bg(void) {
+    int32_t icx, icy;
+    calc_icon_rect(&icx, &icy);
+    fxapp_capture_icon_bg_generic(icx, icy, &g_calc_icon_clean_bg);
+}
+
+static void calc_draw_icon(bool hovered) {
+    int32_t icx, icy;
+    calc_icon_rect(&icx, &icy);
+    fxapp_draw_icon_generic(icx, icy, g_calc_icon_clean_bg, hovered,
+                            g_calc_icon_loaded, &g_calc_icon_img, "+-", g_calc_title);
 }
 
 /* =========================================================================
@@ -1835,6 +2102,50 @@ static void ui_win_restore_bg(int id, int32_t wx, int32_t wy) {
     }
 }
 
+/* ui_win_capture / ui_win_blit_captured — вместо стирания окна в белый
+ * цвет при каждом тике перетаскивания (ui_win_draw()) и ожидания, пока
+ * приложение САМО (кооперативно, когда планировщик даст ему время)
+ * перерисует своё содержимое, просто запоминаем ТЕКУЩИЕ пиксели окна
+ * (рамку+тело как есть на экране, включая всё, что нарисовало
+ * приложение) и переносим их как обычную картинку на новое место.
+ * Раньше окно на весь drag становилось пустым (или "проявлялось"
+ * только маленькими частичными flip'ами вслед за курсором) — теперь
+ * оно просто едет вместе со своим содержимым, как в любой обычной ОС.
+ * Приложение при этом всё равно может перерисоваться поверх (оно уже
+ * само следит за g_rect и делает это) — так оно и должно быть, просто
+ * теперь это не единственный способ увидеть содержимое. */
+static void ui_win_capture(int id, int32_t wx, int32_t wy) {
+    ui_window_t *win = &g_windows[id];
+    if (g_fb.mode != FB_MODE_LINEAR) return;
+
+    uint64_t row_bytes = (uint64_t)win->w * g_fb.bytes_pp;
+    if (!win->content_bak) {
+        win->content_bak = (uint8_t *)kmalloc(row_bytes * win->h);
+    }
+    if (!win->content_bak) return;
+
+    const uint8_t *buf = draw_buf();
+    for (uint32_t row = 0; row < win->h; row++) {
+        const uint8_t *src = buf + (uint64_t)(wy + (int32_t)row) * g_fb.pitch
+                                  + (uint64_t)wx * g_fb.bytes_pp;
+        memcpy(win->content_bak + (uint64_t)row * row_bytes, src, row_bytes);
+    }
+}
+
+static void ui_win_blit_captured(int id, int32_t wx, int32_t wy) {
+    ui_window_t *win = &g_windows[id];
+    if (g_fb.mode != FB_MODE_LINEAR) return;
+    if (!win->content_bak) { ui_win_draw(id); return; } /* первый раз — нечего переносить */
+
+    uint64_t row_bytes = (uint64_t)win->w * g_fb.bytes_pp;
+    uint8_t *buf = draw_buf();
+    for (uint32_t row = 0; row < win->h; row++) {
+        uint8_t *dst = buf + (uint64_t)(wy + (int32_t)row) * g_fb.pitch
+                            + (uint64_t)wx * g_fb.bytes_pp;
+        memcpy(dst, win->content_bak + (uint64_t)row * row_bytes, row_bytes);
+    }
+}
+
 /* Нарисовать "раму" окна: белое тело, синий заголовок слева с именем,
  * кнопка close.png (или fallback 'X') справа в заголовке. Содержимое
  * окна (тело приложения) сюда не входит — сегодня тело всегда просто
@@ -1854,8 +2165,8 @@ static void ui_win_draw(int id) {
     int32_t ty = wy + (int32_t)((UI_WIN_TITLEBAR_H - FB_FONT_H) / 2u);
     fb_draw_string(tx, ty, win->title, UI_WIN_TITLEBAR_FG, UI_WIN_TITLEBAR_BG);
 
-    int32_t cx = wx + (int32_t)win->w - (int32_t)UI_WIN_CLOSE_SZ - 4;
-    int32_t cy = wy + (int32_t)((UI_WIN_TITLEBAR_H - UI_WIN_CLOSE_SZ) / 2u);
+    int32_t cx, cy, ex, ey, mx, my;
+    ui_win_btn_rects(win, &cx, &cy, &ex, &ey, &mx, &my);
 
     if (g_fxapp_close_loaded && g_fxapp_close_img.pixels) {
         fxapp_blit_png(cx, cy, &g_fxapp_close_img);
@@ -1865,6 +2176,28 @@ static void ui_win_draw(int id) {
         fb_draw_string(cx + (int32_t)((UI_WIN_CLOSE_SZ - FB_FONT_W) / 2u),
                        cy + (int32_t)((UI_WIN_CLOSE_SZ - FB_FONT_H) / 2u),
                        "X", FB_WHITE, 0xC04040U);
+    }
+
+    if (g_fxapp_expand_loaded && g_fxapp_expand_img.pixels) {
+        fxapp_blit_png(ex, ey, &g_fxapp_expand_img);
+    } else {
+        fb_fill_rect(ex, ey, UI_WIN_EXPAND_SZ, UI_WIN_EXPAND_SZ, 0x606060U);
+        fb_draw_rect(ex, ey, UI_WIN_EXPAND_SZ, UI_WIN_EXPAND_SZ, UI_WIN_BORDER, 1);
+        /* развернуть/восстановить — квадратик побольше/поменьше */
+        const char *glyph = win->maximized ? "><" : "[]";
+        fb_draw_string(ex + (int32_t)((UI_WIN_EXPAND_SZ - 2u * FB_FONT_W) / 2u),
+                       ey + (int32_t)((UI_WIN_EXPAND_SZ - FB_FONT_H) / 2u),
+                       glyph, FB_WHITE, 0x606060U);
+    }
+
+    if (g_fxapp_minimize_loaded && g_fxapp_minimize_img.pixels) {
+        fxapp_blit_png(mx, my, &g_fxapp_minimize_img);
+    } else {
+        fb_fill_rect(mx, my, UI_WIN_MIN_SZ, UI_WIN_MIN_SZ, 0x606060U);
+        fb_draw_rect(mx, my, UI_WIN_MIN_SZ, UI_WIN_MIN_SZ, UI_WIN_BORDER, 1);
+        fb_draw_string(mx + (int32_t)((UI_WIN_MIN_SZ - FB_FONT_W) / 2u),
+                       my + (int32_t)((UI_WIN_MIN_SZ - FB_FONT_H) / 2u),
+                       "_", FB_WHITE, 0x606060U);
     }
 }
 
@@ -1993,6 +2326,30 @@ int ui_win_create(const char *title, uint32_t w, uint32_t h, int32_t owner_pid) 
     return id;
 }
 
+/* ui_win_get_rect — отдаёт ОБЛАСТЬ СОДЕРЖИМОГО окна (то, что НИЖЕ
+ * заголовка — там, где userspace-приложению можно рисовать пиксели
+ * напрямую через framebuffer, полученный SYS_GET_FRAMEBUFFER), а не
+ * полный прямоугольник окна с заголовком. Так вызывающему (syscall'у,
+ * см. sc_win_get_rect в Syscall.c) не нужно знать о UI_WIN_TITLEBAR_H —
+ * это внутренняя деталь оконного менеджера. Координаты — АБСОЛЮТНЫЕ
+ * (в системе координат всего экрана/framebuffer), не относительные
+ * окну — ровно то, что нужно, чтобы писать пиксели по нужным индексам
+ * в framebuffer, который у процесса один общий на весь экран.
+ * Возвращает false, если win_id невалиден/окно не открыто. */
+bool ui_win_get_rect(int win_id, int32_t *out_x, int32_t *out_y,
+                     uint32_t *out_w, uint32_t *out_h) {
+    if (win_id < 0 || win_id >= (int)UI_MAX_WINDOWS) return false;
+    ui_window_t *win = &g_windows[win_id];
+    if (!win->used || !win->open) return false;
+    if (win->h <= UI_WIN_TITLEBAR_H) return false;
+
+    if (out_x) *out_x = win->x;
+    if (out_y) *out_y = win->y + (int32_t)UI_WIN_TITLEBAR_H;
+    if (out_w) *out_w = win->w;
+    if (out_h) *out_h = win->h - UI_WIN_TITLEBAR_H;
+    return true;
+}
+
 int ui_win_close(int win_id) {
     if (win_id < 0 || win_id >= (int)UI_MAX_WINDOWS) return -1;
     ui_window_t *win = &g_windows[win_id];
@@ -2002,6 +2359,7 @@ int ui_win_close(int win_id) {
     win->open = false;
     win->dragging = false;
     if (win->saved_bg) { kfree(win->saved_bg); win->saved_bg = NULL; }
+    if (win->content_bak) { kfree(win->content_bak); win->content_bak = NULL; }
     win->used = false;
 
     ui_taskbar_draw_app_buttons(ui_taskbar_panel_y());
@@ -2022,18 +2380,98 @@ static int ui_win_move_ex(int win_id, int32_t x, int32_t y, bool do_flip) {
     ui_window_t *win = &g_windows[win_id];
     if (!win->used || !win->open) return -1;
 
+    ui_win_capture(win_id, win->x, win->y);   /* запомнить пиксели окна, ПОКА оно ещё на старом месте */
     ui_win_restore_bg(win_id, win->x, win->y);
     win->x = x;
     win->y = y;
     ui_win_save_bg(win_id, win->x, win->y);
-    ui_win_draw(win_id);
-    if (win_id == g_fxapp_win_id) fm_draw(win_id);   /* ui_win_draw закрасило тело белым — перерисовываем сетку иконок */
+    ui_win_blit_captured(win_id, win->x, win->y);  /* переносим как картинку — вместо ui_win_draw()+белое тело */
+    if (win_id == g_fxapp_win_id) fm_draw(win_id);   /* "Мой компьютер" всё равно перерисовывает сетку иконок сам */
     if (do_flip) fb_flip();
     return 0;
 }
 
 int ui_win_move(int win_id, int32_t x, int32_t y) {
     return ui_win_move_ex(win_id, x, y, true);
+}
+
+/* ui_win_minimize — прячет окно с экрана, но НЕ трогает used/open:
+ * кнопка на панели задач должна остаться (см. условие в
+ * ui_taskbar_draw_app_buttons — оно смотрит только used && open), иначе
+ * восстановить окно кликом по панели будет неоткуда. saved_bg остаётся
+ * тем же самым буфером (геометрия окна не меняется), поэтому просто
+ * восстанавливаем фон под ним и помечаем minimized. */
+static void ui_win_minimize(int id) {
+    if (id < 0 || id >= (int)UI_MAX_WINDOWS) return;
+    ui_window_t *win = &g_windows[id];
+    if (!win->used || !win->open || win->minimized) return;
+
+    ui_win_restore_bg(id, win->x, win->y);
+    win->minimized = true;
+    win->dragging = false;
+    fb_flip();
+}
+
+/* ui_win_restore_from_taskbar — показать ранее свёрнутое окно обратно.
+ * saved_bg пересохраняем заново (ui_win_save_bg сам не перевыделяет
+ * буфер, раз он уже есть — просто перезаписывает содержимым текущего
+ * фона под окном), потому что за время, пока окно было свёрнуто, стол
+ * под его старыми координатами мог измениться (курсор, другие окна). */
+static void ui_win_restore_from_taskbar(int id) {
+    if (id < 0 || id >= (int)UI_MAX_WINDOWS) return;
+    ui_window_t *win = &g_windows[id];
+    if (!win->used || !win->open || !win->minimized) return;
+
+    win->minimized = false;
+    ui_win_save_bg(id, win->x, win->y);
+    ui_win_draw(id);
+    if (id == g_fxapp_win_id) fm_draw(id);
+    fb_flip();
+}
+
+/* ui_win_toggle_maximize — развернуть окно на весь экран (кроме панели
+ * задач) или вернуть в предыдущий размер/позицию (rest_*).
+ *
+ * ВАЖНО: saved_bg выделяется ОДИН РАЗ лениво в ui_win_save_bg и больше
+ * никогда не перевыделяется сам — он рассчитан на размер win->w*win->h
+ * НА МОМЕНТ первого сохранения. Если просто поменять win->w/win->h и
+ * вызвать ui_win_save_bg/ui_win_restore_bg заново, буфер останется
+ * старого (меньшего) размера — переполнение при копировании кадра под
+ * новую (большую) геометрию. Поэтому здесь буфер явно освобождается
+ * ПЕРЕД каждым изменением размера, чтобы ui_win_save_bg честно
+ * перевыделил его заново под актуальные win->w/win->h. */
+static void ui_win_toggle_maximize(int id) {
+    if (id < 0 || id >= (int)UI_MAX_WINDOWS) return;
+    ui_window_t *win = &g_windows[id];
+    if (!win->used || !win->open || win->minimized) return;
+
+    int32_t panel_y = ui_taskbar_panel_y();
+
+    ui_win_restore_bg(id, win->x, win->y);
+    if (win->saved_bg) { kfree(win->saved_bg); win->saved_bg = NULL; }
+    if (win->content_bak) { kfree(win->content_bak); win->content_bak = NULL; }
+
+    if (!win->maximized) {
+        win->rest_x = win->x; win->rest_y = win->y;
+        win->rest_w = win->w; win->rest_h = win->h;
+
+        win->x = 0;
+        win->y = 0;
+        win->w = (uint32_t)g_fb.width;
+        win->h = (uint32_t)panel_y;
+        win->maximized = true;
+    } else {
+        win->x = win->rest_x;
+        win->y = win->rest_y;
+        win->w = win->rest_w;
+        win->h = win->rest_h;
+        win->maximized = false;
+    }
+
+    ui_win_save_bg(id, win->x, win->y);
+    ui_win_draw(id);
+    if (id == g_fxapp_win_id) fm_draw(id);
+    fb_flip();
 }
 
 void ui_win_close_all_owned_by(int32_t owner_pid) {
@@ -2106,11 +2544,48 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
         }
     }
 
+    /* ---- Панель задач: клик по вкладке открытого окна — если оно
+     * свёрнуто (minimized), показать его обратно. Обычный (не
+     * свёрнутый) клик по своей же вкладке пока просто ни на что не
+     * влияет — z-order/фокус здесь не реализован. */
+    if (left_click) {
+        int slot = 0;
+        for (int i = 0; i < (int)UI_MAX_WINDOWS; i++) {
+            if (!g_windows[i].used || !g_windows[i].open) continue;
+            int32_t bx, by; uint32_t bw, bh;
+            ui_taskbar_app_btn_rect(slot, panel_y, &bx, &by, &bw, &bh);
+            if (point_in_rect(x, y, bx, by, bw, bh)) {
+                if (g_windows[i].minimized) ui_win_restore_from_taskbar(i);
+                break;
+            }
+            slot++;
+        }
+    }
+
     /* ---- fxapp: иконка "My Computer" на рабочем столе — hover + клик ----
      * Клик по иконке вызывает ui_win_create() — ТОТ ЖЕ САМЫЙ вызов,
      * которым пользуются syscall'ы SYS_WIN_CREATE из Syscall.c, то есть
-     * "запуск" My Computer идёт по общему для всех приложений пути. */
-    {
+     * "запуск" My Computer идёт по общему для всех приложений пути.
+     *
+     * ВАЖНО: icon_rect() — фиксированная позиция на экране, но сама
+     * иконка физически может быть сейчас ПОД открытым окном (обычное
+     * окно перетащили поверх; развёрнутое (maximize) окно — почти
+     * всегда, у него титульная плашка с кнопками close/expand/minimize
+     * занимает как раз тот же верхний правый угол). Раньше hover-логика
+     * этого не проверяла и просто перерисовывала MyPC.png поверх
+     * содержимого окна каждый раз, когда курсор оказывался над этой
+     * областью — визуально выглядело как "иконка вылезает поверх
+     * кнопки expand". Пропускаем весь блок, если курсор сейчас находится
+     * внутри любого открытого (не свёрнутого) окна — тогда клик там
+     * принадлежит окну, а не рабочему столу. */
+    bool cursor_over_window = false;
+    for (int wi = 0; wi < (int)UI_MAX_WINDOWS; wi++) {
+        ui_window_t *w = &g_windows[wi];
+        if (!w->used || !w->open || w->minimized) continue;
+        if (point_in_rect(x, y, w->x, w->y, w->w, w->h)) { cursor_over_window = true; break; }
+    }
+
+    if (!cursor_over_window) {
         int32_t icx, icy;
         icon_rect(&icx, &icy);
         int32_t  hx = icx - FXAPP_ICON_HALO_PAD;
@@ -2136,6 +2611,66 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
                 }
             }
         }
+    } else if (g_fxapp_icon_hover) {
+        /* Курсор ушёл под окно, пока иконка была в hover-состоянии —
+         * снимаем флаг без перерисовки (рисовать сейчас нечего, иконка
+         * физически закрыта окном; когда окно уйдёт/закроется, следующий
+         * тик пересчитает hover заново по текущей позиции курсора). */
+        g_fxapp_icon_hover = false;
+    }
+
+    /* ---- Калькулятор: hover + клик — В ОТЛИЧИЕ от My Computer, клик
+     * НЕ создаёт окно напрямую (ui_win_create), а запускает НАСТОЯЩИЙ
+     * userspace-процесс через elf64_spawn(g_calc_elf_path, ...). Само
+     * окно/содержимое калькулятор создаёт и рисует уже ИЗНУТРИ себя,
+     * через SYS_WIN_CREATE/SYS_WIN_GET_RECT/SYS_GET_FRAMEBUFFER —
+     * ядро тут ничего не знает про арифметику/кнопки калькулятора,
+     * это именно вынесенное в userspace приложение (fxapp с elf_path). */
+    if (!cursor_over_window) {
+        int32_t icx, icy;
+        calc_icon_rect(&icx, &icy);
+        int32_t  hx = icx - FXAPP_ICON_HALO_PAD;
+        int32_t  hy = icy - FXAPP_ICON_HALO_PAD;
+        uint32_t hw = FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD;
+        uint32_t hh = FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD;
+
+        bool now_hover = point_in_rect(x, y, hx, hy, hw, hh);
+        if (now_hover != g_calc_icon_hover) {
+            g_calc_icon_hover = now_hover;
+            calc_draw_icon(g_calc_icon_hover);
+        }
+
+        if (left_click && now_hover) {
+            /* НЕ запускаем второй экземпляр, если предыдущий ещё жив —
+             * несколько одновременных ring3-процессов обнажают гонки
+             * при спавне/переключении контекста (общий стек SYSCALL уже
+             * чинили; вскрылись и другие). Проще и надёжнее не пускать
+             * пользователя в эту ситуацию вообще, чем гоняться за каждой
+             * гонкой по отдельности — так же ведут себя и обычные ОС
+             * (повторный клик по иконке уже запущенного приложения
+             * обычно не создаёт второй процесс). */
+            if (g_calc_running_tid >= 0 && sched_task_alive((uint32_t)g_calc_running_tid)) {
+                DBG_MSG("FXA", "calc: уже запущен, повторный спавн пропущен");
+                return;
+            }
+
+            /* elf64_spawn() читает calc.elf с диска (блокирующий VFS/FAT32
+             * I/O) — та же причина реентрантности, что чинили для
+             * fm_reset()/fm_handle_click() в "My Computer" (см.
+             * fm_io_cli/fm_io_sti выше): без cli() таймерный тик может
+             * повторно войти в этот же обработчик ДО того как g_prev_buttons
+             * обновится, читая g_calc_icon_hover/клик в неконсистентном
+             * состоянии. */
+            uint64_t spawn_flags = fm_io_cli();
+            int tid = elf64_spawn(g_calc_elf_path, g_calc_title, 0 /* SCHED_PRIO_NORMAL */);
+            fm_io_sti(spawn_flags);
+            g_calc_running_tid = tid;
+            if (tid < 0) {
+                DBG_VAL("FXA", "calc: elf64_spawn failed, rc", (uint64_t)(int64_t)tid);
+            }
+        }
+    } else if (g_calc_icon_hover) {
+        g_calc_icon_hover = false;
     }
 
     /* ---- Окна — перетаскивание за заголовок, закрытие крестиком.
@@ -2144,13 +2679,24 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
     for (int i = 0; i < (int)UI_MAX_WINDOWS; i++) {
         ui_window_t *win = &g_windows[i];
         if (!win->used || !win->open) continue;
+        if (win->minimized) continue;   /* невидимо — некликабельно, кроме вкладки на панели задач (см. выше) */
 
-        int32_t cx = win->x + (int32_t)win->w - (int32_t)UI_WIN_CLOSE_SZ - 4;
-        int32_t cy = win->y + (int32_t)((UI_WIN_TITLEBAR_H - UI_WIN_CLOSE_SZ) / 2u);
+        int32_t cx, cy, ex, ey, mnx, mny;
+        ui_win_btn_rects(win, &cx, &cy, &ex, &ey, &mnx, &mny);
 
         if (left_click && point_in_rect(x, y, cx, cy, UI_WIN_CLOSE_SZ, UI_WIN_CLOSE_SZ)) {
             ui_win_close(i);
             if (i == g_fxapp_win_id) g_fxapp_win_id = -1;
+            continue;
+        }
+
+        if (left_click && point_in_rect(x, y, ex, ey, UI_WIN_EXPAND_SZ, UI_WIN_EXPAND_SZ)) {
+            ui_win_toggle_maximize(i);
+            continue;
+        }
+
+        if (left_click && point_in_rect(x, y, mnx, mny, UI_WIN_MIN_SZ, UI_WIN_MIN_SZ)) {
+            ui_win_minimize(i);
             continue;
         }
 
@@ -2286,6 +2832,10 @@ void ui_draw_desktop(void) {
     fxapp_ensure_assets_loaded();
     fxapp_capture_icon_bg();
     fxapp_draw_icon(g_fxapp_icon_hover);
+
+    /* Калькулятор — вторая иконка, сразу под MyPC (см. calc_icon_rect). */
+    calc_capture_icon_bg();
+    calc_draw_icon(g_calc_icon_hover);
 
     /* Если какие-то окна уже были открыты (например полный редрав вызван
      * не при старте) — перерисуем их поверх рабочего стола. Общий цикл
