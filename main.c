@@ -24,6 +24,15 @@ extern blkdev_t *ide_find_drive(const char *name);
 extern int       ahci_init(void);
 extern blkdev_t *ahci_find_drive(const char *name);
 
+/* -------------------------------------------------------------------------
+ * USB (UHCI/EHCI) — см. Resources/USB.c. Поднимает контроллеры,
+ * перечисляет устройства и подключает классовые драйверы: HID
+ * (клавиатура/мышь, Boot Protocol — Resources/USBHID.c) и Mass Storage
+ * BOT (флешки — Resources/USBMassStorage.c, регистрируется как обычный
+ * blkdev через VFS.h, см. VFS-монтирование ниже).
+ * ------------------------------------------------------------------------- */
+extern void usb_init(void);
+
 typedef struct __attribute__((packed)) {
     uint64_t magic;
     void    *mem_map;
@@ -680,6 +689,20 @@ void kernel_entry(BOOT_INFO *info) {
     } else {
         kprint_err("[INFO] ide_init (no IDE drives)", ret);
     }
+
+    /* ------------------------------------------------------------------
+     * Блок 3.5: USB (UHCI/EHCI + HID + Mass Storage BOT) — см.
+     * Resources/USB.c. Контроллеры + перечисление устройств; найденные
+     * USB-флешки регистрируются как blkdev ("uda", "udb", ...) ДО
+     * монтирования VFS ниже, поэтому могут быть примонтированы наравне
+     * с AHCI/IDE. Клавиатура/мышь начинают работать сразу (см. хук
+     * usb_hid_poll_all в Scheduler.c: sched_tick), без участия VFS.
+     * Требует активного PMM/kmalloc (уже готовы) и PCI config space
+     * (доступен всегда через порты 0xCF8/0xCFC, отдельной инициализации
+     * не требует).
+     * ------------------------------------------------------------------ */
+    DBG_MSG("KR", "23b usb_init...");
+    usb_init();
 
     /* ------------------------------------------------------------------
      * Монтируем первое доступное устройство как "/"

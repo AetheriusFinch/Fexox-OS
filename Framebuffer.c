@@ -249,6 +249,15 @@ typedef struct {
     uint8_t  bpp;
     uint8_t  bytes_pp;
 
+    /* "Родное" разрешение, выставленное загрузчиком при старте (GOP-режим
+     * менять на лету нельзя — UEFI Boot Services уже завершены). width/
+     * height выше — ТЕКУЩЕЕ логическое разрешение рабочего стола, может
+     * быть меньше native_* (см. fb_apply_virtual_resolution ниже —
+     * используется из "Desktop settings" -> Display). native_* задаются
+     * ровно один раз в fb_init и больше не меняются. */
+    uint32_t native_width;
+    uint32_t native_height;
+
     uint8_t *front;
     uint8_t *back;
     uint64_t phys_addr;   /* физический адрес front-буфера (для sys_get_framebuffer) */
@@ -297,6 +306,8 @@ int fb_init(const fb_info_t *info) {
         g_fb.mode      = FB_MODE_LINEAR;
         g_fb.width     = info->width;
         g_fb.height    = info->height;
+        g_fb.native_width  = info->width;
+        g_fb.native_height = info->height;
         g_fb.pitch     = info->pitch  ? info->pitch  : info->width * (info->bpp / 8);
         g_fb.bpp       = info->bpp    ? info->bpp    : 32;
         g_fb.bytes_pp  = g_fb.bpp / 8;
@@ -422,6 +433,42 @@ void fb_flip(void) {
      * который отображён как UC или WC. Обычный memcpy там в 10-50 раз
      * медленнее и вызывает зависание при копировании 4+ МБ. */
     memcpy_nt(g_fb.front, g_fb.back, (size_t)g_fb.pitch * g_fb.height);
+}
+
+/* =========================================================================
+ * fb_apply_virtual_resolution — "смена разрешения" рабочего стола
+ * (Desktop settings -> Display).
+ *
+ * Физический GOP-режим (native_width/native_height, pitch) выставляется
+ * загрузчиком ДО старта ядра — переключить его на лету нельзя, GOP
+ * SetMode доступен только через UEFI Boot Services, которые к этому
+ * моменту уже завершены (ExitBootServices). Поэтому здесь меняются
+ * ЛОГИЧЕСКИЕ g_fb.width/height, которыми и так ограничены все
+ * fb_put_pixel/fb_fill_rect/fb_get_pixel (см. их клиппинг выше по файлу):
+ * рабочий стол просто рисуется в меньшей области левого верхнего угла
+ * физического экрана, остальная площадь остаётся чёрной. back-буфер уже
+ * выделен под native_width×native_height (fb_enable_double_buffer), так
+ * что любые width/height <= native_* укладываются в него безопасно —
+ * никаких перевыделений не требуется.
+ * ========================================================================= */
+static bool fb_apply_virtual_resolution(uint32_t w, uint32_t h) {
+    if (g_fb.mode != FB_MODE_LINEAR) return false;
+    if (!w || !h) return false;
+    if (w > g_fb.native_width)  w = g_fb.native_width;
+    if (h > g_fb.native_height) h = g_fb.native_height;
+
+    /* Сначала стираем ВЕСЬ физический экран, включая область, которая
+     * станет невидимой при уменьшении разрешения — иначе за пределами
+     * новых width/height навсегда останутся старые пиксели (fb_flip
+     * копирует только pitch*height байт, а не весь физический буфер). */
+    g_fb.width  = g_fb.native_width;
+    g_fb.height = g_fb.native_height;
+    fb_clear(FB_BLACK);
+    fb_flip();
+
+    g_fb.width  = w;
+    g_fb.height = h;
+    return true;
 }
 
 /* fb_flip_rect — переносит на экран ТОЛЬКО прямоугольник [x,y,w,h],
@@ -812,7 +859,10 @@ static void fb_draw_digit2(int32_t x, int32_t y, int val,
 /* Панель задач — уменьшена (52 -> 38), верхней полоски-бевела нет —
  * заливка панели начинается сразу с panel_y, без отступа. */
 #define TASKBAR_H            38u
-#define TASKBAR_BG      0xD4D0C8U
+/* Цвет панели задач — раньше был #define-константой; теперь переменная,
+ * т.к. меняется при смене темы рабочего стола (см. "Desktop settings"
+ * ниже, блок ui_theme_t/apply_theme). */
+static fb_color_t TASKBAR_BG = 0xD4D0C8U;
 
 /* Кнопка Menu — размер/пропорции как у кнопки "Пуск" в Windows XP.
  * Высота кнопки равна высоте всей панели задач (во всю высоту),
@@ -822,11 +872,51 @@ static void fb_draw_digit2(int32_t x, int32_t y, int val,
 #define MENU_BTN_W      94u
 #define MENU_BTN_H      TASKBAR_H
 #define MENU_BTN_RADIUS  16   /* радиус скругления правых углов, px */
-#define MENU_BTN_BG     0xFFFAA0U
+/* Цвет кнопки Menu — тоже переменная (меняется по теме, см. ниже). */
+static fb_color_t MENU_BTN_BG = 0xFFFAA0U;
 #define MENU_BTN_FG     0x202020U
 #define WALLPAPER_COLOR 0x6C9FCEU
 #define CLOCK_FG        0x101010U
 #define CLOCK_BG        TASKBAR_BG
+
+/* =========================================================================
+ * Темы рабочего стола ("Desktop settings" — правый клик по пустому месту
+ * рабочего стола -> "Desktop settings" -> квадратик с именем темы + кнопка
+ * со стрелкой ">" листает темы по кругу: Desert -> Space -> Lines -> Desert.
+ *
+ * Каждая тема — это: обои (файл в UI/), цвет панели задач, цвет кнопки
+ * Menu, цвет кнопок открытых окон на панели задач и цвет заголовка окон
+ * ("верхняя рамка" всех окон, см. UI_WIN_TITLEBAR_BG ниже). apply_theme()
+ * (объявлена ниже, реализация — рядом с окном "Desktop settings", перед
+ * ui_desktop_handle_mouse) применяет всё разом и вызывает полный
+ * ui_draw_desktop(), чтобы обои и цвета обновились везде сразу.
+ * ========================================================================= */
+typedef struct {
+    const char *name;            /* подпись в квадратике настроек */
+    const char *wallpaper_file;  /* имя файла внутри UI/ (без пути) */
+    fb_color_t  taskbar_bg;
+    fb_color_t  menu_btn_bg;
+    fb_color_t  app_btn_bg;
+    fb_color_t  win_titlebar_bg;
+} ui_theme_t;
+
+#define UI_THEME_DESERT 0   /* тема по умолчанию — нынешний вид рабочего стола */
+#define UI_THEME_SPACE  1
+#define UI_THEME_LINES  2
+#define UI_THEME_COUNT  3
+
+static const ui_theme_t g_themes[UI_THEME_COUNT] = {
+    /* Desert — как сейчас: жёлтая Menu, серая панель, синий заголовок */
+    { "Desert", "FexoxLightW.png", 0xD4D0C8U, 0xFFFAA0U, 0xECE9D8U, 0x2255AAU },
+    /* Space — синевато-голубая гамма */
+    { "Space",  "SpaceTheme.png",  0xE4EEF8U, 0x3BA8DEU, 0x3BA8DEU, 0x3BA8DEU },
+    /* Lines — бирюзовая гамма (Menu/кнопки — светло-бирюзовые, заголовок
+     * окон — чуть темнее/насыщеннее, панель задач — светло-бирюзовая) */
+    { "Lines",  "ThemeLines.png",  0xBEF2EDU, 0x3ED6C4U, 0x3ED6C4U, 0x20B2AAU },
+};
+
+static int g_theme_idx = UI_THEME_DESERT;
+static void apply_theme(int idx);   /* реализация — перед ui_desktop_handle_mouse */
 
 /* =========================================================================
  * Всплывающее меню "Menu" (Пуск) — Shutdown / Reboot
@@ -910,6 +1000,15 @@ static bool         g_fxapp_icon_hover = false;
  * и его кнопка на панели задач ведёт общий for-all-apps код. */
 static int g_fxapp_win_id = -1; /* UI_WIN_INVALID */
 
+/* id окна "Desktop settings" (смена темы) — тот же генерический оконный
+ * менеджер, что и у "My Computer" (owner_pid = -1, окно ядра). Реализация
+ * theme_win_draw/theme_win_handle_click/ui_open_theme_window — рядом с
+ * контекстным меню рабочего стола, перед ui_desktop_handle_mouse. Forward-
+ * декларация здесь нужна, т.к. на неё уже ссылаются ui_win_move_ex/
+ * ui_win_minimize/ui_win_toggle_maximize ниже (они определены раньше). */
+static int g_theme_win_id = -1; /* UI_WIN_INVALID */
+static void theme_win_draw(int win_id);
+
 /* ---- Калькулятор — вторая иконка рабочего стола, НО в отличие от
  * "My Computer" (который просто открывает встроенное окно ядра) это
  * настоящее userspace-приложение: клик по иконке запускает APPS/calc.elf
@@ -931,13 +1030,31 @@ static bool         g_calc_icon_hover = false;
 static int32_t      g_calc_running_tid = -1;  /* -1 = сейчас никакого экземпляра не запущено */
 extern bool sched_task_alive(uint32_t tid);   /* Scheduler.c */
 
+/* ---- SysLogs — третья иконка рабочего стола, сразу под калькулятором.
+ * Тот же паттерн, что и калькулятор: реальный userspace-процесс
+ * (APPS/syslogs.elf), запускается через elf64_spawn, своё окно и
+ * содержимое рисует сам через SYS_WIN_CREATE/SYS_WIN_GET_RECT/
+ * SYS_GET_FRAMEBUFFER — ядро знает только про иконку на рабочем столе. */
+static png_image_t g_syslogs_icon_img;             /* SysLogs.png (или из манифеста) */
+static int          g_syslogs_icon_loaded = 0;
+static char g_syslogs_title[FXAPP_NAME_MAX] = "System Logs";
+static char g_syslogs_icon_rel[FXAPP_ICON_MAX] = "SysLogs.png";
+static char g_syslogs_elf_path[FXAPP_PATH_MAX] = "/APPS/syslogs.elf";  /* см. комментарий
+    у g_calc_elf_path выше — путь обязан быть абсолютным (с ведущим слэшем) */
+static fb_color_t *g_syslogs_icon_clean_bg = NULL;
+static bool         g_syslogs_icon_hover = false;
+static int32_t      g_syslogs_running_tid = -1;  /* -1 = сейчас никакого экземпляра не запущено */
+
 static void icon_rect(int32_t *ix, int32_t *iy);
 static void calc_icon_rect(int32_t *ix, int32_t *iy);
+static void syslogs_icon_rect(int32_t *ix, int32_t *iy);
 static void fxapp_ensure_assets_loaded(void);
 static void fxapp_capture_icon_bg(void);
 static void fxapp_draw_icon(bool hovered);
 static void calc_capture_icon_bg(void);
 static void calc_draw_icon(bool hovered);
+static void syslogs_capture_icon_bg(void);
+static void syslogs_draw_icon(bool hovered);
 
 /* =========================================================================
  * Генерический оконный менеджер — см. Framebuffer.h: ui_win_create/
@@ -953,7 +1070,8 @@ static void calc_draw_icon(bool hovered);
 #define UI_WIN_EXPAND_SZ      20u
 #define UI_WIN_MIN_SZ         20u
 #define UI_WIN_BTN_GAP         4u   /* зазор между кнопками close/expand/minimize */
-#define UI_WIN_TITLEBAR_BG    0x2255AAU
+/* Цвет заголовка ("верхней рамки") окон — переменная, меняется по теме. */
+static fb_color_t UI_WIN_TITLEBAR_BG = 0x2255AAU;
 #define UI_WIN_TITLEBAR_FG    FB_WHITE
 #define UI_WIN_BODY_BG        FB_WHITE
 #define UI_WIN_BORDER         0x404040U
@@ -964,7 +1082,9 @@ static void calc_draw_icon(bool hovered);
                                            * и между соседними кнопками     */
 #define TASKBAR_APP_BTN_W         140u   /* "квадратик", расширенный по ширине */
 #define TASKBAR_APP_BTN_H         (MENU_BTN_H)
-#define TASKBAR_APP_BTN_BG        0xECE9D8U
+/* Цвет "квадратиков" открытых приложений на панели задач — переменная,
+ * меняется по теме вместе с MENU_BTN_BG. */
+static fb_color_t TASKBAR_APP_BTN_BG = 0xECE9D8U;
 #define TASKBAR_APP_BTN_FG        0x202020U
 #define TASKBAR_APP_BTN_TEXT_PAD   8
 
@@ -993,6 +1113,17 @@ typedef struct {
                                * задач); rest_* — геометрия для возврата */
     int32_t     rest_x, rest_y;
     uint32_t    rest_w, rest_h;
+
+    /* redraw_gen — счётчик "содержимое инвалидировано, перерисуйся".
+     * Растёт только там, где кернел меняет ГЕОМЕТРИЮ окна и поэтому не
+     * может честно перенести старые пиксели содержимого как есть (см.
+     * ui_win_toggle_maximize) — drag и minimize/restore сюда не входят,
+     * там геометрия не меняется (или кернел сам переносит content_bak
+     * как картинку, см. ui_win_capture/ui_win_blit_captured) — для
+     * userspace-приложений (calc.c и т.п.) это единственный способ
+     * узнать "меня развернули/свернули на весь экран, перерисуй себя
+     * под новый размер" — см. sys_win_get_rect (Syscall.c/Syscall.h). */
+    uint32_t    redraw_gen;
 } ui_window_t;
 
 static ui_window_t g_windows[UI_MAX_WINDOWS];
@@ -1107,9 +1238,15 @@ static inline void fm_io_sti(uint64_t flags) {
 static bool ui_load_wallpaper(uint32_t taskbar_y) {
     if (g_fb.mode != FB_MODE_LINEAR) return false;
 
-    /* Открываем файл */
-    int fd = vfs_open("UI/FexoxLightW.png", UI_O_RDONLY);
-    if (fd < 0) fd = vfs_open("/UI/FexoxLightW.png", UI_O_RDONLY);
+    /* Открываем файл — имя берём из текущей темы (g_themes[g_theme_idx]),
+     * тот же паттерн "UI/<n>" / "/UI/<n>", что и у fxapp_load_png_asset. */
+    char path_a[96] = "UI/";
+    char path_b[96] = "/UI/";
+    strncat(path_a, g_themes[g_theme_idx].wallpaper_file, sizeof(path_a) - 4);
+    strncat(path_b, g_themes[g_theme_idx].wallpaper_file, sizeof(path_b) - 5);
+
+    int fd = vfs_open(path_a, UI_O_RDONLY);
+    if (fd < 0) fd = vfs_open(path_b, UI_O_RDONLY);
     if (fd < 0) {
         DBG_MSG("UI", "wallpaper PNG not found");
         return false;
@@ -1418,6 +1555,47 @@ static void calc_icon_rect(int32_t *ix, int32_t *iy) {
     *iy = my + (int32_t)FXAPP_ICON_H + 40;
 }
 
+/* SysLogs — та же логика, ещё на один "слот" (иконка + halo + подпись,
+ * 40px) ниже калькулятора. */
+static void syslogs_icon_rect(int32_t *ix, int32_t *iy) {
+    int32_t cx, cy;
+    calc_icon_rect(&cx, &cy);
+    *ix = cx;
+    *iy = cy + (int32_t)FXAPP_ICON_H + 40;
+}
+
+/* Проверка: находится ли точка (x,y) над одной из иконок рабочего стола
+ * (My Computer/Calculator/SysLogs), включая область подсветки (halo).
+ * Нужна, чтобы правый клик ПО ИКОНКЕ не открывал контекстное меню рабочего
+ * стола ("Desktop settings" — см. ui_desktop_handle_mouse ниже): по
+ * условию задачи меню должно всплывать только при клике мимо приложений. */
+static bool ui_point_over_any_desktop_icon(int32_t x, int32_t y) {
+    int32_t icx, icy;
+
+    icon_rect(&icx, &icy);
+    if (point_in_rect(x, y,
+                       icx - FXAPP_ICON_HALO_PAD, icy - FXAPP_ICON_HALO_PAD,
+                       FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD,
+                       FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD))
+        return true;
+
+    calc_icon_rect(&icx, &icy);
+    if (point_in_rect(x, y,
+                       icx - FXAPP_ICON_HALO_PAD, icy - FXAPP_ICON_HALO_PAD,
+                       FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD,
+                       FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD))
+        return true;
+
+    syslogs_icon_rect(&icx, &icy);
+    if (point_in_rect(x, y,
+                       icx - FXAPP_ICON_HALO_PAD, icy - FXAPP_ICON_HALO_PAD,
+                       FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD,
+                       FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD))
+        return true;
+
+    return false;
+}
+
 /* Отрисовать декодированный PNG (RGBA) с альфа-блендингом по фону экрана.
  * Общая функция для иконки на рабочем столе и кнопки close.png. */
 static void fxapp_blit_png(int32_t x, int32_t y, const png_image_t *img) {
@@ -1555,6 +1733,27 @@ static void fxapp_ensure_assets_loaded(void) {
     g_calc_icon_img.pixels = NULL;
     if (fxapp_load_png_asset(g_calc_icon_rel, FXAPP_ICON_W, FXAPP_ICON_H, &g_calc_icon_img))
         g_calc_icon_loaded = 1;
+
+    /* SysLogs — та же схема: манифест необязателен, дефолты заданы у
+     * g_syslogs_* выше (имя "System Logs", иконка "SysLogs.png", ELF
+     * "/APPS/syslogs.elf"). */
+    fxapp_t lapp;
+    if (fxapp_load("APPS/SysLogs.fxapp", &lapp) == 0 ||
+        fxapp_load("/APPS/SysLogs.fxapp", &lapp) == 0) {
+        if (lapp.header.name[0] != '\0')
+            strlcpy(g_syslogs_title, lapp.header.name, sizeof(g_syslogs_title));
+        if (lapp.header.icon[0] != '\0')
+            strlcpy(g_syslogs_icon_rel, lapp.header.icon, sizeof(g_syslogs_icon_rel));
+        if (lapp.header.elf_path[0] != '\0')
+            strlcpy(g_syslogs_elf_path, lapp.header.elf_path, sizeof(g_syslogs_elf_path));
+        DBG_MSG("FXA", "SysLogs.fxapp manifest loaded");
+    } else {
+        DBG_MSG("FXA", "SysLogs.fxapp manifest not found, using defaults");
+    }
+
+    g_syslogs_icon_img.pixels = NULL;
+    if (fxapp_load_png_asset(g_syslogs_icon_rel, FXAPP_ICON_W, FXAPP_ICON_H, &g_syslogs_icon_img))
+        g_syslogs_icon_loaded = 1;
 }
 
 /* Захватить "чистый" фон под иконкой+halo сразу после отрисовки обоев/
@@ -1667,6 +1866,20 @@ static void calc_draw_icon(bool hovered) {
     calc_icon_rect(&icx, &icy);
     fxapp_draw_icon_generic(icx, icy, g_calc_icon_clean_bg, hovered,
                             g_calc_icon_loaded, &g_calc_icon_img, "+-", g_calc_title);
+}
+
+/* ---- SysLogs: тонкие обёртки над generic-версиями выше ---- */
+static void syslogs_capture_icon_bg(void) {
+    int32_t icx, icy;
+    syslogs_icon_rect(&icx, &icy);
+    fxapp_capture_icon_bg_generic(icx, icy, &g_syslogs_icon_clean_bg);
+}
+
+static void syslogs_draw_icon(bool hovered) {
+    int32_t icx, icy;
+    syslogs_icon_rect(&icx, &icy);
+    fxapp_draw_icon_generic(icx, icy, g_syslogs_icon_clean_bg, hovered,
+                            g_syslogs_icon_loaded, &g_syslogs_icon_img, "LG", g_syslogs_title);
 }
 
 /* =========================================================================
@@ -2294,6 +2507,10 @@ int ui_win_create(const char *title, uint32_t w, uint32_t h, int32_t owner_pid) 
     win->owner_pid = owner_pid;
     win->w = w;
     win->h = h;
+    win->redraw_gen = 1;   /* стартовое значение — приложение и так рисует
+                             * первый кадр сразу после sys_win_create, само
+                             * число не важно, лишь бы было ненулевым/
+                             * определённым для последующих сравнений */
 
     size_t n = strlen(title);
     if (n >= UI_WIN_TITLE_MAX) n = UI_WIN_TITLE_MAX - 1;
@@ -2335,9 +2552,18 @@ int ui_win_create(const char *title, uint32_t w, uint32_t h, int32_t owner_pid) 
  * (в системе координат всего экрана/framebuffer), не относительные
  * окну — ровно то, что нужно, чтобы писать пиксели по нужным индексам
  * в framebuffer, который у процесса один общий на весь экран.
+ *
+ * out_redraw_gen — счётчик "перерисуйся" (см. ui_window_t.redraw_gen):
+ * растёт при изменениях геометрии, которые кернел не может честно
+ * перенести как картинку (сейчас — только ui_win_toggle_maximize).
+ * Приложение сравнивает его с последним увиденным значением и, если он
+ * изменился, обязано перерисовать своё содержимое под новый размер
+ * (см. calc.c: g_last_redraw_gen). NULL — если вызывающему не нужно
+ * (сейчас все вызывающие его передают).
+ *
  * Возвращает false, если win_id невалиден/окно не открыто. */
 bool ui_win_get_rect(int win_id, int32_t *out_x, int32_t *out_y,
-                     uint32_t *out_w, uint32_t *out_h) {
+                     uint32_t *out_w, uint32_t *out_h, uint32_t *out_redraw_gen) {
     if (win_id < 0 || win_id >= (int)UI_MAX_WINDOWS) return false;
     ui_window_t *win = &g_windows[win_id];
     if (!win->used || !win->open) return false;
@@ -2347,6 +2573,7 @@ bool ui_win_get_rect(int win_id, int32_t *out_x, int32_t *out_y,
     if (out_y) *out_y = win->y + (int32_t)UI_WIN_TITLEBAR_H;
     if (out_w) *out_w = win->w;
     if (out_h) *out_h = win->h - UI_WIN_TITLEBAR_H;
+    if (out_redraw_gen) *out_redraw_gen = win->redraw_gen;
     return true;
 }
 
@@ -2387,6 +2614,7 @@ static int ui_win_move_ex(int win_id, int32_t x, int32_t y, bool do_flip) {
     ui_win_save_bg(win_id, win->x, win->y);
     ui_win_blit_captured(win_id, win->x, win->y);  /* переносим как картинку — вместо ui_win_draw()+белое тело */
     if (win_id == g_fxapp_win_id) fm_draw(win_id);   /* "Мой компьютер" всё равно перерисовывает сетку иконок сам */
+    if (win_id == g_theme_win_id) theme_win_draw(win_id);
     if (do_flip) fb_flip();
     return 0;
 }
@@ -2406,6 +2634,17 @@ static void ui_win_minimize(int id) {
     ui_window_t *win = &g_windows[id];
     if (!win->used || !win->open || win->minimized) return;
 
+    /* Запоминаем пиксели окна (рамка+тело+всё, что нарисовало
+     * приложение) ДО того, как сотрём его фоном — геометрия при
+     * сворачивании не меняется, поэтому на восстановлении (см.
+     * ui_win_restore_from_taskbar) можно перенести их обратно 1-в-1,
+     * тем же приёмом, что уже работает при перетаскивании окна (см.
+     * ui_win_capture/ui_win_blit_captured выше). Раньше это не
+     * делалось — после restore userspace-окна (calc.c и т.п.) оставались
+     * с пустым белым телом, пока сами не перерисуются (а зачастую вообще
+     * не перерисовывались, т.к. x/y/w/h после restore не менялись и
+     * приложение не видело повода для редрава). */
+    ui_win_capture(id, win->x, win->y);
     ui_win_restore_bg(id, win->x, win->y);
     win->minimized = true;
     win->dragging = false;
@@ -2424,8 +2663,14 @@ static void ui_win_restore_from_taskbar(int id) {
 
     win->minimized = false;
     ui_win_save_bg(id, win->x, win->y);
-    ui_win_draw(id);
+    /* Переносим РОВНО те пиксели, что были на экране в момент сворачивания
+     * (см. ui_win_capture в ui_win_minimize выше) — вместо ui_win_draw()
+     * (рамка + пустое белое тело), из-за которого содержимое userspace-
+     * окон "исчезало" (становилось белой заливкой) после restore. Тот же
+     * приём, что уже используется при перетаскивании окна. */
+    ui_win_blit_captured(id, win->x, win->y);
     if (id == g_fxapp_win_id) fm_draw(id);
+    if (id == g_theme_win_id) theme_win_draw(id);
     fb_flip();
 }
 
@@ -2450,6 +2695,14 @@ static void ui_win_toggle_maximize(int id) {
     ui_win_restore_bg(id, win->x, win->y);
     if (win->saved_bg) { kfree(win->saved_bg); win->saved_bg = NULL; }
     if (win->content_bak) { kfree(win->content_bak); win->content_bak = NULL; }
+    /* Геометрия сейчас изменится (маленькое <-> во весь экран) — старые
+     * пиксели содержимого переносить некуда (другой размер), поэтому, в
+     * отличие от minimize/restore и drag, здесь НЕТ переноса content_bak
+     * как картинки — тело просто перерисовывается пустым (ui_win_draw
+     * ниже), а userspace-приложение обязано перерисовать себя САМО под
+     * новый размер. redraw_gen — это и есть тот сигнал "перерисуйся",
+     * который приложение видит через sys_win_get_rect (см. Syscall.c). */
+    win->redraw_gen++;
 
     if (!win->maximized) {
         win->rest_x = win->x; win->rest_y = win->y;
@@ -2471,6 +2724,7 @@ static void ui_win_toggle_maximize(int id) {
     ui_win_save_bg(id, win->x, win->y);
     ui_win_draw(id);
     if (id == g_fxapp_win_id) fm_draw(id);
+    if (id == g_theme_win_id) theme_win_draw(id);
     fb_flip();
 }
 
@@ -2481,12 +2735,352 @@ void ui_win_close_all_owned_by(int32_t owner_pid) {
     }
 }
 
+/* Список разрешений для Display — фиксированный, поэтому подписи хранятся
+ * готовыми строками (в freestanding-окружении нет sprintf/itoa под рукой,
+ * а конвертировать 4 числа в текст ради этого не имеет смысла). Индекс 0
+ * (1280x800) — значение по умолчанию, показанное в квадратике при старте. */
+typedef struct {
+    uint32_t    w, h;
+    const char *label;
+} ui_resolution_t;
+
+#define UI_RES_COUNT 4
+static const ui_resolution_t g_resolutions[UI_RES_COUNT] = {
+    { 1280, 800,  "1280x800"  },
+    { 1366, 768,  "1366x768"  },
+    { 1680, 1050, "1680x1050" },
+    { 1920, 1080, "1920x1080" },
+};
+
+static int g_res_idx = 0;   /* 1280x800 — значение по умолчанию в квадратике Display,
+                              * перезаписывается ui_load_persisted_resolution() ниже,
+                              * если на диске уже есть "/display.cfg" от прошлой сессии. */
+
+/* =========================================================================
+ * Персистентность выбора Display — "/display.cfg" в корне VFS-диска.
+ *
+ * Настоящее переключение физического видеорежима (GOP SetMode) может
+ * сделать ТОЛЬКО загрузчик (bootloader.c), пока живы UEFI Boot Services —
+ * у уже запущенного ядра их нет (ExitBootServices давно вызван). Поэтому
+ * схема в два шага:
+ *   1. Здесь, в apply_resolution() — сразу применяем "виртуальное"
+ *      разрешение (fb_apply_virtual_resolution, см. начало файла) для
+ *      мгновенной обратной связи в текущей сессии, И сохраняем выбор в
+ *      "/display.cfg" (простой текст вида "1920x1080\n").
+ *   2. При СЛЕДУЮЩЕЙ загрузке bootloader.c: bl_read_display_cfg() читает
+ *      этот файл ДО ExitBootServices, находит подходящий GOP-режим через
+ *      QueryMode и реально переключает экран через SetMode — это уже
+ *      настоящая, физическая смена разрешения монитора/панели.
+ * ui_load_persisted_resolution() — обратная операция: при первом
+ * ui_draw_desktop() подтягивает g_res_idx из "/display.cfg", чтобы
+ * квадратик Display в "Desktop settings" показывал то же значение, что
+ * реально применил загрузчик на этом старте (просто синхронизация UI,
+ * fb_apply_virtual_resolution() тут НЕ вызывается — разрешение уже и так
+ * физически то, что нужно).
+ * ========================================================================= */
+static void ui_persist_display_cfg(const char *label) {
+    int fd = vfs_open("/display.cfg", O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) {
+        DBG_MSG("UI", "display.cfg: vfs_open(write) failed");
+        return;
+    }
+    vfs_write(fd, label, strlen(label));
+    vfs_write(fd, "\n", 1);
+    vfs_close(fd);
+}
+
+static void ui_load_persisted_resolution(void) {
+    int fd = vfs_open("/display.cfg", O_RDONLY);
+    if (fd < 0) return;   /* файла нет — первая загрузка, оставляем g_res_idx = 0 */
+
+    char buf[32];
+    int64_t got = vfs_read(fd, buf, sizeof(buf) - 1);
+    vfs_close(fd);
+    if (got <= 0) return;
+
+    buf[got] = '\0';
+    for (int64_t i = 0; i < got; i++) {
+        if (buf[i] == '\n' || buf[i] == '\r') { buf[i] = '\0'; break; }
+    }
+
+    for (int i = 0; i < UI_RES_COUNT; i++) {
+        if (strcmp(buf, g_resolutions[i].label) == 0) {
+            g_res_idx = i;
+            break;
+        }
+    }
+}
+
+
+/* =========================================================================
+ * apply_theme — применить тему g_themes[idx]: перекрасить панель задач,
+ * кнопку Menu, кнопки приложений на панели задач и заголовок ("верхнюю
+ * рамку") всех окон, и перезагрузить обои под новую тему. ui_draw_desktop()
+ * делает полный редрав — этого достаточно, чтобы обновилось вообще всё
+ * (включая уже открытые окна, см. хуки theme_win_draw/fm_draw в его цикле
+ * выше по файлу).
+ * ========================================================================= */
+static void apply_theme(int idx) {
+    if (idx < 0 || idx >= UI_THEME_COUNT) return;
+    g_theme_idx = idx;
+
+    const ui_theme_t *t = &g_themes[idx];
+    TASKBAR_BG         = t->taskbar_bg;
+    MENU_BTN_BG        = t->menu_btn_bg;
+    TASKBAR_APP_BTN_BG = t->app_btn_bg;
+    UI_WIN_TITLEBAR_BG = t->win_titlebar_bg;
+
+    DBG_VAL("UI", "theme changed to idx", (uint64_t)idx);
+    ui_draw_desktop();
+}
+
+/* =========================================================================
+ * apply_resolution — применить g_resolutions[idx]: "смена разрешения"
+ * рабочего стола (см. подробный комментарий у fb_apply_virtual_resolution
+ * в начале файла — это не переключение физического видеорежима, а смена
+ * логической рабочей области внутри уже промапленного GOP-буфера).
+ * ========================================================================= */
+static void apply_resolution(int idx) {
+    if (idx < 0 || idx >= UI_RES_COUNT) return;
+    g_res_idx = idx;
+
+    fb_apply_virtual_resolution(g_resolutions[idx].w, g_resolutions[idx].h);
+    ui_persist_display_cfg(g_resolutions[idx].label);
+    DBG_VAL("UI", "resolution changed to idx", (uint64_t)idx);
+    ui_draw_desktop();
+}
+
+/* =========================================================================
+ * Окно "Desktop settings" — две строки-настройки:
+ *   Theme   — квадратик с именем темы + стрелка ">", листает темы по кругу
+ *             (Desert -> Space -> Lines -> Desert), см. apply_theme() выше.
+ *   Display — квадратик с текущим разрешением + такая же стрелка, листает
+ *             g_resolutions по кругу и сразу применяет (apply_resolution).
+ * Окно создаётся тем же генерическим ui_win_create(), что и "My Computer"
+ * (owner_pid = -1 — окно ядра), поэтому перетаскивание/закрытие/сворачи-
+ * вание/разворачивание уже работают "бесплатно" через общий код ниже
+ * (см. ui_desktop_handle_mouse) — специфично для этого окна только само
+ * содержимое (theme_win_draw) и клик по стрелкам (theme_win_handle_click).
+ * ========================================================================= */
+#define THEME_WIN_W          300u
+#define THEME_WIN_H          150u
+
+#define THEME_ROW_THEME          0
+#define THEME_ROW_DISPLAY        1
+#define THEME_ROW_COUNT           2
+
+#define THEME_LABEL_X          16
+#define THEME_ROW_Y             16   /* Y первой строки внутри тела окна */
+#define THEME_BOX_W             90u
+#define THEME_BOX_H             30u
+#define THEME_BOX_GAP           14   /* и горизонтальный отступ, и вертикальный между строками */
+#define THEME_ARROW_W           30u
+#define THEME_ARROW_H           30u
+#define THEME_BOX_BG        FB_BLACK
+#define THEME_BOX_FG        FB_WHITE
+#define THEME_BOX_BORDER    0x606060U
+#define THEME_ARROW_BG      0x303030U
+#define THEME_ARROW_FG      FB_WHITE
+
+/* Подпись строки ("Theme"/"Display") — используется и при отрисовке, и
+ * при расчёте геометрии (чтобы обе колонки квадратиков были выровнены по
+ * более длинной подписи, "Display"). */
+static const char *theme_row_label(int row) {
+    return (row == THEME_ROW_DISPLAY) ? "Display" : "Theme";
+}
+
+/* Общая геометрия строки: label_x/box_x/box_y. box_x одинаков для обеих
+ * строк (считается от самой длинной подписи, "Display"), чтобы квадратики
+ * Theme и Display стояли ровно друг под другом. */
+static void theme_row_positions(int win_id, int row,
+                                int32_t *label_x, int32_t *box_x, int32_t *box_y) {
+    ui_window_t *win = &g_windows[win_id];
+    int32_t base_x = win->x;
+    int32_t base_y = win->y + (int32_t)UI_WIN_TITLEBAR_H;
+
+    *label_x = base_x + THEME_LABEL_X;
+    *box_x   = *label_x + (int32_t)fb_text_width("Display") + THEME_BOX_GAP;
+    *box_y   = base_y + THEME_ROW_Y + row * (int32_t)(THEME_BOX_H + THEME_BOX_GAP);
+}
+
+/* Геометрия кнопки-стрелки — общая функция для рисования и хит-теста,
+ * чтобы они не могли разъехаться (тот же паттерн, что ui_win_btn_rects). */
+static void theme_arrow_rect(int win_id, int row, int32_t *ax, int32_t *ay,
+                             uint32_t *aw, uint32_t *ah) {
+    int32_t label_x, box_x, box_y;
+    theme_row_positions(win_id, row, &label_x, &box_x, &box_y);
+    *ax = box_x + (int32_t)THEME_BOX_W + THEME_BOX_GAP;
+    *ay = box_y;
+    *aw = THEME_ARROW_W;
+    *ah = THEME_ARROW_H;
+}
+
+/* Нарисовать одну строку-настройку: подпись, тёмный квадратик со значением
+ * и кнопку-стрелку ">". value — то, что показывается в квадратике. */
+static void theme_row_draw(int win_id, int row, const char *value) {
+    int32_t label_x, box_x, box_y;
+    theme_row_positions(win_id, row, &label_x, &box_x, &box_y);
+
+    int32_t label_y = box_y + (int32_t)((THEME_BOX_H - FB_FONT_H) / 2u);
+    fb_draw_string(label_x, label_y, theme_row_label(row), FB_BLACK, UI_WIN_BODY_BG);
+
+    fb_fill_rect(box_x, box_y, THEME_BOX_W, THEME_BOX_H, THEME_BOX_BG);
+    fb_draw_rect(box_x, box_y, THEME_BOX_W, THEME_BOX_H, THEME_BOX_BORDER, 1);
+
+    int32_t tw = (int32_t)fb_text_width(value);
+    int32_t tx = box_x + (int32_t)((THEME_BOX_W - (uint32_t)(tw > 0 ? tw : 0)) / 2u);
+    int32_t ty = box_y + (int32_t)((THEME_BOX_H - FB_FONT_H) / 2u);
+    fb_draw_string(tx, ty, value, THEME_BOX_FG, THEME_BOX_BG);
+
+    int32_t ax, ay; uint32_t aw, ah;
+    theme_arrow_rect(win_id, row, &ax, &ay, &aw, &ah);
+    fb_fill_rect(ax, ay, aw, ah, THEME_ARROW_BG);
+    fb_draw_rect(ax, ay, aw, ah, THEME_BOX_BORDER, 1);
+    fb_draw_string(ax + (int32_t)((aw - FB_FONT_W) / 2u),
+                   ay + (int32_t)((ah - FB_FONT_H) / 2u),
+                   ">", THEME_ARROW_FG, THEME_ARROW_BG);
+}
+
+static void theme_win_draw(int win_id) {
+    if (win_id < 0 || win_id >= (int)UI_MAX_WINDOWS) return;
+    ui_window_t *win = &g_windows[win_id];
+    if (!win->used) return;
+
+    int32_t  base_x    = win->x;
+    int32_t  base_y    = win->y + (int32_t)UI_WIN_TITLEBAR_H;
+    uint32_t content_h = (win->h > UI_WIN_TITLEBAR_H) ? win->h - UI_WIN_TITLEBAR_H : 0;
+
+    /* Стираем тело — на случай смены названия темы (Desert -> Space) или
+     * значения разрешения (1280x800 -> 1366x768 и т.п.). */
+    fb_fill_rect(base_x, base_y, win->w, content_h, UI_WIN_BODY_BG);
+
+    theme_row_draw(win_id, THEME_ROW_THEME,   g_themes[g_theme_idx].name);
+    theme_row_draw(win_id, THEME_ROW_DISPLAY, g_resolutions[g_res_idx].label);
+}
+
+/* Клик внутри тела окна "Desktop settings" — реагируем только на попадание
+ * в одну из двух кнопок-стрелок; остальная область окна не интерактивна. */
+static void theme_win_handle_click(int win_id, int32_t x, int32_t y) {
+    int32_t ax, ay; uint32_t aw, ah;
+
+    theme_arrow_rect(win_id, THEME_ROW_THEME, &ax, &ay, &aw, &ah);
+    if (point_in_rect(x, y, ax, ay, aw, ah)) {
+        apply_theme((g_theme_idx + 1) % UI_THEME_COUNT);
+        return;
+    }
+
+    theme_arrow_rect(win_id, THEME_ROW_DISPLAY, &ax, &ay, &aw, &ah);
+    if (point_in_rect(x, y, ax, ay, aw, ah)) {
+        apply_resolution((g_res_idx + 1) % UI_RES_COUNT);
+    }
+}
+
+/* Открыть окно "Desktop settings" (или показать обратно, если было
+ * свёрнуто) — вызывается по клику на пункт контекстного меню ниже. */
+static void ui_open_theme_window(void) {
+    if (g_theme_win_id < 0 || !g_windows[g_theme_win_id].used || !g_windows[g_theme_win_id].open) {
+        g_theme_win_id = ui_win_create("Desktop settings", THEME_WIN_W, THEME_WIN_H, -1);
+        if (g_theme_win_id >= 0) {
+            theme_win_draw(g_theme_win_id);
+            fb_flip();
+        }
+    } else if (g_windows[g_theme_win_id].minimized) {
+        ui_win_restore_from_taskbar(g_theme_win_id);
+    }
+}
+
+/* =========================================================================
+ * Контекстное меню рабочего стола — тёмное всплывающее меню по правому
+ * клику на ПУСТОМ месте рабочего стола (не по иконке, не по окну, не по
+ * панели задач — см. ui_point_over_any_desktop_icon() и проверки в
+ * ui_desktop_handle_mouse). Сейчас один пункт — "Desktop settings".
+ * Тот же паттерн save/restore фона под собой, что и у меню "Menu" (см.
+ * menu_save_bg/menu_restore_bg выше), но с другой (тёмной) палитрой и
+ * позицией "под курсором" вместо фиксированной у кнопки Menu.
+ * ========================================================================= */
+#define CTXMENU_W               180u
+#define CTXMENU_PAD               8
+#define CTXMENU_ITEM_H           32u
+#define CTXMENU_H        (2u * CTXMENU_PAD + CTXMENU_ITEM_H)
+#define CTXMENU_BG           0x2B2B2BU
+#define CTXMENU_BORDER       0x000000U
+#define CTXMENU_ITEM_BG_HOVER 0x454545U
+#define CTXMENU_ITEM_FG      0xE8E8E8U
+
+static bool        g_ctxmenu_open  = false;
+static bool        g_ctxmenu_hover = false;
+static int32_t     g_ctxmenu_x = 0, g_ctxmenu_y = 0;
+static fb_color_t *g_ctxmenu_saved_bg = NULL;
+
+static void ctxmenu_item_rect(int32_t mx, int32_t my,
+                              int32_t *ix, int32_t *iy, uint32_t *iw, uint32_t *ih) {
+    *ix = mx + CTXMENU_PAD;
+    *iy = my + CTXMENU_PAD;
+    *iw = CTXMENU_W - 2u * CTXMENU_PAD;
+    *ih = CTXMENU_ITEM_H;
+}
+
+static void ctxmenu_save_bg(int32_t mx, int32_t my) {
+    if (!g_ctxmenu_saved_bg) {
+        g_ctxmenu_saved_bg = (fb_color_t *)kmalloc(
+            (uint64_t)CTXMENU_W * CTXMENU_H * sizeof(fb_color_t));
+    }
+    if (!g_ctxmenu_saved_bg) return;
+    for (uint32_t row = 0; row < CTXMENU_H; row++)
+        for (uint32_t col = 0; col < CTXMENU_W; col++)
+            g_ctxmenu_saved_bg[row * CTXMENU_W + col] =
+                fb_get_pixel(mx + (int32_t)col, my + (int32_t)row);
+}
+
+static void ctxmenu_restore_bg(int32_t mx, int32_t my) {
+    if (!g_ctxmenu_saved_bg) return;
+    for (uint32_t row = 0; row < CTXMENU_H; row++)
+        for (uint32_t col = 0; col < CTXMENU_W; col++)
+            fb_put_pixel(mx + (int32_t)col, my + (int32_t)row,
+                        g_ctxmenu_saved_bg[row * CTXMENU_W + col]);
+    fb_flip();
+}
+
+static void ui_draw_ctxmenu(void) {
+    int32_t mx = g_ctxmenu_x, my = g_ctxmenu_y;
+    fb_fill_rect(mx, my, CTXMENU_W, CTXMENU_H, CTXMENU_BG);
+    fb_draw_rect(mx, my, CTXMENU_W, CTXMENU_H, CTXMENU_BORDER, 1);
+
+    int32_t ix, iy; uint32_t iw, ih;
+    ctxmenu_item_rect(mx, my, &ix, &iy, &iw, &ih);
+    fb_color_t bg = g_ctxmenu_hover ? CTXMENU_ITEM_BG_HOVER : CTXMENU_BG;
+    fb_fill_rect(ix, iy, iw, ih, bg);
+
+    int32_t tx = ix + 8;
+    int32_t ty = iy + (int32_t)((ih - FB_FONT_H) / 2u);
+    fb_draw_string(tx, ty, "Desktop settings", CTXMENU_ITEM_FG, bg);
+
+    fb_flip();
+}
+
 /*
  * ui_desktop_handle_mouse — вызывать на каждом тике (из ui_tick, ДО
  * перерисовки курсора) с текущей позицией мыши и состоянием кнопок.
  * Открывает/закрывает Menu-меню по клику на кнопку Menu, подсвечивает
  * пункты меню под курсором и обрабатывает клики по "Shutdown"/"Reboot".
  */
+/* =========================================================================
+ * ВРЕМЕННАЯ диагностика лага при перетаскивании окна — убрать после
+ * отладки. Тот же приём, что уже помог найти проблему с
+ * ui_flip_userspace_windows (см. Scheduler.c/ui_extra.c, история этого
+ * файла) — меряем именно ui_win_move_ex() (единственное, что реально
+ * выполняется на КАЖДЫЙ тик мыши во время drag'а) и печатаем только
+ * "медленные" вызовы (>= 0.5мс), чтобы не утопить лог.
+ * ========================================================================= */
+static inline uint64_t dbg_win_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline uint64_t dbg_win_tsc_to_ns(uint64_t tsc) {
+    return tsc / 3ULL;   /* ~3 ГГц, то же приближение, что в Scheduler.c/USB.c */
+}
+
 void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
     if (g_fb.mode != FB_MODE_LINEAR) return;
     if (!g_fb.width || !g_fb.height) return;
@@ -2501,6 +3095,10 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
     int32_t mbx = MENU_BTN_X;
     int32_t mby = panel_y;   /* кнопка во всю высоту панели задач */
     if (left_click && point_in_rect(x, y, mbx, mby, MENU_BTN_W, MENU_BTN_H)) {
+        if (g_ctxmenu_open) {
+            ctxmenu_restore_bg(g_ctxmenu_x, g_ctxmenu_y);
+            g_ctxmenu_open = false;
+        }
         int32_t mx, my;
         menu_popup_rect(panel_y, &mx, &my);
         if (g_menu_open) {
@@ -2541,6 +3139,69 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
             /* клик мимо меню и мимо кнопки Menu — закрыть */
             menu_restore_bg(mx, my);
             g_menu_open = false;
+        }
+    }
+
+    /* ---- ПКМ по пустому месту рабочего стола — тёмное контекстное меню
+     * с пунктом "Desktop settings" (см. блок выше, перед этой функцией).
+     * НЕ открывается: над иконками (My Computer/Calculator/SysLogs),
+     * над открытым окном, над панелью задач и пока открыто меню "Menu". */
+    bool right_now   = (buttons & 0x02) != 0;
+    bool right_was   = (g_prev_buttons & 0x02) != 0;
+    bool right_click = right_now && !right_was;
+
+    if (right_click) {
+        bool over_taskbar = (y >= panel_y);
+        bool over_icon = ui_point_over_any_desktop_icon(x, y);
+        bool over_window = false;
+        for (int wi = 0; wi < (int)UI_MAX_WINDOWS; wi++) {
+            ui_window_t *w = &g_windows[wi];
+            if (!w->used || !w->open || w->minimized) continue;
+            if (point_in_rect(x, y, w->x, w->y, w->w, w->h)) { over_window = true; break; }
+        }
+
+        if (g_ctxmenu_open) {
+            ctxmenu_restore_bg(g_ctxmenu_x, g_ctxmenu_y);
+            g_ctxmenu_open = false;
+        }
+
+        if (!over_taskbar && !over_icon && !over_window && !g_menu_open) {
+            int32_t mx = x, my = y;
+            if (mx + (int32_t)CTXMENU_W > (int32_t)g_fb.width) mx = (int32_t)g_fb.width - (int32_t)CTXMENU_W;
+            if (my + (int32_t)CTXMENU_H > panel_y) my = panel_y - (int32_t)CTXMENU_H;
+            if (mx < 0) mx = 0;
+            if (my < 0) my = 0;
+
+            g_ctxmenu_x = mx;
+            g_ctxmenu_y = my;
+            g_ctxmenu_hover = false;
+            ctxmenu_save_bg(mx, my);
+            ui_draw_ctxmenu();
+            g_ctxmenu_open = true;
+        }
+
+        g_prev_buttons = buttons;
+        return;
+    }
+
+    if (g_ctxmenu_open) {
+        int32_t ix, iy; uint32_t iw, ih;
+        ctxmenu_item_rect(g_ctxmenu_x, g_ctxmenu_y, &ix, &iy, &iw, &ih);
+        bool now_hover = point_in_rect(x, y, ix, iy, iw, ih);
+        if (now_hover != g_ctxmenu_hover) {
+            g_ctxmenu_hover = now_hover;
+            ui_draw_ctxmenu();
+        }
+
+        if (left_click && now_hover) {
+            ctxmenu_restore_bg(g_ctxmenu_x, g_ctxmenu_y);
+            g_ctxmenu_open = false;
+            ui_open_theme_window();
+        } else if (left_click && !now_hover &&
+                   !point_in_rect(x, y, g_ctxmenu_x, g_ctxmenu_y, CTXMENU_W, CTXMENU_H)) {
+            /* клик мимо меню — закрыть без действия */
+            ctxmenu_restore_bg(g_ctxmenu_x, g_ctxmenu_y);
+            g_ctxmenu_open = false;
         }
     }
 
@@ -2673,6 +3334,42 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
         g_calc_icon_hover = false;
     }
 
+    /* ---- SysLogs: тот же паттерн, что и калькулятор — реальный
+     * userspace-процесс через elf64_spawn(g_syslogs_elf_path, ...). */
+    if (!cursor_over_window) {
+        int32_t icx, icy;
+        syslogs_icon_rect(&icx, &icy);
+        int32_t  hx = icx - FXAPP_ICON_HALO_PAD;
+        int32_t  hy = icy - FXAPP_ICON_HALO_PAD;
+        uint32_t hw = FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD;
+        uint32_t hh = FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD;
+
+        bool now_hover = point_in_rect(x, y, hx, hy, hw, hh);
+        if (now_hover != g_syslogs_icon_hover) {
+            g_syslogs_icon_hover = now_hover;
+            syslogs_draw_icon(g_syslogs_icon_hover);
+        }
+
+        if (left_click && now_hover) {
+            /* Не запускаем второй экземпляр, пока первый ещё жив — та же
+             * причина, что и у калькулятора (см. комментарий выше). */
+            if (g_syslogs_running_tid >= 0 && sched_task_alive((uint32_t)g_syslogs_running_tid)) {
+                DBG_MSG("FXA", "syslogs: уже запущен, повторный спавн пропущен");
+                return;
+            }
+
+            uint64_t spawn_flags = fm_io_cli();
+            int tid = elf64_spawn(g_syslogs_elf_path, g_syslogs_title, 0 /* SCHED_PRIO_NORMAL */);
+            fm_io_sti(spawn_flags);
+            g_syslogs_running_tid = tid;
+            if (tid < 0) {
+                DBG_VAL("FXA", "syslogs: elf64_spawn failed, rc", (uint64_t)(int64_t)tid);
+            }
+        }
+    } else if (g_syslogs_icon_hover) {
+        g_syslogs_icon_hover = false;
+    }
+
     /* ---- Окна — перетаскивание за заголовок, закрытие крестиком.
      * Обрабатываем ВСЕ открытые окна одинаково (My Computer и любые
      * будущие окна, созданные через SYS_WIN_CREATE). ---- */
@@ -2687,6 +3384,7 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
         if (left_click && point_in_rect(x, y, cx, cy, UI_WIN_CLOSE_SZ, UI_WIN_CLOSE_SZ)) {
             ui_win_close(i);
             if (i == g_fxapp_win_id) g_fxapp_win_id = -1;
+            if (i == g_theme_win_id) g_theme_win_id = -1;
             continue;
         }
 
@@ -2709,6 +3407,14 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
             fm_handle_click(i, x, y);
         }
 
+        /* Клик по телу окна "Desktop settings" — реагирует только кнопка
+         * со стрелкой ">" (см. theme_win_handle_click выше). */
+        if (i == g_theme_win_id && left_click &&
+            y >= win->y + (int32_t)UI_WIN_TITLEBAR_H &&
+            point_in_rect(x, y, win->x, win->y, win->w, win->h)) {
+            theme_win_handle_click(i, x, y);
+        }
+
         if (left_click && point_in_rect(x, y, win->x, win->y, win->w, UI_WIN_TITLEBAR_H)) {
             /* захват за заголовок — не за саму кнопку close */
             win->dragging = true;
@@ -2729,7 +3435,16 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
                 ny = panel_y - (int32_t)win->h;
             if (ny < 0) ny = 0;
 
-            if (nx != win->x || ny != win->y) ui_win_move_ex(i, nx, ny, false);
+            if (nx != win->x || ny != win->y) {
+                uint64_t t0 = dbg_win_rdtsc();
+                ui_win_move_ex(i, nx, ny, false);
+                uint64_t ns = dbg_win_tsc_to_ns(dbg_win_rdtsc() - t0);
+                if (ns >= 500000ULL) {   /* >= 0.5мс */
+                    DBG_VAL("DRAG", "ui_win_move_ex SLOW, ns", ns);
+                    DBG_VAL("DRAG", "  win w", win->w);
+                    DBG_VAL("DRAG", "  win h", win->h);
+                }
+            }
         }
     }
 
@@ -2799,6 +3514,16 @@ static void ui_system_reboot(void) {
 void ui_draw_desktop(void) {
     if (g_fb.mode != FB_MODE_LINEAR) return;
 
+    /* Один раз за сессию — синхронизируем g_res_idx с "/display.cfg" (если
+     * он есть), чтобы квадратик Display в "Desktop settings" показывал
+     * то же разрешение, что реально применил загрузчик на этом старте
+     * (см. большой комментарий у ui_load_persisted_resolution выше). */
+    static bool persisted_res_loaded = false;
+    if (!persisted_res_loaded) {
+        persisted_res_loaded = true;
+        ui_load_persisted_resolution();
+    }
+
     uint32_t w = g_fb.width;
     uint32_t h = g_fb.height;
     if (!w || !h) return;
@@ -2837,6 +3562,10 @@ void ui_draw_desktop(void) {
     calc_capture_icon_bg();
     calc_draw_icon(g_calc_icon_hover);
 
+    /* SysLogs — третья иконка, сразу под калькулятором. */
+    syslogs_capture_icon_bg();
+    syslogs_draw_icon(g_syslogs_icon_hover);
+
     /* Если какие-то окна уже были открыты (например полный редрав вызван
      * не при старте) — перерисуем их поверх рабочего стола. Общий цикл
      * для ВСЕХ окон, не только My Computer. */
@@ -2845,6 +3574,7 @@ void ui_draw_desktop(void) {
             ui_win_save_bg(i, g_windows[i].x, g_windows[i].y);
             ui_win_draw(i);
             if (i == g_fxapp_win_id) fm_draw(i);
+            if (i == g_theme_win_id) theme_win_draw(i);
         }
     }
 

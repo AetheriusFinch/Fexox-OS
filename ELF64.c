@@ -49,6 +49,19 @@ extern uint64_t pmm_alloc_frames(size_t count, size_t align);
 extern void     pmm_free_frames(uint64_t pa, size_t count);
 /* vmm_map_user: va <= USER_VIRT_LIMIT, rw=true → PTE_W, exec=true → !PTE_NX */
 extern int      vmm_map_user(uint64_t va, uint64_t pa, bool rw, bool exec);
+/* ИСПРАВЛЕНО: у каждого процесса теперь своя таблица страниц (PML4) —
+ * см. большой комментарий в MemoryControl.c про vmm_create_user_pml4().
+ * Раньше elf64_load() маппил сегменты/стек ВСЕГДА в одну общую
+ * g_vmm.kernel_pml4 через vmm_map_user() — если два процесса были живы
+ * одновременно (например второй экземпляр случайно запускался раньше,
+ * чем первый успевал sys_exit()), второй затирал память первого по тем
+ * же виртуальным адресам (стек — всегда USER_STACK_TOP, код non-PIE
+ * ET_EXEC — всегда свой фиксированный vaddr из файла). Теперь вместо
+ * vmm_map_user() используем vmm_map_user_in(pml4_phys, ...) — явно в
+ * ЭТУ, отдельную PML4 нового процесса. */
+extern uint64_t vmm_create_user_pml4(void);
+extern int      vmm_map_user_in(uint64_t pml4_phys, uint64_t va, uint64_t pa, bool rw, bool exec);
+extern void     vmm_free_user_pml4(uint64_t pml4_phys);
 
 /* =========================================================================
  * Внутренние константы
@@ -227,6 +240,19 @@ int elf64_load(const char *path, elf64_image_t *out) {
         }
     }
 
+    /* --- Своя PML4 для этого процесса (см. большой комментарий у
+     * extern-объявлений выше) — начиная с этой точки out->pml4_phys
+     * валиден, и elf64_free(out) (используется во ВСЕХ путях ошибок
+     * ниже, включая err_free_segs) освободит и её тоже. */
+    out->pml4_phys = vmm_create_user_pml4();
+    if (out->pml4_phys == (uint64_t)-1) {
+        DBG_MSG("ELF", "vmm_create_user_pml4 OOM");
+        out->pml4_phys = 0;
+        kfree(phdrs);
+        vfs_close(fd);
+        return ELF_ERR_NOMEM;
+    }
+
     /* --- Вычисляем базу загрузки ---
      * ET_EXEC: base = 0 (сегменты загружаются по своим vaddr)
      * ET_DYN:  base = PIE_LOAD_BASE (прибавляем ко всем vaddr)
@@ -316,9 +342,9 @@ int elf64_load(const char *path, elf64_image_t *out) {
         for (uint64_t p = 0; p < seg_pages; p++) {
             uint64_t va = seg_vaddr + (p << PAGE_SHIFT);
             uint64_t pa = phys      + (p << PAGE_SHIFT);
-            int mr = vmm_map_user(va, pa, seg_rw, seg_exec);
+            int mr = vmm_map_user_in(out->pml4_phys, va, pa, seg_rw, seg_exec);
             if (mr != 0) {
-                DBG_MSG("ELF", "vmm_map_user failed");
+                DBG_MSG("ELF", "vmm_map_user_in failed");
                 /* Анмаппим уже маппленные */
                 /* (vmm_unmap не экспортирован публично — пропустим, pmm freeing достаточно) */
                 pmm_free_frames(phys, (size_t)seg_pages);
@@ -364,8 +390,8 @@ int elf64_load(const char *path, elf64_image_t *out) {
         for (uint64_t p = 0; p < stack_pages; p++) {
             uint64_t va = stack_va_base + (p << PAGE_SHIFT);
             uint64_t pa = stack_phys    + (p << PAGE_SHIFT);
-            if (vmm_map_user(va, pa, true, false) != 0) {
-                DBG_MSG("ELF", "vmm_map_user stack failed");
+            if (vmm_map_user_in(out->pml4_phys, va, pa, true, false) != 0) {
+                DBG_MSG("ELF", "vmm_map_user_in stack failed");
                 pmm_free_frames(stack_phys, (size_t)stack_pages);
                 elf64_free(out);
                 return ELF_ERR_NOMEM;
@@ -415,6 +441,15 @@ void elf64_free(elf64_image_t *img) {
         pmm_free_frames(img->stack_phys, (size_t)img->stack_pages);
         img->stack_phys  = 0;
         img->stack_pages = 0;
+    }
+
+    /* Освобождаем персональную PML4 процесса (см. vmm_create_user_pml4()
+     * в MemoryControl.c). Только верхнеуровневая таблица — вложенные
+     * PDPT/PD/PT для user-половины остаются висеть, см. комментарий у
+     * vmm_free_user_pml4() в MemoryControl.c. */
+    if (img->pml4_phys) {
+        vmm_free_user_pml4(img->pml4_phys);
+        img->pml4_phys = 0;
     }
 }
 
@@ -543,6 +578,26 @@ int elf64_spawn(const char *path, const char *name, int prio) {
         elf64_free(&sa->image);
         kfree(sa);
         return ELF_ERR_NOMEM;
+    }
+
+    /* ИСПРАВЛЕНО: привязываем персональную PML4 этого процесса (была
+     * создана в elf64_load(), см. большой комментарий в MemoryControl.c)
+     * к её task_t — теперь Scheduler.c::context_switch() будет грузить
+     * именно её в CR3 каждый раз, когда планировщик выбирает эту
+     * задачу, вместо общей на всё ядро таблицы. Без этого шага сегменты/
+     * стек оказались бы замаплены в отдельную PML4, которую CR3 никогда
+     * не увидит — процесс сразу же упал бы на первой же инструкции.
+     * sched_find(Scheduler.h) уже объявлена (мы и так #include
+     * "Scheduler.h" — task_t полностью виден здесь). */
+    task_t *t = sched_find((uint32_t)tid);
+    if (t) {
+        t->pml4_phys = sa->image.pml4_phys;
+    } else {
+        /* Не должно случаться (tid только что создан), но на всякий
+         * случай — если задачу почему-то не нашли, её PML4 иначе
+         * никогда не освободится (task_t.pml4_phys останется 0 и
+         * Scheduler.c не будет знать о ней). */
+        DBG_MSG("ELF", "elf64_spawn: sched_find(tid) не нашла свежесозданную задачу");
     }
 
     DBG_VAL("ELF", "spawned tid", (uint64_t)(uint32_t)tid);

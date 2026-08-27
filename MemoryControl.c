@@ -271,6 +271,55 @@ phys_addr_t pmm_alloc_frames_above(size_t count, size_t align, phys_addr_t min_p
     return result;
 }
 
+/*
+ * pmm_alloc_frames_range — то же самое, что pmm_alloc_frames_above, но с
+ * ВЕРХНЕЙ границей (max_phys, исключительно) в дополнение к нижней
+ * (min_phys). Нужна контроллерам с 32-битным DMA (UHCI и, в общем случае,
+ * EHCI без выставленного бита 64-bit addressing capability — см. USB.c) —
+ * их структуры (frame list, QH, TD) обязаны лежать физически ниже 4 ГБ,
+ * иначе адрес просто не влезет в 32-битное поле указателя в дескрипторе.
+ * pmm_alloc_frames_above() такой гарантии не даёт (только нижнюю границу),
+ * поэтому для USB-контроллеров использовать нужно именно эту функцию, а
+ * не её.
+ *
+ * max_phys: верхняя граница (не включительно), обычно 0x100000000ULL (4 ГБ).
+ */
+phys_addr_t pmm_alloc_frames_range(size_t count, size_t align,
+                                   phys_addr_t min_phys, phys_addr_t max_phys) {
+    if (count == 0 || (align & (align - 1)) != 0) return (phys_addr_t)-1;
+    if (max_phys <= min_phys) return (phys_addr_t)-1;
+
+    size_t min_frame = (size_t)((min_phys + PAGE_SIZE - 1) >> PAGE_SHIFT);
+    size_t max_frame = (size_t)(max_phys >> PAGE_SHIFT);   /* не включительно */
+    size_t a = align ? align : 1;
+
+    spinlock_acquire(&g_pmm.lock);
+    size_t limit = g_pmm.total_frames < max_frame ? g_pmm.total_frames : max_frame;
+    size_t idx = min_frame;
+    phys_addr_t result = (phys_addr_t)-1;
+
+    while (idx + count <= limit) {
+        size_t cand = pmm_find_next_zero(idx, limit);
+        if (cand == (size_t)-1) break;
+        size_t aligned = (cand + a - 1) & ~(a - 1);
+        if (aligned < min_frame) aligned = (min_frame + a - 1) & ~(a - 1);
+        if (aligned + count > limit) break;
+        bool ok = true;
+        for (size_t i = 0; i < count; i++) {
+            if (pmm_test(aligned + i)) { ok = false; break; }
+        }
+        if (ok) {
+            for (size_t i = 0; i < count; i++) pmm_set(aligned + i);
+            g_pmm.free_frames -= count;
+            result = (phys_addr_t)aligned << PAGE_SHIFT;
+            break;
+        }
+        idx = aligned + count;
+    }
+    spinlock_release(&g_pmm.lock);
+    return result;
+}
+
 void pmm_free_frames(phys_addr_t pa, size_t count) {
     if (pa == 0 || pa == (phys_addr_t)-1 || count == 0) return;
     size_t idx = pa >> PAGE_SHIFT;
@@ -308,6 +357,23 @@ typedef struct {
 } vmm_t;
 
 static vmm_t g_vmm;
+
+/* g_kernel_pml4_phys — ФИЗИЧЕСКИЙ адрес g_vmm.kernel_pml4. Нужен отдельно
+ * от g_vmm.kernel_pml4 (это указатель, kernel-virtual — после
+ * vmm_activate() это уже phys_to_kvirt(pa), физический адрес из него
+ * так просто не достать) — используется при переключении CR3 между
+ * процессами (см. vmm_kernel_pml4_phys() ниже, Scheduler.c). */
+static phys_addr_t g_kernel_pml4_phys = (phys_addr_t)-1;
+
+/* sched_current_pml4_phys — реализована в Scheduler.c. Возвращает
+ * pml4_phys ТЕКУЩЕЙ (исполняющей syscall) задачи, либо 0, если задачи
+ * ещё нет или это kernel-поток без своего адресного пространства.
+ * Нужна vmm_map_user() ниже, чтобы SYS_MMAP/SYS_SHM_AT/
+ * sys_get_framebuffer из Syscall.c маппили память именно в адресное
+ * пространство ВЫЗВАВШЕГО процесса, а не всегда в общую (уже более не
+ * единственную!) g_vmm.kernel_pml4 — см. большой комментарий у
+ * vmm_create_user_pml4(). */
+extern uint64_t sched_current_pml4_phys(void);
 
 static inline pte_t pte_make(phys_addr_t pa, uint64_t flags) { return (pa & PTE_ADDR_MASK) | flags | PTE_A; }
 static void cpu_invlpg(virt_addr_t addr) { __asm__ volatile ("invlpg (%0)" :: "r"(addr) : "memory"); }
@@ -505,6 +571,7 @@ int vmm_init(void) {
     if (pml4_pa == (phys_addr_t)-1) return -1;
     g_vmm.kernel_pml4 = (pte_t *)phys_access(pml4_pa);
     kmemset(g_vmm.kernel_pml4, 0, PAGE_SIZE);
+    g_kernel_pml4_phys = pml4_pa;
 
     /* Direct map: 4 GiB через 2 MiB huge pages (2048 итераций вместо 1M) */
     uint64_t dm_flags = PTE_P | PTE_W | PTE_G | PTE_NX;
@@ -919,16 +986,108 @@ int mem_control_init(const void *efi_map, uint64_t map_size, uint64_t desc_size)
     return 0;
 }
 
-int vmm_map_user(virt_addr_t va, phys_addr_t pa, bool rw, bool exec) {
+/* =========================================================================
+ * PER-PROCESS ADDRESS SPACES
+ *
+ * ИСПРАВЛЕНО: раньше ЛЮБОЙ вызов vmm_map_user() (и elf64_load() сегментов
+ * ELF/стека, и sc_mmap/sc_shm_at/sc_get_framebuffer из Syscall.c) всегда
+ * писал в ОДНУ И ТУ ЖЕ, единственную на всё ядро g_vmm.kernel_pml4. Это
+ * значит, что у ВСЕХ userspace-процессов был буквально ОДИН общий набор
+ * виртуальных адресов — включая стек (он всегда садится по фиксированному
+ * USER_STACK_TOP из ELF64.c) и код (non-PIE ET_EXEC всегда грузится по
+ * одному и тому же vaddr из файла). Пока одновременно жил только один
+ * процесс — проблем не было. Как только запускались двое одновременно
+ * (даже случайно, например повторный спавн, пока первый экземпляр ещё не
+ * дошёл до sys_exit) — elf64_load() второго процесса ОБНУЛЯЛ и
+ * переиспользовал те же самые физические страницы под ТЕ ЖЕ виртуальные
+ * адреса, что использовал первый, — стирая его стек/код прямо у него
+ * из-под ног. Результат — #PF с RIP=0 (адрес возврата на стеке
+ * оказывается зануленным чужим elf64_load) в самый неожиданный момент.
+ *
+ * Фикс: у каждого userspace-процесса теперь СВОЯ верхнеуровневая таблица
+ * (PML4) — vmm_create_user_pml4(). Нижняя половина (индексы 0..255,
+ * user-адреса) в ней всегда пустая и заполняется индивидуально при
+ * загрузке ELF (vmm_map_user_in). Верхняя половина (256..511, kernel:
+ * direct map, код ядра, куча) — общие для ВСЕХ адресных пространств
+ * указатели на ОДНИ И ТЕ ЖЕ физические таблицы, что и в g_vmm.kernel_pml4
+ * (копируется один раз при создании, дальше ядро одинаково видно из
+ * любого CR3). Собственно переключение CR3 при переключении задач —
+ * в Scheduler.c::context_switch().
+ * ========================================================================= */
+
+/* vmm_kernel_pml4_phys — физический адрес "исходной" PML4 ядра (та, что
+ * загружена в CR3 для kernel-потоков без своего pml4_phys, т.е. когда
+ * task_t.pml4_phys == 0). Используется Scheduler.c при переключении CR3. */
+phys_addr_t vmm_kernel_pml4_phys(void) { return g_kernel_pml4_phys; }
+
+/* vmm_create_user_pml4 — новая PML4 для отдельного процесса: нижняя
+ * половина (user, 0..255) — чистый ноль, верхняя (kernel, 256..511) —
+ * копия соответствующих записей g_vmm.kernel_pml4 (те же физические
+ * PDPT/PD/PT, не дублируются — копируется только сама верхнеуровневая
+ * таблица, 512 записей по 8 байт). Возвращает физический адрес новой
+ * PML4 или (phys_addr_t)-1 при нехватке памяти. */
+phys_addr_t vmm_create_user_pml4(void) {
+    phys_addr_t pa = pmm_alloc_frame();
+    if (pa == (phys_addr_t)-1 || !pa_in_ram(pa)) return (phys_addr_t)-1;
+    pte_t *pml4 = (pte_t *)phys_access(pa);
+    kmemset(pml4, 0, PAGE_SIZE);
+    for (size_t i = 256; i < 512; i++) pml4[i] = g_vmm.kernel_pml4[i];
+    return pa;
+}
+
+/* vmm_free_user_pml4 — освобождает верхнеуровневую таблицу процесса.
+ * ВАЖНО (известное упрощение, как и везде в этом проекте — см.
+ * elf64_free(), который тоже не убирает записи в page tables при
+ * освобождении физических страниц сегментов): здесь освобождается
+ * ТОЛЬКО сама PML4-страница, а НЕ вложенные PDPT/PD/PT, которые
+ * vmm_walk_table() создавала под нижнюю половину (user-адреса) этого
+ * процесса — они остаются висеть как утечка (по несколько страниц на
+ * процесс). Полная рекурсивная очистка требует прохода по всем
+ * презентным записям на всех уровнях — не делаем сейчас, т.к. процессы
+ * и так пока не переживают перезапуск ядра, а этот путь и раньше (для
+ * общей PML4) утечки такого рода не закрывал. */
+void vmm_free_user_pml4(phys_addr_t pml4_phys) {
+    if (pml4_phys && pml4_phys != (phys_addr_t)-1) pmm_free_frames(pml4_phys, 1);
+}
+
+/* vmm_map_user_in — как vmm_map_user() ниже, но в ЯВНО указанную PML4
+ * (для ELF64.c: сегменты/стек нового процесса грузятся ДО того, как он
+ * стал "текущей" задачей — автоопределение через sched_current_pml4_phys()
+ * тут даст неверный (чужой, текущий на момент спавна) адрес). */
+int vmm_map_user_in(phys_addr_t pml4_phys, virt_addr_t va, phys_addr_t pa, bool rw, bool exec) {
     if (va > USER_VIRT_LIMIT) return -1;
+    if ((va & ~PAGE_MASK) || (pa & ~PAGE_MASK)) return -1;
+    if (pml4_phys == (phys_addr_t)-1 || !pa_in_ram(pml4_phys)) return -1;
+
     uint64_t flags = PTE_P | PTE_U;
-    if (rw) {
-        flags |= PTE_W;
-    }
-    if (!exec) {
-        flags |= PTE_NX;
-    }
-    return vmm_map(va, pa, flags);
+    if (rw) flags |= PTE_W;
+    if (!exec) flags |= PTE_NX;
+
+    spinlock_acquire(&g_vmm.lock);
+    pte_t *pml4 = (pte_t *)phys_access(pml4_phys);
+    pte_t *entry = vmm_walk_table(pml4, va, true);
+    if (!entry) { spinlock_release(&g_vmm.lock); return -2; }
+    *entry = pte_make(pa, flags);
+    /* invlpg имеет смысл, только если pml4_phys сейчас реально в CR3;
+     * при заполнении ЕЩЁ не запущенного процесса это не так, но лишний
+     * invlpg здесь безвреден. */
+    if (g_vmm.paging_active) cpu_invlpg(va);
+    spinlock_release(&g_vmm.lock);
+    return 0;
+}
+
+/* vmm_map_user — как раньше по сигнатуре (все старые вызовы в Syscall.c —
+ * sc_mmap/sc_shm_at/sc_get_framebuffer — не тронуты), но теперь маппит
+ * в PML4 ТЕКУЩЕЙ задачи (sched_current_pml4_phys()), а не всегда в
+ * общую g_vmm.kernel_pml4 — иначе после появления отдельных PML4 у
+ * процессов эти маппинги стали бы невидимы вызвавшему процессу (он
+ * работает уже под своим CR3, а не под kernel_pml4). Если текущей
+ * задачи ещё нет или это kernel-поток без своего адресного пространства
+ * (pml4_phys == 0) — используем kernel_pml4, как и раньше. */
+int vmm_map_user(virt_addr_t va, phys_addr_t pa, bool rw, bool exec) {
+    uint64_t cur = sched_current_pml4_phys();
+    phys_addr_t target = cur ? (phys_addr_t)cur : g_kernel_pml4_phys;
+    return vmm_map_user_in(target, va, pa, rw, exec);
 }
 
 #ifdef __cplusplus

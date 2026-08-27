@@ -29,7 +29,17 @@ extern void dbg_hex64(uint64_t v);
  * ------------------------------------------------------------------------- */
 extern void  *kmalloc(uint64_t size);
 extern void   kfree(void *ptr);
+extern void   pmm_free_frames(uint64_t pa, uint64_t count);
+extern uint64_t vmm_kernel_pml4_phys(void);
 extern void   interrupt_set_scheduler_tick(uint64_t (*fn)(uint64_t frame_rsp));
+
+/* g_active_pml4_phys — физический адрес PML4, реально загруженной в CR3
+ * прямо сейчас (0 = ещё ни разу не переключали явно, т.е. активна
+ * "исходная" kernel_pml4 из vmm_activate() при загрузке ядра). Только
+ * для того, чтобы context_switch() не перезагружал CR3 (и не флашил
+ * TLB) без необходимости, когда next работает в том же адресном
+ * пространстве, что и уже загружено. */
+static uint64_t g_active_pml4_phys = 0;
 
 /* -------------------------------------------------------------------------
  * Spinlock — однопроцессорная реализация через CLI/STI
@@ -535,6 +545,70 @@ static uint64_t context_switch(uint64_t frame_rsp) {
     g_sched.current = next;
     g_sched.slice_start_tsc = now_tsc;
 
+    /* ИСПРАВЛЕНО: переключение CR3 между процессами. Раньше здесь ничего
+     * не было (см. старый комментарий "все kernel-потоки в одном
+     * адресном пространстве, для user-mode нужно добавить переключение
+     * CR3" — вот это "добавить"), и все userspace-процессы фактически
+     * делили ОДНУ таблицу страниц (g_vmm.kernel_pml4) — второй
+     * запущенный процесс переиспользовал те же виртуальные адреса
+     * (стек, код non-PIE ET_EXEC) и стирал память первого. Теперь у
+     * каждого процесса своя PML4 (next->pml4_phys, см. ELF64.c/
+     * MemoryControl.c) — грузим её в CR3 ПЕРЕД чем-либо ещё при каждом
+     * переключении на него (важно сделать это РАНЬШЕ реапа ZOMBIE ниже:
+     * когда prev — только что завершившийся процесс, CR3 к моменту
+     * реапа должен уже указывать на next/kernel, а не на prev, чтобы
+     * можно было безопасно освободить его PML4). pml4_phys == 0 —
+     * обычный kernel-поток (idle, task_wrapper и т.п.) без своего
+     * адресного пространства: используем "исходную" kernel_pml4 (в ней
+     * тоже есть весь код/данные ядра — они скопированы в верхнюю
+     * половину КАЖДОЙ пользовательской PML4). g_active_pml4_phys — чтобы
+     * не дёргать CR3 (и не флашить TLB) лишний раз, когда следующая
+     * задача работает в том же адресном пространстве, что и уже
+     * загружено. */
+    {
+        uint64_t want = next->pml4_phys ? next->pml4_phys : vmm_kernel_pml4_phys();
+        if (want != g_active_pml4_phys) {
+            __asm__ volatile ("mov %0, %%cr3" :: "r"(want) : "memory");
+            g_active_pml4_phys = want;
+        }
+    }
+
+    /* ИСПРАВЛЕНО (утечка памяти при закрытии приложений): раньше ZOMBIE-
+     * задача (после sched_exit()) навсегда оставалась в памяти — её TCB
+     * (task_t, ~несколько сотен байт), весь kernel-стек (SCHED_KSTACK_SIZE
+     * = 16 KiB) и (после появления per-process PML4 выше) её персональная
+     * таблица страниц никогда не освобождались, т.к. sched_exit() лишь
+     * снимает задачу со всех списков и зависает в "sti;hlt", а её
+     * собственный kfree(себя) невозможен — задача физически ИСПОЛНЯЕТСЯ
+     * на этом самом стеке (и под этим самым CR3). При многократном
+     * открытии/закрытии калькулятора и SysLogs (см. calc_running_tid/
+     * syslogs_running_tid в Framebuffer.c — второй экземпляр не
+     * запускается, пока sched_task_alive() не станет false, т.е. только
+     * после реального ухода в ZOMBIE) это уходило в никуда — куча
+     * фрагментировалась/истощалась, что и объясняло странные повторные
+     * kfree() с совпадающим phys_prev в логе паники.
+     *
+     * Единственный БЕЗОПАСНЫЙ момент освободить ZOMBIE-задачу — сразу
+     * ЗДЕСЬ, сразу после того как мы гарантированно переключились на
+     * next (включая CR3, см. блок выше) и больше никогда не вернёмся в
+     * prev (ZOMBIE никогда не попадает обратно в rq — см. блок выше по
+     * коду). К этому моменту prev уже снят со всех списков планировщика
+     * (см. sched_exit), а CR3 уже точно не указывает на её PML4 —
+     * освобождаем стек, персональную PML4 (если была — т.е. это был
+     * настоящий userspace-процесс, а не просто kernel-поток) и сам TCB. */
+    if (prev && prev->state == TASK_ZOMBIE) {
+        if (prev->kstack_base) {
+            kfree(prev->kstack_base);
+            prev->kstack_base = NULL;
+        }
+        if (prev->pml4_phys) {
+            pmm_free_frames(prev->pml4_phys, 1);
+            prev->pml4_phys = 0;
+        }
+        kfree(prev);
+        prev = NULL;
+    }
+
     /* ВРЕМЕННЫЙ диагностический принт — убрать после отладки. Показывает,
      * доходит ли планировщик вообще до выбора tid только что созданной
      * задачи, и на каком именно тике. */
@@ -570,39 +644,33 @@ static uint64_t context_switch(uint64_t frame_rsp) {
 uint64_t sched_tick(uint64_t frame_rsp) {
     if (!g_sched.ready) return frame_rsp;
 
-    /* ВРЕМЕННЫЙ диагностический heartbeat — убрать после отладки.
-     * Печатает раз в ~50 тиков: тикает ли таймер вообще после спавна
-     * калькулятора, кто сейчас current и сколько задач в очереди. Если
-     * это перестаёт печататься сразу после "[ELF] spawned tid" — значит
-     * система виснет целиком ДО следующего тика (например, ещё внутри
-     * обработчика клика/elf64_spawn или сразу на sti()), а не в
-     * механизме переключения контекста. */
-    {
-        static uint32_t hb = 0;
-        if ((hb++ % 50) == 0) {
-            DBG_VAL("SC", "sched_tick: hb, cur tid", (uint64_t)(g_sched.current ? g_sched.current->tid : 0xFFFFFFFF));
-            DBG_VAL("SC", "sched_tick: hb, rq.size", (uint64_t)g_sched.rq.size);
-        }
-    }
-
     /* Курсор (PNG + альфа) и "тикающие" часы — рисуются вне блокировки
      * планировщика, чтобы не задерживать переключение контекста. */
     extern void ui_tick(void);
-
-    /* ВРЕМЕННЫЙ замер — убрать после отладки. Проверяем гипотезу: не
-     * стал ли ui_tick() занимать ДОЛЬШЕ периода таймера (~10мс при
-     * 100Гц) — если так, следующий тик оказывается просрочен ещё ДО
-     * iretq в задачу, и ни один пользовательский поток не получает ни
-     * одного такта (ровно то, что видно в qemu.log: RIP/RSP заморожены
-     * на входе в task_wrapper). Печатаем только "медленные" вызовы
-     * (>= 1мс), чтобы не утопить лог: если такие строки посыпятся
-     * массово именно после спавна калькулятора — гипотеза подтверждена.
-     */
-    uint64_t ui_t0 = rdtsc();
     ui_tick();
-    uint64_t ui_ns = tsc_to_ns(rdtsc() - ui_t0);
-    if (ui_ns >= 1000000ULL) /* >= 1 мс */
-        DBG_VAL("SC", "sched_tick: ui_tick() SLOW, ns", ui_ns);
+
+    /* USB HID (клавиатура/мышь, Boot Protocol) — опрашивается через
+     * control-transfer (GET_REPORT), а не через interrupt endpoint (см.
+     * шапку Resources/USBHID.c), поэтому это АКТИВНЫЙ опрос по таймеру,
+     * а не пассивное ожидание прерывания. Как и с
+     * ui_flip_userspace_windows (см. ui_extra.c) — не каждый тик, иначе
+     * лишние control-транзакции на пустом месте съедают то же время
+     * планировщика, которое мы отвоевали в прошлый раз. Раз в 3 тика
+     * (~30мс при 100Гц) — задержка ввода с клавиатуры/мыши не заметна
+     * человеку, а нагрузка на HCD в 3 раза меньше, чем при опросе каждый
+     * тик. */
+    extern void usb_hid_poll_all(void);
+    static uint32_t s_usb_hid_tick = 0;
+    if ((s_usb_hid_tick++ % 3) == 0) {
+        /* ВРЕМЕННАЯ диагностика — убрать после отладки (см. такую же
+         * пару в Framebuffer.c: ui_desktop_handle_mouse, "DRAG"). Печатаем
+         * только "медленные" опросы (>= 0.5мс), чтобы не утопить лог. */
+        uint64_t t0 = rdtsc();
+        usb_hid_poll_all();
+        uint64_t ns = tsc_to_ns(rdtsc() - t0);
+        if (ns >= 500000ULL)
+            DBG_VAL("SC", "usb_hid_poll_all SLOW, ns", ns);
+    }
 
     spinlock_acquire(&g_sched.lock);
 
@@ -730,6 +798,16 @@ void sched_wake(uint32_t tid) {
  * sched_current / sched_find / sched_task_count
  * ------------------------------------------------------------------------- */
 task_t *sched_current(void) { return g_sched.current; }
+
+/* sched_current_pml4_phys — для MemoryControl.c::vmm_map_user(), чтобы
+ * SYS_MMAP/SYS_SHM_AT/sys_get_framebuffer (Syscall.c) маппили память в
+ * адресное пространство ИМЕННО вызвавшего процесса — теперь, когда у
+ * каждого процесса своя PML4 (см. MemoryControl.c), а не общая на всё
+ * ядро. 0, если текущей задачи нет или это kernel-поток без своего
+ * pml4_phys (тогда MemoryControl.c сам подставит kernel_pml4). */
+uint64_t sched_current_pml4_phys(void) {
+    return g_sched.current ? g_sched.current->pml4_phys : 0;
+}
 
 task_t *sched_find(uint32_t tid) {
     task_t *t = g_sched.all_head;

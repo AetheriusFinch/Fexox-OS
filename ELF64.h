@@ -143,6 +143,16 @@ typedef struct {
     uint64_t    stack_pages;   /* кол-во страниц стека */
     uint64_t    stack_phys;    /* физический адрес стека (для освобождения) */
 
+    /* pml4_phys — СВОЯ верхнеуровневая таблица страниц этого процесса
+     * (см. vmm_create_user_pml4() в MemoryControl.c). Раньше все процессы
+     * грузились в одну общую g_vmm.kernel_pml4 — при одновременной работе
+     * двух процессов второй затирал память первого (см. большой
+     * комментарий в MemoryControl.c). Теперь у каждого elf64_image_t —
+     * своя PML4; task_t.pml4_phys (Scheduler.h) копируется из этого поля
+     * в elf64_spawn(), чтобы Scheduler.c переключал CR3 при переключении
+     * задач. */
+    uint64_t    pml4_phys;
+
     uint32_t    nseg;
     elf64_seg_t segs[ELF64_MAX_SEGS];
 } elf64_image_t;

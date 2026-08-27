@@ -112,12 +112,22 @@ typedef struct {
     UINTN                              FrameBufferSize;
 } EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
 
-typedef struct {
-    void *QueryMode;
-    void *SetMode;
+/* Forward-декларация: SetMode/QueryMode принимают указатель "на себя"
+ * (This), поэтому struct-тег нужен до самого typedef. */
+typedef struct EFI_GRAPHICS_OUTPUT_PROTOCOL EFI_GRAPHICS_OUTPUT_PROTOCOL;
+
+struct EFI_GRAPHICS_OUTPUT_PROTOCOL {
+    /* QueryMode — вернуть параметры режима ModeNumber (0..MaxMode-1) без
+     * его активации; SetMode — реально переключить экран на ModeNumber
+     * (единственный способ по-настоящему сменить физическое разрешение —
+     * доступен только здесь, в загрузчике, пока живы Boot Services). */
+    EFI_STATUS (EFIAPI *QueryMode)(EFI_GRAPHICS_OUTPUT_PROTOCOL *This,
+                                    UINT32 ModeNumber, UINTN *SizeOfInfo,
+                                    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION **Info);
+    EFI_STATUS (EFIAPI *SetMode)(EFI_GRAPHICS_OUTPUT_PROTOCOL *This, UINT32 ModeNumber);
     void *Blt;
     EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
-} EFI_GRAPHICS_OUTPUT_PROTOCOL;
+};
 
 /* ---- fb_info_t (должна совпадать с Framebuffer.h) ---- */
 #define FB_MODE_NONE    0
@@ -331,6 +341,58 @@ static void bl_fail(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut, const char *stage, 
     dbg_hex64((UINT64)st);
     dbg_puts(" ***\n");
     DBG_PANIC("BL", stage);
+}
+
+/* =========================================================================
+ * "/display.cfg" — выбор разрешения из "Desktop settings" -> Display
+ * (см. Framebuffer.c: apply_resolution() / ui_persist_display_cfg()).
+ * Простой текстовый файл вида "1920x1080\n" в корне того же диска, с
+ * которого грузится kernel.bin. Читаем его ЗДЕСЬ (пока живы Boot
+ * Services) и, если найден подходящий GOP-режим, реально переключаем
+ * экран через gop->SetMode() — единственное место, где это в принципе
+ * возможно (ExitBootServices необратимо всё это отбирает).
+ * ========================================================================= */
+
+/* Простой парсер "ШИРИНАxВЫСОТА" (например "1920x1080") — без libc. */
+static int parse_resolution(const char *s, UINT32 *w, UINT32 *h) {
+    UINT32 a = 0, b = 0;
+    int has_a = 0, has_b = 0;
+
+    while (*s >= '0' && *s <= '9') { a = a * 10 + (UINT32)(*s - '0'); s++; has_a = 1; }
+    if (!has_a || (*s != 'x' && *s != 'X')) return 0;
+    s++;
+    while (*s >= '0' && *s <= '9') { b = b * 10 + (UINT32)(*s - '0'); s++; has_b = 1; }
+    if (!has_b) return 0;
+
+    *w = a;
+    *h = b;
+    return 1;
+}
+
+/* Читает "\display.cfg" из уже открытого корня root FS. Возвращает 1 и
+ * заполняет *out_w/*out_h при успехе, 0 если файла нет / битый формат —
+ * это НЕ ошибка загрузки, просто "нет сохранённого выбора", вызывающий
+ * код должен молча оставить текущий (прошивочный) режим. */
+static int bl_read_display_cfg(EFI_FILE_PROTOCOL *root, UINT32 *out_w, UINT32 *out_h) {
+    if (!root) return 0;
+
+    UINT16 cfg_path[] = L"\\display.cfg";
+    EFI_FILE_PROTOCOL *cfg_file = NULL;
+    EFI_STATUS st = root->Open(root, (void **)&cfg_file, cfg_path, 0x01 /* EFI_FILE_MODE_READ */, 0);
+    if (st != EFI_SUCCESS || !cfg_file) return 0;
+
+    char buf[32];
+    UINTN read_size = sizeof(buf) - 1;
+    st = cfg_file->Read(cfg_file, &read_size, buf);
+    cfg_file->Close(cfg_file);
+    if (st != EFI_SUCCESS || read_size == 0) return 0;
+
+    buf[read_size] = '\0';
+    for (UINTN i = 0; i < read_size; i++) {
+        if (buf[i] == '\r' || buf[i] == '\n') { buf[i] = '\0'; break; }
+    }
+
+    return parse_resolution(buf, out_w, out_h);
 }
 
 static UINT64 setup_boot_paging(UINT64 pml4_phys) {
@@ -575,6 +637,49 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             &EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID, NULL, (void **)&gop);
 
         if (gop_status == EFI_SUCCESS && gop && gop->Mode && gop->Mode->Info) {
+            /* Если раньше из "Desktop settings" -> Display сохранили выбор
+             * ("/display.cfg", см. Framebuffer.c: apply_resolution()) —
+             * ищем среди gop->QueryMode() режим с точным совпадением
+             * width/height и реально переключаем экран через SetMode.
+             * Не нашли файл / нет такого режима — молча остаёмся на том,
+             * что уже выбрала прошивка (как и раньше, ничего не меняется). */
+            UINT32 want_w = 0, want_h = 0;
+            if (bl_read_display_cfg(root, &want_w, &want_h)) {
+                DBG_VAL("BL", "display.cfg want_w", want_w);
+                DBG_VAL("BL", "display.cfg want_h", want_h);
+
+                UINT32 match_mode = 0;
+                int    found      = 0;
+                for (UINT32 m = 0; m < gop->Mode->MaxMode; m++) {
+                    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *qi = NULL;
+                    UINTN qsz = 0;
+                    if (gop->QueryMode(gop, m, &qsz, &qi) != EFI_SUCCESS || !qi) continue;
+                    if (qi->HorizontalResolution == want_w && qi->VerticalResolution == want_h) {
+                        match_mode = m;
+                        found = 1;
+                        break;
+                    }
+                }
+
+                if (found && match_mode != gop->Mode->Mode) {
+                    EFI_STATUS set_status = gop->SetMode(gop, match_mode);
+                    if (set_status == EFI_SUCCESS) {
+                        DBG_MSG("BL", "GOP mode switched via display.cfg");
+                        bl_log(ConOut, "[OK] GOP mode switched via display.cfg\r\n");
+                    } else {
+                        DBG_VAL("BL", "GOP SetMode failed", (UINT64)set_status);
+                        bl_log(ConOut, "[WARN] GOP SetMode failed, keeping current mode\r\n");
+                    }
+                } else if (!found) {
+                    DBG_MSG("BL", "display.cfg resolution not supported by GOP");
+                    bl_log(ConOut, "[WARN] display.cfg resolution not supported\r\n");
+                }
+                /* found && match_mode == gop->Mode->Mode — уже тот режим, ничего делать не надо */
+            }
+
+            /* gop->Mode->Info — тот же указатель, что и раньше, но после
+             * SetMode прошивка обновляет его содержимое на НОВЫЙ активный
+             * режим, поэтому перечитываем mi здесь, а не до блока выше. */
             EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi = gop->Mode->Info;
 
             g_boot_info.fb.mode     = FB_MODE_LINEAR;

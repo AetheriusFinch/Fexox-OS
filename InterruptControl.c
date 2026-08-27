@@ -141,15 +141,35 @@ static void format_hex(uint64_t val, char *buf) {
     buf[pos] = '\0';
 }
 
-__attribute__((interrupt))
-void page_fault_handler(cpu_frame_t *frame, uint64_t err) {
+/*
+ * ИСПРАВЛЕНО (см. большой комментарий у irq0_timer_isr ниже, тот же класс
+ * бага): page_fault_handler() и ВСЕ exc_N() раньше были объявлены как
+ * __attribute__((interrupt)) с аргументом типа cpu_frame_t* — большой
+ * "программной" структурой (r15..rax, error_code, rip, cs, rflags, rsp, ss,
+ * 20 полей), которую сам компилятор туда НЕ кладёт. __attribute__((interrupt))
+ * сам решает, какие регистры и в каком порядке сохранить (это ЕГО личный
+ * пролог, не наш), а реальный "frame", который он передаёт — это только
+ * то, что аппаратно положил CPU (error_code[если есть]/rip/cs/rflags/rsp/ss),
+ * причём часто СРАЗУ после ЕГО собственных push'ей callee-saved регистров,
+ * а не по смещениям cpu_frame_t. Из-за этого frame->rip/frame->cs/frame->rsp
+ * читались из совершенно случайных мест на стеке — отсюда в логе паники
+ * "RIP : 0x0000000000000000 / CS : 0x0 / RSP : 0x0" при абсолютно реальном
+ * (и ненулевом) page fault (ADDR/ERR читались верно — cr2 и код ошибки
+ * компилятор передаёт как обычные значения, а не через this же "frame").
+ *
+ * Фикс: ручные naked-стабы (ISR_STUB_NOERR/ISR_STUB_ERR ниже), которые
+ * сами пушат GPR В ТОМ ЖЕ порядке, что и setup_kstack()/irq0_timer_isr —
+ * тогда frame реально указывает на валидный cpu_frame_t и дамп паники
+ * показывает НАСТОЯЩИЙ RIP/CS/RSP упавшего кода (и можно будет понять,
+ * ring3-приложение упало или сам код ядра).
+ */
+__attribute__((used))
+static void page_fault_handler_c(uint8_t num, uint64_t err, cpu_frame_t *frame) {
+    (void)num;
     uint64_t cr2 = read_cr2();
     char addr_buf[20], err_buf[20], rip_buf[20], cs_buf[20], rsp_buf[20];
     format_hex(cr2, addr_buf);
     format_hex(err, err_buf);
-    /* ВРЕМЕННО: raw frame->rip/cs/rsp вместо (void)frame — нужно узнать
-     * ТОЧНЫЙ адрес падения (и был ли это ring0/ring3), а не гадать по
-     * контексту в логе. Сверить потом с nm/symbols.txt. */
     format_hex(frame->rip, rip_buf);
     format_hex(frame->cs,  cs_buf);
     format_hex(frame->rsp, rsp_buf);
@@ -199,8 +219,102 @@ void page_fault_handler(cpu_frame_t *frame, uint64_t err) {
 /* ==========================================================================
 DISPATCHERS & STUBS
 ========================================================================== */
+/* __attribute__((used)) ОБЯЗАТЕЛЕН: единственный вызов этой static-функции —
+ * из текста инлайн-асма (ISR_STUB_NOERR/ISR_STUB_ERR ниже). Компилятор не
+ * разбирает строки инлайн-асма и не видит там вызова, поэтому с его точки
+ * зрения это "неиспользуемая static-функция" — и он (даже на -O0) не
+ * эмиттирует её в объектник вовсе. Без атрибута: "call exception_dispatch"
+ * в асме ссылается на символ, которого физически нет в .o -> ld.lld:
+ * undefined symbol. */
+__attribute__((used))
+static void exception_dispatch(uint8_t num, uint64_t err, cpu_frame_t *frame);
+
+/* -------------------------------------------------------------------------
+ * ISR_STUB_NOERR / ISR_STUB_ERR — генерируют naked-обработчик вектора NUM,
+ * который аппаратно-корректно строит cpu_frame_t (см. большой комментарий
+ * выше у page_fault_handler_c) и зовёт HANDLER(NUM, err, &frame).
+ *
+ * Порядок push ДОЛЖЕН точно совпадать с cpu_frame_t и с тем, что строит
+ * setup_kstack() в Scheduler.c (см. комментарий там же):
+ *   r15,r14,r13,r12,r11,r10,r9,r8, rdi,rsi,rbp,rdx,rcx,rbx,rax, error_code,
+ *   [rip,cs,rflags,rsp,ss — уже положены самим CPU].
+ * Значит физический порядок push-инструкций (каждый push кладёт значение
+ * НИЖЕ по адресу) должен быть обратным списку полей: сначала (fake)
+ * error_code, потом rax,rbx,rcx,rdx,rbp,rsi,rdi,r8,r9,r10,r11,r12,r13,r14,
+ * и r15 — последним (r15 окажется по самому маленькому адресу = struct
+ * offset 0, ровно как ожидает cpu_frame_t).
+ *
+ * ISR_STUB_NOERR: у вектора нет аппаратного error_code — пушим фиктивный
+ * $0 сами (как и в irq0_timer_isr), чтобы смещения совпали с cpu_frame_t.
+ *
+ * ISR_STUB_ERR: аппаратный error_code уже лежит на вершине стека (CPU
+ * кладёт его ДО rip/cs/rflags/rsp/ss) — фиктивный push НЕ нужен, реальное
+ * значение читаем после наших push'ей по смещению 120(%rsp) (offsetof
+ * error_code в cpu_frame_t) и передаём вторым аргументом.
+ * ------------------------------------------------------------------------- */
+#define ISR_PUSH_GPR \
+    "push %%rax\n\t" "push %%rbx\n\t" "push %%rcx\n\t" "push %%rdx\n\t" \
+    "push %%rbp\n\t" "push %%rsi\n\t" "push %%rdi\n\t" \
+    "push %%r8\n\t"  "push %%r9\n\t"  "push %%r10\n\t" "push %%r11\n\t" \
+    "push %%r12\n\t" "push %%r13\n\t" "push %%r14\n\t" "push %%r15\n\t"
+
+#define ISR_POP_GPR \
+    "pop %%r15\n\t" "pop %%r14\n\t" "pop %%r13\n\t" "pop %%r12\n\t" \
+    "pop %%r11\n\t" "pop %%r10\n\t" "pop %%r9\n\t"  "pop %%r8\n\t" \
+    "pop %%rdi\n\t" "pop %%rsi\n\t" "pop %%rbp\n\t" "pop %%rdx\n\t" \
+    "pop %%rcx\n\t" "pop %%rbx\n\t" "pop %%rax\n\t"
+
+#define ISR_STUB_NOERR(NAME, NUM, HANDLER) \
+__attribute__((naked)) void NAME(void) { \
+    __asm__ volatile ( \
+        "push $0\n\t"                 /* фиктивный error_code */ \
+        ISR_PUSH_GPR \
+        "mov %%rsp, %%rdx\n\t"        /* 3-й аргумент: cpu_frame_t* */ \
+        "xor %%esi, %%esi\n\t"        /* 2-й аргумент: err = 0 */ \
+        "mov $" #NUM ", %%edi\n\t"    /* 1-й аргумент: num */ \
+        "call " #HANDLER "\n\t" \
+        ISR_POP_GPR \
+        "add $8, %%rsp\n\t"           /* убрать фиктивный error_code */ \
+        "iretq\n\t" \
+        ::: "memory" \
+    ); \
+}
+
+/* Для IRQ (irq_dispatch(num, frame) — 2 аргумента, без error_code, вектор
+ * не в SysV-регистре err, а сразу num/frame): та же безопасная сборка
+ * cpu_frame_t, что и ISR_STUB_NOERR, но с другой сигнатурой вызова. */
+#define ISR_STUB_IRQ(NAME, VEC, HANDLER) \
+__attribute__((naked)) void NAME(void) { \
+    __asm__ volatile ( \
+        "push $0\n\t"                 /* фиктивный error_code */ \
+        ISR_PUSH_GPR \
+        "mov %%rsp, %%rsi\n\t"        /* 2-й аргумент: cpu_frame_t* */ \
+        "mov $" #VEC ", %%edi\n\t"    /* 1-й аргумент: вектор */ \
+        "call " #HANDLER "\n\t" \
+        ISR_POP_GPR \
+        "add $8, %%rsp\n\t" \
+        "iretq\n\t" \
+        ::: "memory" \
+    ); \
+}
+
+#define ISR_STUB_ERR(NAME, NUM, HANDLER) \
+__attribute__((naked)) void NAME(void) { \
+    __asm__ volatile ( \
+        ISR_PUSH_GPR \
+        "mov %%rsp, %%rdx\n\t"        /* 3-й аргумент: cpu_frame_t* */ \
+        "mov 120(%%rsp), %%rsi\n\t"   /* 2-й аргумент: реальный error_code */ \
+        "mov $" #NUM ", %%edi\n\t"    /* 1-й аргумент: num */ \
+        "call " #HANDLER "\n\t" \
+        ISR_POP_GPR \
+        "add $8, %%rsp\n\t"           /* убрать error_code перед iretq */ \
+        "iretq\n\t" \
+        ::: "memory" \
+    ); \
+}
+
+__attribute__((used))
 static void exception_dispatch(uint8_t num, uint64_t err, cpu_frame_t *frame) {
-    (void)frame;
     if (g_isr_handlers[num]) {
         g_isr_handlers[num](num, err, frame);
         return;
@@ -215,9 +329,47 @@ static void exception_dispatch(uint8_t num, uint64_t err, cpu_frame_t *frame) {
         "#RF Reserved", "#RF Reserved", "#RF Reserved", "#RF Reserved",
         "#RF Reserved", "#RF Reserved", "#SX Security Exception", "#TF Triple Fault"
     };
-    vga_panic((num < 32) ? exc_names[num] : "Unknown Exception");
+
+    /* ВАЖНО: раньше здесь печаталось только имя исключения (frame
+     * игнорировался — (void)frame), поэтому для любого исключения КРОМЕ
+     * #PF (у него свой обработчик с полным дампом) в логе не было ни
+     * RIP, ни CS/RSP — только "#UD Invalid Opcode" без единой зацепки,
+     * где именно в коде это произошло и был ли это ring0 или ring3
+     * (см. calc.elf/syslogs.elf — CS сразу скажет, ring3-код упал или
+     * сам обработчик прерывания/переключения контекста в ядре). Дублируем
+     * тот же формат, что и в page_fault_handler ниже. */
+    char rip_buf[20], cs_buf[20], rsp_buf[20], err_buf[20];
+    format_hex(frame->rip, rip_buf);
+    format_hex(frame->cs,  cs_buf);
+    format_hex(frame->rsp, rsp_buf);
+    format_hex(err,        err_buf);
+
+    static char panic_msg[300];
+    int pos = 0;
+    const char *name = (num < 32) ? exc_names[num] : "Unknown Exception";
+    for (int i = 0; name[i]; i++) panic_msg[pos++] = name[i];
+
+    const char *err_lbl = "\nERR : 0x";
+    for (int i = 0; err_lbl[i]; i++) panic_msg[pos++] = err_lbl[i];
+    for (int i = 0; err_buf[i]; i++) panic_msg[pos++] = err_buf[i];
+
+    const char *rip_lbl = "\nRIP : 0x";
+    for (int i = 0; rip_lbl[i]; i++) panic_msg[pos++] = rip_lbl[i];
+    for (int i = 0; rip_buf[i]; i++) panic_msg[pos++] = rip_buf[i];
+
+    const char *cs_lbl = "\nCS  : 0x";
+    for (int i = 0; cs_lbl[i]; i++) panic_msg[pos++] = cs_lbl[i];
+    for (int i = 0; cs_buf[i]; i++) panic_msg[pos++] = cs_buf[i];
+
+    const char *rsp_lbl = "\nRSP : 0x";
+    for (int i = 0; rsp_lbl[i]; i++) panic_msg[pos++] = rsp_lbl[i];
+    for (int i = 0; rsp_buf[i]; i++) panic_msg[pos++] = rsp_buf[i];
+    panic_msg[pos] = '\0';
+
+    vga_panic(panic_msg);
 }
 
+__attribute__((used))
 static void irq_dispatch(uint8_t num, cpu_frame_t *frame) {
     if (g_isr_handlers[num]) g_isr_handlers[num](num, 0, frame);
     /* КРИТИЧНО: без EOI LAPIC считает вектор "всё ещё в обработке"
@@ -232,30 +384,33 @@ static void irq_dispatch(uint8_t num, cpu_frame_t *frame) {
     apic_send_eoi(num);
 }
 
-/* --- Исключения БЕЗ кода ошибки --- */
-__attribute__((interrupt)) void exc_0(cpu_frame_t *frame)  { exception_dispatch(0,  0, frame); }
-__attribute__((interrupt)) void exc_1(cpu_frame_t *frame)  { exception_dispatch(1,  0, frame); }
-__attribute__((interrupt)) void exc_2(cpu_frame_t *frame)  { exception_dispatch(2,  0, frame); }
-__attribute__((interrupt)) void exc_3(cpu_frame_t *frame)  { exception_dispatch(3,  0, frame); }
-__attribute__((interrupt)) void exc_4(cpu_frame_t *frame)  { exception_dispatch(4,  0, frame); }
-__attribute__((interrupt)) void exc_5(cpu_frame_t *frame)  { exception_dispatch(5,  0, frame); }
-__attribute__((interrupt)) void exc_6(cpu_frame_t *frame)  { exception_dispatch(6,  0, frame); }
-__attribute__((interrupt)) void exc_7(cpu_frame_t *frame)  { exception_dispatch(7,  0, frame); }
-__attribute__((interrupt)) void exc_9(cpu_frame_t *frame)  { exception_dispatch(9,  0, frame); }
-__attribute__((interrupt)) void exc_15(cpu_frame_t *frame) { exception_dispatch(15, 0, frame); }
-__attribute__((interrupt)) void exc_16(cpu_frame_t *frame) { exception_dispatch(16, 0, frame); }
-__attribute__((interrupt)) void exc_18(cpu_frame_t *frame) { exception_dispatch(18, 0, frame); }
-__attribute__((interrupt)) void exc_19(cpu_frame_t *frame) { exception_dispatch(19, 0, frame); }
-__attribute__((interrupt)) void exc_20(cpu_frame_t *frame) { exception_dispatch(20, 0, frame); }
+/* --- Исключения БЕЗ кода ошибки (naked, корректный cpu_frame_t) --- */
+ISR_STUB_NOERR(exc_0,  0,  exception_dispatch)
+ISR_STUB_NOERR(exc_1,  1,  exception_dispatch)
+ISR_STUB_NOERR(exc_2,  2,  exception_dispatch)
+ISR_STUB_NOERR(exc_3,  3,  exception_dispatch)
+ISR_STUB_NOERR(exc_4,  4,  exception_dispatch)
+ISR_STUB_NOERR(exc_5,  5,  exception_dispatch)
+ISR_STUB_NOERR(exc_6,  6,  exception_dispatch)
+ISR_STUB_NOERR(exc_7,  7,  exception_dispatch)
+ISR_STUB_NOERR(exc_9,  9,  exception_dispatch)
+ISR_STUB_NOERR(exc_15, 15, exception_dispatch)
+ISR_STUB_NOERR(exc_16, 16, exception_dispatch)
+ISR_STUB_NOERR(exc_18, 18, exception_dispatch)
+ISR_STUB_NOERR(exc_19, 19, exception_dispatch)
+ISR_STUB_NOERR(exc_20, 20, exception_dispatch)
 
-/* --- Исключения С кодом ошибки --- */
-__attribute__((interrupt)) void exc_8(cpu_frame_t *frame, uint64_t err)  { exception_dispatch(8,  err, frame); }
-__attribute__((interrupt)) void exc_10(cpu_frame_t *frame, uint64_t err) { exception_dispatch(10, err, frame); }
-__attribute__((interrupt)) void exc_11(cpu_frame_t *frame, uint64_t err) { exception_dispatch(11, err, frame); }
-__attribute__((interrupt)) void exc_12(cpu_frame_t *frame, uint64_t err) { exception_dispatch(12, err, frame); }
-__attribute__((interrupt)) void exc_13(cpu_frame_t *frame, uint64_t err) { exception_dispatch(13, err, frame); }
-__attribute__((interrupt)) void exc_17(cpu_frame_t *frame, uint64_t err) { exception_dispatch(17, err, frame); }
-__attribute__((interrupt)) void exc_30(cpu_frame_t *frame, uint64_t err) { exception_dispatch(30, err, frame); }
+/* --- Исключения С кодом ошибки (naked, корректный cpu_frame_t) --- */
+ISR_STUB_ERR(exc_8,  8,  exception_dispatch)
+ISR_STUB_ERR(exc_10, 10, exception_dispatch)
+ISR_STUB_ERR(exc_11, 11, exception_dispatch)
+ISR_STUB_ERR(exc_12, 12, exception_dispatch)
+ISR_STUB_ERR(exc_13, 13, exception_dispatch)
+ISR_STUB_ERR(exc_17, 17, exception_dispatch)
+ISR_STUB_ERR(exc_30, 30, exception_dispatch)
+
+/* --- #PF (14) — свой обработчик с полным дампом, тот же механизм --- */
+ISR_STUB_ERR(pf_entry, 14, page_fault_handler_c)
 
 /* --- IRQ Handlers --- */
 /*
@@ -291,6 +446,59 @@ __attribute__((interrupt)) void exc_30(cpu_frame_t *frame, uint64_t err) { excep
  */
 __attribute__((naked)) void irq0_timer_isr(void) {
     __asm__ volatile (
+        /* =====================================================================
+         * КРИТИЧНЫЙ ФИКС (паника при открытии 2-го usermode-приложения):
+         *
+         * usermode_init() (main.c) держит инвариант "GS.base == &g_percpu
+         * ВСЕГДА, пока выполняется код ядра (ring0)". user_entry_trampoline()
+         * (ELF64.c) и syscall_entry_stub() (main.c) поддерживают этот
+         * инвариант КАЖДЫЙ явным парным swapgs на СВОИХ собственных
+         * переходах ring3<->ring0. Но у IDT interrupt-gate вход по
+         * аппаратному прерыванию (наш случай — LAPIC-таймер) НЕ делает
+         * swapgs автоматически — а этот стаб раньше вообще не трогал GS.
+         *
+         * Пока в системе только ОДНА ring3-задача, это "случайно" не
+         * стреляло: клик мышью (ui_tick() ниже) чаще всего попадал на тик,
+         * прервавший ЕЁ ЖЕ синхронный SYS_SCHED_YIELD (см. sched_yield() в
+         * Scheduler.c) — а там GS.base к моменту тика УЖЕ = &g_percpu
+         * (мы внутри syscall_entry_stub, между его входным и выходным
+         * swapgs), так что "случайная" база совпадала с тем, что дальше
+         * безусловно предполагает user_entry_trampoline().
+         *
+         * При открытии ВТОРОГО приложения этот тик почти гарантированно
+         * прерывает первое приложение прямо в ring3 (обычный код, а не
+         * внутри syscall) — там GS.base = 0 (user-сторона). elf64_spawn()
+         * для второго приложения вызывается прямо тут, внутри ui_tick(),
+         * создаёт kthread-трамплин, переключение на него происходит НИЖЕ
+         * по этому же стабу, и когда task_wrapper() затем зовёт
+         * user_entry_trampoline(), тот делает БЕЗУСЛОВНЫЙ swapgs, думая,
+         * что уходит из ring0(&g_percpu) в ring3(0) — а на деле уходит из
+         * ring3(0) в "ring3"(&g_percpu): GS.base после этого = &g_percpu,
+         * хотя код уже выполняется в ring3! Первый же SYSCALL (любого из
+         * двух процессов) делает СВОЙ swapgs поверх уже сбитой пары —
+         * syscall_entry_stub пишет "mov %%rsp, %%gs:8" по адресу
+         * (0 + 8) = 0x8 либо соседний код читает/пишет по gs:0 — отсюда
+         * #PF ADDR=0x0, ERR=W, ровно как в панике из багрепорта.
+         *
+         * Фикс — классический подход (как в Linux entry_64.S): swapgs
+         * ЗДЕСЬ должен быть УСЛОВНЫМ, а не безусловным отсутствующим.
+         * Проверяем CPL сохранённого CS (бит RPL=0..1 в младших битах):
+         *   - на ВХОДЕ: если прервали ring3 (CS.RPL==3) — GS.base сейчас
+         *     0(user), делаем swapgs -> &g_percpu(kernel) на время работы
+         *     обработчика/планировщика. Если прервали ring0 — GS.base уже
+         *     &g_percpu (инвариант), swapgs НЕ делаем.
+         *   - на ВЫХОДЕ: смотрим CS кадра, В КОТОРЫЙ реально возвращаемся
+         *     (после возможного переключения задачи это может быть СОВСЕМ
+         *     другая задача!). Если это ring3 — делаем swapgs обратно в
+         *     user(0). Если это ring0 (например task_wrapper только что
+         *     созданного треда) — НЕ делаем, оставляем &g_percpu, и тогда
+         *     последующий безусловный swapgs внутри user_entry_trampoline()
+         *     снова видит корректную базовую точку отсчёта.
+         * ===================================================================== */
+        "testb $3, 8(%%rsp)\n\t"   /* CS.RPL прерванного кадра (RIP=+0,CS=+8) */
+        "jz 1f\n\t"
+        "swapgs\n\t"
+        "1:\n\t"
         "push $0\n\t"              /* фиктивный error_code */
         "push %%rax\n\t"
         "push %%rbx\n\t"
@@ -326,25 +534,40 @@ __attribute__((naked)) void irq0_timer_isr(void) {
         "pop %%rbx\n\t"
         "pop %%rax\n\t"
         "add $8, %%rsp\n\t"        /* убрать фиктивный error_code */
+        /* Симметричная проверка на выходе — см. большой комментарий выше.
+         * ВАЖНО: смотрим CS кадра, на который сейчас указывает %rsp — это
+         * кадр ЦЕЛЕВОЙ задачи (после возможного переключения), не обязательно
+         * той же, что была прервана на входе. testb/jz не трогают регистры,
+         * которые мы только что восстановили pop'ами выше — safe перед iretq. */
+        "testb $3, 8(%%rsp)\n\t"
+        "jz 2f\n\t"
+        "swapgs\n\t"
+        "2:\n\t"
         "iretq\n\t"
         ::: "memory"
     );
 }
-__attribute__((interrupt)) void irq_1(cpu_frame_t *frame)  { irq_dispatch(0x21, frame); }
-__attribute__((interrupt)) void irq_2(cpu_frame_t *frame)  { irq_dispatch(0x22, frame); }
-__attribute__((interrupt)) void irq_3(cpu_frame_t *frame)  { irq_dispatch(0x23, frame); }
-__attribute__((interrupt)) void irq_4(cpu_frame_t *frame)  { irq_dispatch(0x24, frame); }
-__attribute__((interrupt)) void irq_5(cpu_frame_t *frame)  { irq_dispatch(0x25, frame); }
-__attribute__((interrupt)) void irq_6(cpu_frame_t *frame)  { irq_dispatch(0x26, frame); }
-__attribute__((interrupt)) void irq_7(cpu_frame_t *frame)  { irq_dispatch(0x27, frame); }
-__attribute__((interrupt)) void irq_8(cpu_frame_t *frame)  { irq_dispatch(0x28, frame); }
-__attribute__((interrupt)) void irq_9(cpu_frame_t *frame)  { irq_dispatch(0x29, frame); }
-__attribute__((interrupt)) void irq_10(cpu_frame_t *frame) { irq_dispatch(0x2A, frame); }
-__attribute__((interrupt)) void irq_11(cpu_frame_t *frame) { irq_dispatch(0x2B, frame); }
-__attribute__((interrupt)) void irq_12(cpu_frame_t *frame) { irq_dispatch(0x2C, frame); }
-__attribute__((interrupt)) void irq_13(cpu_frame_t *frame) { irq_dispatch(0x2D, frame); }
-__attribute__((interrupt)) void irq_14(cpu_frame_t *frame) { irq_dispatch(0x2E, frame); }
-__attribute__((interrupt)) void irq_15(cpu_frame_t *frame) { irq_dispatch(0x2F, frame); }
+/* __attribute__((used)) — та же причина, что и у exception_dispatch выше:
+ * вызывается только из текста инлайн-асма (ISR_STUB_IRQ), компилятор
+ * этого не видит и без атрибута выкинет функцию из объектника как
+ * "неиспользуемую static" -> undefined symbol на этапе линковки. */
+__attribute__((used))
+static void irq_dispatch(uint8_t num, cpu_frame_t *frame);
+ISR_STUB_IRQ(irq_1,  0x21, irq_dispatch)
+ISR_STUB_IRQ(irq_2,  0x22, irq_dispatch)
+ISR_STUB_IRQ(irq_3,  0x23, irq_dispatch)
+ISR_STUB_IRQ(irq_4,  0x24, irq_dispatch)
+ISR_STUB_IRQ(irq_5,  0x25, irq_dispatch)
+ISR_STUB_IRQ(irq_6,  0x26, irq_dispatch)
+ISR_STUB_IRQ(irq_7,  0x27, irq_dispatch)
+ISR_STUB_IRQ(irq_8,  0x28, irq_dispatch)
+ISR_STUB_IRQ(irq_9,  0x29, irq_dispatch)
+ISR_STUB_IRQ(irq_10, 0x2A, irq_dispatch)
+ISR_STUB_IRQ(irq_11, 0x2B, irq_dispatch)
+ISR_STUB_IRQ(irq_12, 0x2C, irq_dispatch)
+ISR_STUB_IRQ(irq_13, 0x2D, irq_dispatch)
+ISR_STUB_IRQ(irq_14, 0x2E, irq_dispatch)
+ISR_STUB_IRQ(irq_15, 0x2F, irq_dispatch)
 
 /* ==========================================================================
 PIC, APIC & IOAPIC
@@ -558,7 +781,7 @@ int interrupt_init(uint64_t ioapic_phys_addr, uint32_t timer_freq_hz) {
     idt_set_gate(11, exc_11, cs, 0, IDT_GATE_INT);
     idt_set_gate(12, exc_12, cs, 0, IDT_GATE_INT);
     idt_set_gate(13, exc_13, cs, 0, IDT_GATE_INT);
-    idt_set_gate(14, page_fault_handler, cs, 0, IDT_GATE_INT);
+    idt_set_gate(14, pf_entry, cs, 0, IDT_GATE_INT);
     idt_set_gate(15, exc_15, cs, 0, IDT_GATE_INT);
     idt_set_gate(16, exc_16, cs, 0, IDT_GATE_INT);
     idt_set_gate(17, exc_17, cs, 0, IDT_GATE_INT);

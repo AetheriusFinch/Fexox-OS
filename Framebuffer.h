@@ -350,9 +350,13 @@ int ui_win_move(int win_id, int32_t x, int32_t y);
 /* Область СОДЕРЖИМОГО окна (ниже заголовка) в АБСОЛЮТНЫХ координатах
  * экрана — то, куда userspace-приложению можно писать пиксели через
  * framebuffer, полученный SYS_GET_FRAMEBUFFER (см. sc_win_get_rect в
- * Syscall.c). Возвращает false, если win_id невалиден/окно закрыто. */
+ * Syscall.c). out_redraw_gen — счётчик "перерисуйся" (растёт при смене
+ * геометрии, которую кернел не переносит как картинку — сейчас только
+ * ui_win_toggle_maximize; см. ui_window_t.redraw_gen в Framebuffer.c) —
+ * можно передать NULL, если не нужен. Возвращает false, если win_id
+ * невалиден/окно закрыто. */
 bool ui_win_get_rect(int win_id, int32_t *out_x, int32_t *out_y,
-                     uint32_t *out_w, uint32_t *out_h);
+                     uint32_t *out_w, uint32_t *out_h, uint32_t *out_redraw_gen);
 
 /* Закрыть все окна, принадлежащие owner_pid (вызывать при завершении
  * процесса — см. sc_exit в Syscall.c), чтобы окна "мёртвых" процессов

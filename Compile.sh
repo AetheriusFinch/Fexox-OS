@@ -47,6 +47,11 @@ $CC $CFLAGS_KERN -c ui_extra.c         -o build/ui_extra.o
 $CC $CFLAGS_KERN -c PS2Mouse.c         -o build/PS2Mouse.o
 $CC $CFLAGS_KERN -c AcpiControl.c      -o build/AcpiControl.o
 $CC $CFLAGS_KERN -c Resources/fxapp.c  -o build/fxapp.o
+$CC $CFLAGS_KERN -c Resources/USB.c    -o build/USB.o
+$CC $CFLAGS_KERN -c Resources/UHCI.c   -o build/UHCI.o
+$CC $CFLAGS_KERN -c Resources/EHCI.c   -o build/EHCI.o
+$CC $CFLAGS_KERN -c Resources/USBHID.c         -o build/USBHID.o
+$CC $CFLAGS_KERN -c Resources/USBMassStorage.c -o build/USBMassStorage.o
 
 $LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
     build/boot_stub.o      \
@@ -66,12 +71,22 @@ $LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
     build/ui_extra.o        \
     build/PS2Mouse.o        \
 	build/AcpiControl.o     \
-	build/fxapp.o
+	build/fxapp.o           \
+    build/USB.o             \
+    build/UHCI.o            \
+    build/EHCI.o             \
+    build/USBHID.o          \
+    build/USBMassStorage.o
 
 echo "[*] Калькулятор (userspace, отдельно от ядра)..."
 $CC $CFLAGS_USER -c SysApps/calc.c -o build/calc.o
 $LD_KERN $LDFLAGS_USER -o build/calc.elf build/calc.o
 ls -lh build/calc.elf
+
+echo "[*] SysLogs (userspace, отдельно от ядра)..."
+$CC $CFLAGS_USER -c SysApps/SysLogsApp.c -o build/syslogs.o
+$LD_KERN $LDFLAGS_USER -o build/syslogs.elf build/syslogs.o
+ls -lh build/syslogs.elf
 
 echo "[*] Загрузчик UEFI..."
 $MGW $CFLAGS_BOOT -c bootloader.c -o build/bootloader.o
@@ -150,9 +165,12 @@ if command -v mformat >/dev/null; then
     mmd -i build/data.img ::APPS 2>/dev/null || true
     mcopy -i build/data.img build/calc.elf ::APPS/calc.elf
     echo "[OK] build/calc.elf -> ::APPS/calc.elf"
+
+    mcopy -i build/data.img build/syslogs.elf ::APPS/syslogs.elf
+    echo "[OK] build/syslogs.elf -> ::APPS/syslogs.elf"
 else
     echo "[!] mtools нет — pacman -S mingw-w64-ucrt-x86_64-mtools"
 fi
 
-echo "[+] build/kernel.bin  build/bootloader.efi  build/esp.img  build/data.img  build/calc.elf"
+echo "[+] build/kernel.bin  build/bootloader.efi  build/esp.img  build/data.img  build/calc.elf  build/syslogs.elf"
 echo "=== Готово ==="

@@ -73,7 +73,7 @@ extern int  ui_win_close(int win_id);
 extern int  ui_win_move(int win_id, int32_t x, int32_t y);
 extern void ui_win_close_all_owned_by(int32_t owner_pid);
 extern bool ui_win_get_rect(int win_id, int32_t *out_x, int32_t *out_y,
-                            uint32_t *out_w, uint32_t *out_h);
+                            uint32_t *out_w, uint32_t *out_h, uint32_t *out_redraw_gen);
 
 /* --- PS2Mouse.c: состояние кнопок мыши; позиция — из ui_extra.c --- */
 extern uint8_t ps2_mouse_buttons(void);
@@ -1417,17 +1417,24 @@ static int64_t sc_win_move(uint64_t win_id, uint64_t x, uint64_t y) {
  * содержимого окна (ниже заголовка), нужна userspace-приложению, чтобы
  * знать, по каким координатам в общем framebuffer'е (см.
  * sys_get_framebuffer) рисовать себя — окна создаются с автоматическим
- * каскадным смещением (см. ui_win_create), заранее координаты неизвестны. */
+ * каскадным смещением (см. ui_win_create), заранее координаты неизвестны.
+ * redraw_gen — счётчик "перерисуйся" (см. ui_window_t.redraw_gen в
+ * Framebuffer.c): растёт при смене геометрии, которую кернел не может
+ * честно перенести как картинку (сейчас — только разворачивание/сворачи-
+ * вание на весь экран). Приложение должно сравнивать его с последним
+ * увиденным значением и перерисовывать себя под новый размер при
+ * изменении — см. calc.c. */
 static int64_t sc_win_get_rect(uint64_t win_id, uint64_t rect_ptr) {
     if (!syscall_validate_ptr((void *)(uintptr_t)rect_ptr, sizeof(sc_win_rect_t)))
         return -(int64_t)EFAULT;
 
     sc_win_rect_t *out = (sc_win_rect_t *)(uintptr_t)rect_ptr;
-    int32_t x, y; uint32_t w, h;
-    if (!ui_win_get_rect((int)win_id, &x, &y, &w, &h))
+    int32_t x, y; uint32_t w, h, redraw_gen;
+    if (!ui_win_get_rect((int)win_id, &x, &y, &w, &h, &redraw_gen))
         return -(int64_t)EINVAL;
 
     out->x = x; out->y = y; out->w = w; out->h = h;
+    out->redraw_gen = redraw_gen;
     return 0;
 }
 
