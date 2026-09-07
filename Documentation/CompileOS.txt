@@ -1,0 +1,12 @@
+1. Required Components and Dependencies
+Before running the compilation script, the following tools must be installed on your system:LLVM / Clang: clang and the ld.lld linker (used for building the kernel and user ELF applications).MinGW-w64: x86_64-w64-mingw32-gcc (used for building the UEFI bootloader bootloader.efi into PE32+ format).mtools: mformat, mmd, and mcopy utilities (used for creating the FAT boot image esp.img and data disk data.img).xorriso: Used for packaging the final bootable fexos.iso.
+
+2. Installing Dependencies and the Compilation EnvironmentMSYS2 (UCRT64) is used for compilation; it is recommended to use the latest version.To install the dependencies, run the following command in MSYS2 UCRT64:
+
+pacman -S mingw-w64-ucrt-x86_64-clang \
+          mingw-w64-ucrt-x86_64-lld \
+          mingw-w64-ucrt-x86_64-gcc \
+          mingw-w64-ucrt-x86_64-mtools \
+          mingw-w64-ucrt-x86_64-xorriso
+
+3. Execution and CompilationTo compile, run Compile.sh and wait for the process to complete. For testing, you can open RunQemu.sh to run it in QEMU, test it via VirtualBox using the ISO image, or test it on a real PC by flashing the OS ISO image using Rufus.

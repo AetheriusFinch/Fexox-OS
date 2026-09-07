@@ -1,0 +1,4 @@
+About OS:
+- Architecture x86_64
+- FAT32, VFS, SysCall, MemoryManager, GUI, ELF-programs (V64), ps2keyboard, mouse, HID Keyboard, Mouse, USB2, PNG-decoder, IDE, AHCI, UEFI Bootloader for Fexox OS.
+- Copyleft GPL-2.0
