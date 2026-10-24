@@ -10,3 +10,4 @@ Fexox OS исходный код
 -Стадия разработки: Alpha1
 
 TG: https://t.me/FexoxOS
+About Developer: известен под ником/псевдонимом на Reddit (u/BreakfastKitchen6249), (Aetherius Finch)
