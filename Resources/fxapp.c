@@ -1,13 +1,7 @@
-/*
- * fxapp.c — загрузчик манифестов приложений FEXOS (.fxapp)
- *
- * Зависимости: VFS (vfs_open/vfs_read/vfs_close), klibc (memset),
- * ELF64 (elf64_spawn — вызывается только из fxapp_launch), debug_out.h.
- *
- * Как и остальные модули ядра, файл сам объявляет нужные extern'ы —
- * в проекте нет общего заголовка для VFS/ELF64 (см. комментарии в
- * PS2Mouse.c/ui_extra.c).
- */
+/* Fexox OS Project, EULA GPLv2 */
+ 
+
+
 #include <stdint.h>
 #include <stddef.h>
 #include "fxapp.h"
@@ -54,17 +48,17 @@ int fxapp_load(const char *path, fxapp_t *out) {
         return -1;
     }
 
-    /* Сейчас формат поддерживает только приложения на СИ (статический
-     * ELF64, тот же путь загрузки, что и /init — см. ELF64.c). Любой
-     * другой app_type отклоняем, чтобы не пытаться "запустить" то,
-     * что ядро не умеет исполнять. */
+     
+
+
+
     if (out->header.app_type != FXAPP_TYPE_C_ELF64) {
         DBG_VAL("FXA", "fxapp_load: неподдерживаемый app_type", (uint64_t)out->header.app_type);
         return -1;
     }
 
-    /* Гарантируем нуль-терминацию строковых полей независимо от
-     * содержимого файла на диске (не доверяем внешним данным). */
+     
+
     out->header.name[FXAPP_NAME_MAX - 1] = '\0';
     out->header.icon[FXAPP_ICON_MAX - 1] = '\0';
     out->header.elf_path[FXAPP_PATH_MAX - 1] = '\0';
@@ -78,9 +72,9 @@ int fxapp_launch(const fxapp_t *app, int prio) {
     if (!app || !app->valid) return -1;
     if (app->header.app_type != FXAPP_TYPE_C_ELF64) return -1;
     if (app->header.elf_path[0] == '\0') {
-        /* У приложения ещё нет исполняемого кода (например у "My
-         * Computer" сейчас есть только окно-заглушка) — это не ошибка
-         * дескриптора, просто запускать нечего. */
+         
+
+
         DBG_MSG("FXA", "fxapp_launch: elf_path пуст, запускать нечего");
         return -1;
     }

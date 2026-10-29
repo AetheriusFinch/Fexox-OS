@@ -1,13 +1,7 @@
-/*
- * png.c — минимальный PNG-декодер для FEXOS
- *
- * Содержит собственную реализацию INFLATE (RFC1951: stored, fixed Huffman,
- * dynamic Huffman) и парсер PNG-чанков (RFC2083) для 8-bit RGB/RGBA,
- * non-interlaced изображений.
- *
- * Based on the well-known public-domain algorithm structure of
- * "puff.c" (Mark Adler), переписан без файлового I/O и libc.
- */
+/* Fexox OS Project, EULA GPLv2 */
+ 
+
+
 #include "png.h"
 
 extern void *kmalloc(uint64_t size);
@@ -15,20 +9,20 @@ extern void  kfree(void *ptr);
 extern void *memset(void *dst, int c, size_t n);
 extern void *memcpy(void *dst, const void *src, size_t n);
 
-/* =========================================================================
- * Битовый поток (LSB-first, как требует DEFLATE)
- * ========================================================================= */
+ 
+
+
 typedef struct {
     const uint8_t *in;
     size_t          in_len;
-    size_t          in_pos;   /* текущий байт */
-    uint32_t        bitbuf;   /* накопленные биты */
-    int             bitcnt;   /* сколько бит валидно в bitbuf */
+    size_t          in_pos;    
+    uint32_t        bitbuf;    
+    int             bitcnt;    
 } bitstream_t;
 
 static int bs_getbit(bitstream_t *bs) {
     if (bs->bitcnt == 0) {
-        if (bs->in_pos >= bs->in_len) return -1; /* EOF */
+        if (bs->in_pos >= bs->in_len) return -1;  
         bs->bitbuf = bs->in[bs->in_pos++];
         bs->bitcnt = 8;
     }
@@ -38,7 +32,7 @@ static int bs_getbit(bitstream_t *bs) {
     return bit;
 }
 
-/* Читает n бит (n <= 16), LSB-first, возвращает -1 при ошибке/EOF */
+ 
 static int32_t bs_getbits(bitstream_t *bs, int n) {
     uint32_t val = 0;
     for (int i = 0; i < n; i++) {
@@ -49,27 +43,27 @@ static int32_t bs_getbits(bitstream_t *bs, int n) {
     return (int32_t)val;
 }
 
-/* Сбросить остаток текущего байта (для перехода к stored block) */
+ 
 static void bs_align(bitstream_t *bs) {
     bs->bitbuf = 0;
     bs->bitcnt = 0;
 }
 
-/* =========================================================================
- * Huffman-декодер (по алгоритму puff.c: канонические коды)
- * ========================================================================= */
+ 
+
+
 #define MAXBITS 15
 #define MAXLCODES 286
 #define MAXDCODES 30
 #define MAXCODES (MAXLCODES + MAXDCODES)
 
 typedef struct {
-    int16_t count[MAXBITS + 1]; /* кол-во кодов каждой длины */
-    int16_t symbol[MAXCODES];   /* символы в порядке кодов */
+    int16_t count[MAXBITS + 1];  
+    int16_t symbol[MAXCODES];    
 } huffman_t;
 
-/* Декодирует один символ по таблице h, читая биты из bs.
- * Возвращает символ >=0 или -1 при ошибке. */
+ 
+
 static int huffman_decode(bitstream_t *bs, const huffman_t *h) {
     int code = 0, first = 0, index = 0;
     for (int len = 1; len <= MAXBITS; len++) {
@@ -87,7 +81,7 @@ static int huffman_decode(bitstream_t *bs, const huffman_t *h) {
     return -1;
 }
 
-/* Строит каноническую Huffman-таблицу из массива длин кодов length[0..n-1] */
+ 
 static void huffman_build(huffman_t *h, const uint8_t *length, int n) {
     for (int len = 0; len <= MAXBITS; len++) h->count[len] = 0;
     for (int sym = 0; sym < n; sym++) h->count[length[sym]]++;
@@ -103,9 +97,9 @@ static void huffman_build(huffman_t *h, const uint8_t *length, int n) {
             h->symbol[offs[length[sym]]++] = (int16_t)sym;
 }
 
-/* =========================================================================
- * Таблицы длин/расстояний DEFLATE (RFC1951 §3.2.5)
- * ========================================================================= */
+ 
+
+
 static const uint16_t LEN_BASE[29] = {
     3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258
 };
@@ -120,9 +114,9 @@ static const uint8_t DIST_EXTRA[30] = {
     0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13
 };
 
-/* =========================================================================
- * Выходной буфер inflate — фиксированного размера (мы знаем его заранее)
- * ========================================================================= */
+ 
+
+
 typedef struct {
     uint8_t *buf;
     size_t   size;
@@ -135,12 +129,12 @@ static int out_put(outbuf_t *o, uint8_t byte) {
     return 0;
 }
 
-/* Копирует block из stored-блока */
+ 
 static int inflate_stored(bitstream_t *bs, outbuf_t *out) {
     bs_align(bs);
     if (bs->in_pos + 4 > bs->in_len) return PNG_ERR_INFLATE;
     uint16_t len  = (uint16_t)(bs->in[bs->in_pos] | (bs->in[bs->in_pos+1] << 8));
-    /* nlen (复~len) проверять не обязательно для нашего случая */
+     
     bs->in_pos += 4;
     if (bs->in_pos + len > bs->in_len) return PNG_ERR_INFLATE;
     for (uint16_t i = 0; i < len; i++) {
@@ -149,7 +143,7 @@ static int inflate_stored(bitstream_t *bs, outbuf_t *out) {
     return PNG_OK;
 }
 
-/* Декодирует один блок с заданными Huffman-таблицами (fixed или dynamic) */
+ 
 static int inflate_block_data(bitstream_t *bs, outbuf_t *out,
                                const huffman_t *lc, const huffman_t *dc) {
     for (;;) {
@@ -158,7 +152,7 @@ static int inflate_block_data(bitstream_t *bs, outbuf_t *out,
         if (sym < 256) {
             if (out_put(out, (uint8_t)sym) < 0) return PNG_ERR_INFLATE;
         } else if (sym == 256) {
-            return PNG_OK; /* конец блока */
+            return PNG_OK;  
         } else {
             sym -= 257;
             if (sym >= 29) return PNG_ERR_INFLATE;
@@ -200,15 +194,15 @@ static void build_fixed_tables(void) {
     g_fixed_built = 1;
 }
 
-/* Порядок индексов для таблицы длин кодов длин (RFC1951 §3.2.7) */
+ 
 static const uint8_t CLEN_ORDER[19] = {
     16,17,18,0,8,7,9,6,10,5,11,4,12,3,13,2,14,1,15
 };
 
 static int inflate_dynamic(bitstream_t *bs, outbuf_t *out) {
-    int32_t hlit  = bs_getbits(bs, 5);  /* +257 */
-    int32_t hdist = bs_getbits(bs, 5);  /* +1   */
-    int32_t hclen = bs_getbits(bs, 4);  /* +4   */
+    int32_t hlit  = bs_getbits(bs, 5);   
+    int32_t hdist = bs_getbits(bs, 5);   
+    int32_t hclen = bs_getbits(bs, 4);   
     if (hlit < 0 || hdist < 0 || hclen < 0) return PNG_ERR_INFLATE;
     hlit += 257; hdist += 1; hclen += 4;
 
@@ -243,7 +237,7 @@ static int inflate_dynamic(bitstream_t *bs, outbuf_t *out) {
             if (rep < 0) return PNG_ERR_INFLATE;
             rep += 3;
             while (rep-- && idx < total) lengths[idx++] = 0;
-        } else { /* 18 */
+        } else {  
             int32_t rep = bs_getbits(bs, 7);
             if (rep < 0) return PNG_ERR_INFLATE;
             rep += 11;
@@ -258,11 +252,11 @@ static int inflate_dynamic(bitstream_t *bs, outbuf_t *out) {
     return inflate_block_data(bs, out, &lc, &dc);
 }
 
-/* zlib stream: 2-байтный заголовок, затем DEFLATE-блоки, затем 4-байтный adler32
- * (который мы не проверяем — нет необходимости для отрисовки). */
+ 
+
 static int inflate_zlib(const uint8_t *in, size_t in_len, outbuf_t *out) {
     if (in_len < 2) return PNG_ERR_INFLATE;
-    /* in[0..1] — zlib header (CMF/FLG), пропускаем */
+     
     bitstream_t bs = { .in = in + 2, .in_len = in_len - 2, .in_pos = 0, .bitbuf = 0, .bitcnt = 0 };
 
     if (!g_fixed_built) build_fixed_tables();
@@ -283,14 +277,14 @@ static int inflate_zlib(const uint8_t *in, size_t in_len, outbuf_t *out) {
         if (rc != PNG_OK) return rc;
 
         if (bfinal) break;
-        if (out->pos >= out->size) break; /* получили всё, что нужно */
+        if (out->pos >= out->size) break;  
     }
     return PNG_OK;
 }
 
-/* =========================================================================
- * PNG chunk parsing
- * ========================================================================= */
+ 
+
+
 static uint32_t be32(const uint8_t *p) {
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
            ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
@@ -302,7 +296,7 @@ static uint32_t be32(const uint8_t *p) {
 #define PNG_COLOR_GRAY_A   4
 #define PNG_COLOR_RGBA     6
 
-/* Paeth predictor (RFC2083 §6.6) */
+ 
 static inline uint8_t paeth(int a, int b, int c) {
     int p  = a + b - c;
     int pa = p > a ? p - a : a - p;
@@ -325,19 +319,19 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
     uint8_t  bit_depth = 0, color_type = 0, interlace = 0;
     int have_ihdr = 0;
 
-    /* PLTE (для color_type == PALETTE) — до 256 записей RGB */
+     
     uint8_t palette[256 * 3];
     size_t  palette_count = 0;
 
-    /* tRNS (для color_type == PALETTE) — альфа на запись палитры.
-     * tRNS для GRAY/RGB (color-key transparency) не поддерживается —
-     * это редкий случай для непрозрачных обоев/курсоров. */
+     
+
+
     uint8_t trns_alpha[256];
     size_t  trns_count = 0;
 
-    /* IDAT может быть разбит на несколько чанков — посчитаем общий размер,
-     * затем соберём всё в один буфер. Для этого делаем два прохода.
-     * Также вычитываем PLTE/tRNS на этом же проходе. */
+     
+
+
     size_t idat_total = 0;
     size_t scan_pos = 8;
     while (scan_pos + 8 <= size) {
@@ -386,10 +380,10 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
         default: return PNG_ERR_UNSUPPORTED;
     }
 
-    /* RGB/RGBA/GRAY+ALPHA в этом декодере — только 8 бит/канал (без 16-bit).
-     * GRAY и PALETTE — допускаем "узкие" битовые глубины 1/2/4/8,
-     * это часто встречается в палитровых PNG, сохранённых оптимизаторами
-     * (pngquant, tinypng и т.п.) или простыми редакторами для обоев/иконок. */
+     
+
+
+
     if (color_type == PNG_COLOR_RGB || color_type == PNG_COLOR_GRAY_A ||
         color_type == PNG_COLOR_RGBA) {
         if (bit_depth != 8) return PNG_ERR_UNSUPPORTED;
@@ -399,14 +393,14 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
     }
     if (color_type == PNG_COLOR_PALETTE && palette_count == 0) return PNG_ERR_FORMAT;
 
-    /* "bpp" по терминологии спецификации PNG — байтовая дистанция,
-     * используемая фильтрами Sub/Up/Average/Paeth. Для битовых глубин < 8
-     * она всё равно округляется вверх до 1 байта (т.к. у нас всегда 1 канал
-     * в этих случаях — GRAY или PALETTE). */
+     
+
+
+
     int filt_bpp = (int)(((uint32_t)bit_depth * (uint32_t)channels + 7) / 8);
     if (filt_bpp < 1) filt_bpp = 1;
 
-    /* Собираем все IDAT-чанки в один сплошной буфер */
+     
     uint8_t *idat = (uint8_t *)kmalloc(idat_total);
     if (!idat) return PNG_ERR_NOMEM;
     {
@@ -426,8 +420,8 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
         }
     }
 
-    /* Размер несжатых данных: каждая строка = 1 байт фильтра +
-     * ceil(width*bit_depth*channels/8) байт упакованных сэмплов. */
+     
+
     size_t bytes_per_row = ((size_t)width * (size_t)bit_depth * (size_t)channels + 7) / 8;
     size_t row_bytes = 1 + bytes_per_row;
     size_t raw_size  = row_bytes * (size_t)height;
@@ -443,11 +437,11 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
         return (rc != PNG_OK) ? rc : PNG_ERR_INFLATE;
     }
 
-    /* Выделяем итоговый RGBA-буфер */
+     
     uint8_t *rgba = (uint8_t *)kmalloc((size_t)width * (size_t)height * 4);
     if (!rgba) { kfree(raw); return PNG_ERR_NOMEM; }
 
-    /* Применяем un-filter построчно (нужна предыдущая строка для Up/Avg/Paeth) */
+     
     uint8_t *prev_line = (uint8_t *)kmalloc(bytes_per_row);
     uint8_t *cur_line  = (uint8_t *)kmalloc(bytes_per_row);
     if (!prev_line || !cur_line) {
@@ -458,7 +452,7 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
     }
     memset(prev_line, 0, bytes_per_row);
 
-    uint32_t maxval = (1u << bit_depth) - 1; /* для масштабирования GRAY < 8 бит */
+    uint32_t maxval = (1u << bit_depth) - 1;  
 
     for (uint32_t y = 0; y < height; y++) {
         const uint8_t *src_row = raw + (size_t)y * row_bytes;
@@ -472,11 +466,11 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
             int c = (x >= (size_t)filt_bpp) ? prev_line[x - filt_bpp] : 0;
             int val;
             switch (filter) {
-                case 0: val = raw_byte; break;                       /* None */
-                case 1: val = raw_byte + a; break;                   /* Sub */
-                case 2: val = raw_byte + b; break;                   /* Up */
-                case 3: val = raw_byte + ((a + b) >> 1); break;       /* Average */
-                case 4: val = raw_byte + paeth(a, b, c); break;       /* Paeth */
+                case 0: val = raw_byte; break;                        
+                case 1: val = raw_byte + a; break;                    
+                case 2: val = raw_byte + b; break;                    
+                case 3: val = raw_byte + ((a + b) >> 1); break;        
+                case 4: val = raw_byte + paeth(a, b, c); break;        
                 default:
                     kfree(prev_line); kfree(cur_line); kfree(rgba); kfree(raw);
                     return PNG_ERR_FORMAT;
@@ -484,7 +478,7 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
             cur_line[x] = (uint8_t)(val & 0xFF);
         }
 
-        /* Конвертация строки в RGBA8888 */
+         
         uint8_t *dst_row = rgba + (size_t)y * (size_t)width * 4;
 
         if (bit_depth == 8) {
@@ -522,8 +516,8 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
                 }
             }
         } else {
-            /* bit_depth 1/2/4 — всегда 1 канал на пиксель (GRAY или PALETTE),
-             * сэмплы упакованы по битам, MSB первым (RFC2083 §7). */
+             
+
             for (uint32_t x = 0; x < width; x++) {
                 size_t bit_off  = (size_t)x * bit_depth;
                 size_t byte_off = bit_off / 8;
@@ -541,7 +535,7 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
                         dp[0] = dp[1] = dp[2] = 0;
                     }
                     dp[3] = ((size_t)idx < trns_count) ? trns_alpha[idx] : 0xFF;
-                } else { /* GRAY, масштабируем 0..maxval -> 0..255 */
+                } else {  
                     uint32_t v = (uint32_t)raw_val * 255u / maxval;
                     dp[0] = dp[1] = dp[2] = (uint8_t)v;
                     dp[3] = 0xFF;
@@ -549,7 +543,7 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
             }
         }
 
-        /* swap prev <-> cur */
+         
         uint8_t *tmp = prev_line;
         prev_line = cur_line;
         cur_line  = tmp;

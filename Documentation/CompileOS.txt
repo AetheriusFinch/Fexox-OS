@@ -1,12 +1,82 @@
-1. Required Components and Dependencies
-Before running the compilation script, the following tools must be installed on your system:LLVM / Clang: clang and the ld.lld linker (used for building the kernel and user ELF applications).MinGW-w64: x86_64-w64-mingw32-gcc (used for building the UEFI bootloader bootloader.efi into PE32+ format).mtools: mformat, mmd, and mcopy utilities (used for creating the FAT boot image esp.img and data disk data.img).xorriso: Used for packaging the final bootable fexos.iso.
+Fexox OS Project, EULA GPLv2
 
-2. Installing Dependencies and the Compilation EnvironmentMSYS2 (UCRT64) is used for compilation; it is recommended to use the latest version.To install the dependencies, run the following command in MSYS2 UCRT64:
+Fexox OS Build and USB Image Instructions
 
-pacman -S mingw-w64-ucrt-x86_64-clang \
+Build Environment
+
+Build the project from the repository root in an MSYS2 UCRT64 terminal. Install the required tools:
+
+pacman -Sy mingw-w64-ucrt-x86_64-clang \
           mingw-w64-ucrt-x86_64-lld \
           mingw-w64-ucrt-x86_64-gcc \
           mingw-w64-ucrt-x86_64-mtools \
           mingw-w64-ucrt-x86_64-xorriso
 
-3. Execution and CompilationTo compile, run Compile.sh and wait for the process to complete. For testing, you can open RunQemu.sh to run it in QEMU, test it via VirtualBox using the ISO image, or test it on a real PC by flashing the OS ISO image using Rufus.
+The build requires clang and ld.lld for the kernel, BIOS loader, and user applications; MinGW-w64 GCC for the UEFI loader; and mtools for creating FAT images. GNU core utilities such as dd, along with Bash, are also used by the build scripts.
+
+Build Order
+
+Run the following scripts from the repository root, in this order:
+
+1. ./Compile.sh
+
+   Compiles and links the kernel, user applications, and UEFI loader. It creates build/kernel.bin, build/bootloader.efi, and the user application binaries. When mtools is available, it also creates intermediate FAT images.
+
+2. ./build_bios.sh
+
+   Builds the legacy BIOS boot stages. It creates build/bios/stage1.bin and build/bios/stage2.bin. The first stage must fit within the 446-byte MBR boot-code area, and the second stage must fit within 40 KiB.
+
+3. ./make_usb_image.sh
+
+   Creates build/usb.img, a FAT32 superfloppy image without an MBR or a partition table. This image contains the UEFI loader, kernel, and available UI and application files. It is an intermediate USB image and is not the universal BIOS and UEFI image.
+
+4. ./make_bios_image.sh
+
+   Packages the BIOS boot stages, UEFI loader, kernel, and available UI and application files into build/usb_bios.img. This step requires the outputs from both previous scripts.
+
+The order matters. make_usb_image.sh requires build/kernel.bin and build/bootloader.efi. make_bios_image.sh requires build/bios/stage1.bin, build/bios/stage2.bin, build/kernel.bin, and build/bootloader.efi.
+
+Universal BIOS and UEFI USB Image
+
+build/usb_bios.img is a raw, hybrid boot image intended to support both legacy BIOS and x86_64 UEFI boot:
+
+- The MBR contains the legacy BIOS stage1 loader, followed by the stage2 loader in the sectors immediately after the MBR.
+- The FAT32 partition contains the kernel and the UEFI fallback loader at EFI/BOOT/BOOTX64.EFI.
+- A startup.nsh script is included for UEFI firmware that supports the UEFI shell.
+
+The same image can therefore be written to a USB drive and selected from the firmware boot menu in either legacy BIOS mode or UEFI mode. On some systems, the firmware may show separate entries for UEFI and legacy boot. Select the entry matching the mode you want to test.
+
+Writing the Image to a USB Drive
+
+Writing a raw image overwrites the selected device. Verify the USB drive by its model and capacity before starting. Do not select the system disk.
+
+On Windows, macOS, or Linux, you can use balenaEtcher. Select build/usb_bios.img as the image, select the verified USB drive as the target, and start the flash operation. Confirm that the selected target is the USB drive because flashing erases its contents.
+
+On Linux, identify the USB device with lsblk, unmount its partitions, and write the image to the whole device, not to an individual partition:
+
+sudo dd if=build/usb_bios.img of=/dev/sdX bs=4M status=progress conv=fsync
+
+Replace /dev/sdX with the verified USB device.
+
+On macOS, identify the USB device with diskutil list, unmount it, then write to the corresponding raw device. Verify the device path before running dd:
+
+diskutil unmountDisk /dev/diskN
+sudo dd if=build/usb_bios.img of=/dev/rdiskN bs=4m
+sync
+
+Replace diskN with the verified USB device.
+
+Testing
+
+Use build/usb_bios.img for the universal BIOS and UEFI USB drive. Use the system firmware boot menu to select the USB drive. For legacy BIOS testing, select the non-UEFI USB entry when the firmware presents separate options. For UEFI testing, select the UEFI USB entry.
+
+The image can also be tested in QEMU. The following command attaches it as a USB mass-storage device to an emulated EHCI controller:
+
+qemu-system-x86_64 -m 512 -serial stdio -device usb-ehci,id=ehci \
+  -drive if=none,id=usbd,file=build/usb_bios.img,format=raw \
+  -device usb-storage,bus=ehci.0,drive=usbd,bootindex=0
+
+The image can alternatively be attached as a VirtIO block device:
+
+qemu-system-x86_64 -m 512 -serial stdio \
+  -drive file=build/usb_bios.img,if=virtio,format=raw

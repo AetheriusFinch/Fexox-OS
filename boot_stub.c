@@ -1,4 +1,5 @@
-/* boot_stub.c — точка входа ядра (higher-half) */
+/* Fexox OS Project, EULA GPLv2 */
+ 
 #include <stdint.h>
 #include "debug_out.h"
 #include "Framebuffer.h"
@@ -25,6 +26,17 @@ void boot_stub_entry(BOOT_INFO *info) {
 
     if (!info)
         DBG_PANIC("KR", "BOOT_INFO is NULL");
+
+    if (info->fb.mode == 2   &&
+        info->fb.phys_addr && info->fb.width && info->fb.height && info->fb.pitch) {
+        volatile uint8_t *fb   = (volatile uint8_t *)(uintptr_t)info->fb.phys_addr;
+        uint32_t beacon_rows   = info->fb.height / 4u;
+        uint32_t color         = 0x0000FF00u;    
+        for (uint32_t row = 0; row < beacon_rows; row++) {
+            volatile uint32_t *px = (volatile uint32_t *)(fb + (uint64_t)row * info->fb.pitch);
+            for (uint32_t col = 0; col < info->fb.width; col++) px[col] = color;
+        }
+    }
 
     DBG_VAL("KR", "info", (uint64_t)(uintptr_t)info);
     DBG_VAL("KR", "magic", info->magic);

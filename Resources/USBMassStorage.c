@@ -1,33 +1,5 @@
-/*
- * USBMassStorage.c — класс-драйвер USB Mass Storage, Bulk-Only Transport
- * (USB Mass Storage Class – Bulk Only Transport, rev 1.0) поверх SCSI
- * transparent command set (bInterfaceSubClass==0x06 "SCSI transparent",
- * bInterfaceProtocol==0x50 "Bulk-Only").
- *
- * Протокол BOT для одной команды — три bulk-транзакции подряд:
- *   1. CBW (Command Block Wrapper, 31 байт) -> bulk OUT
- *   2. DATA (опционально, размер из самой команды) -> bulk IN или OUT
- *   3. CSW (Command Status Wrapper, 13 байт) <- bulk IN
- * Используется usb_hcd_ops_t.bulk_transfer (см. USB.h, реализован в
- * UHCI.c/EHCI.c) — Data Toggle у bulk-эндпоинтов персистентный между
- * вызовами, поэтому в usb_msc_dev_t хранится toggle_in/toggle_out.
- *
- * Регистрируется как обычный blkdev (см. VFS.h — тот же интерфейс, что у
- * AHCI.c/IDE.c рядом), поэтому FAT32/VFS работают с USB-флешкой ровно так
- * же, как с SATA/IDE диском — разницы для остального ядра нет.
- *
- * Сознательные границы этой версии:
- *   - Один LUN (bCBWLUN всегда 0) — составные картридеры с несколькими
- *     логическими юнитами не поддержаны (увидим только первый).
- *   - Нет обработки Stall/Reset Recovery по полной схеме BOT-спеки (Bulk-
- *     Only Mass Storage Reset + Clear Feature на обоих эндпоинтах) —
- *     если bulk_transfer вернул ошибку, команда просто проваливается;
- *     устройство может потребовать физического переподключения, чтобы
- *     восстановиться после реального STALL. Для нормально работающих
- *     флешек в первом приближении не критично.
- *   - Не 4Kn (4096-байтные секторы) — READ CAPACITY(10) возвращает 32-бит
- *     LBA, диски больше 2ТБ (где нужен READ CAPACITY(16)) не поддержаны.
- */
+/* Fexox OS Project, EULA GPLv2 */
+
 #include "USBMassStorage.h"
 #include "USB.h"
 #include "VFS.h"
@@ -38,36 +10,36 @@
 
 extern void  *memset(void *dst, int c, size_t n);
 extern void  *memcpy(void *dst, const void *src, size_t n);
-extern size_t strlcpy(char *dst, const char *src, size_t n);   /* klibc.c */
+extern size_t strlcpy(char *dst, const char *src, size_t n);    
 
-/* =========================================================================
- * CBW / CSW (USB Mass Storage BOT spec §5.1/§5.2)
- * ========================================================================= */
-#define USB_MSC_CBW_SIG 0x43425355u   /* "USBC" */
-#define USB_MSC_CSW_SIG 0x53425355u   /* "USBS" */
+ 
+
+
+#define USB_MSC_CBW_SIG 0x43425355u    
+#define USB_MSC_CSW_SIG 0x53425355u    
 
 #pragma pack(push, 1)
 typedef struct {
     uint32_t dCBWSignature;
     uint32_t dCBWTag;
     uint32_t dCBWDataTransferLength;
-    uint8_t  bmCBWFlags;   /* bit7: 1=IN(device->host), 0=OUT */
-    uint8_t  bCBWLUN;      /* младшие 4 бита */
-    uint8_t  bCBWCBLength; /* 1..16 */
+    uint8_t  bmCBWFlags;    
+    uint8_t  bCBWLUN;       
+    uint8_t  bCBWCBLength;  
     uint8_t  CBWCB[16];
-} usb_msc_cbw_t;   /* 31 байт */
+} usb_msc_cbw_t;    
 
 typedef struct {
     uint32_t dCSWSignature;
     uint32_t dCSWTag;
     uint32_t dCSWDataResidue;
-    uint8_t  bCSWStatus;   /* 0=passed, 1=failed, 2=phase error */
-} usb_msc_csw_t;   /* 13 байт */
+    uint8_t  bCSWStatus;    
+} usb_msc_csw_t;    
 #pragma pack(pop)
 
-/* =========================================================================
- * Контекст устройства
- * ========================================================================= */
+ 
+
+
 #define USB_MSC_MAX_DEVICES 8
 
 typedef struct {
@@ -89,9 +61,9 @@ typedef struct {
 static usb_msc_dev_t g_msc[USB_MSC_MAX_DEVICES];
 static int            g_msc_count = 0;
 
-/* =========================================================================
- * msc_command — одна SCSI-команда целиком (CBW+DATA+CSW)
- * ========================================================================= */
+ 
+
+
 static int msc_command(usb_msc_dev_t *d, const uint8_t *cb, uint8_t cblen,
                        void *data, uint32_t data_len, bool dir_in) {
     usb_msc_cbw_t cbw;
@@ -122,20 +94,67 @@ static int msc_command(usb_msc_dev_t *d, const uint8_t *cb, uint8_t cblen,
                                    d->bulk_in_maxp, &csw, sizeof(csw), &d->toggle_in);
     if (r != 0) return r;
 
-    if (csw.dCSWSignature != USB_MSC_CSW_SIG || csw.dCSWTag != cbw.dCBWTag) return -1;
-    if (csw.bCSWStatus != 0) return -2;
+     
+
+
+
+    if (csw.dCSWSignature != USB_MSC_CSW_SIG || csw.dCSWTag != cbw.dCBWTag) return -22;
+    if (csw.bCSWStatus == 1) return -20;    
+    if (csw.bCSWStatus != 0) return -21;    
     return 0;
 }
 
-/* =========================================================================
- * blkdev_ops
- * ========================================================================= */
+ 
+
+
+ 
+
+
+
+static struct { uint32_t errors, recovered; int last_rc; uint64_t last_lba; } g_msc_stat;
+
+void usb_msc_get_stats(uint32_t *errors, uint32_t *recovered, int *last_rc, uint64_t *last_lba) {
+    if (errors)    *errors    = g_msc_stat.errors;
+    if (recovered) *recovered = g_msc_stat.recovered;
+    if (last_rc)   *last_rc   = g_msc_stat.last_rc;
+    if (last_lba)  *last_lba  = g_msc_stat.last_lba;
+}
+
+static void msc_request_sense(usb_msc_dev_t *d);
+static void msc_reset_recovery(usb_msc_dev_t *d);
+
+ 
+
+
+
+
+
+
+static int msc_command_retry(usb_msc_dev_t *d, const uint8_t *cb, uint8_t cblen,
+                             void *data, uint32_t len, bool dir_in, uint64_t lba) {
+    int r = 0;
+    for (int attempt = 0; attempt < 4; attempt++) {
+        r = msc_command(d, cb, cblen, data, len, dir_in);
+        if (r == 0) {
+            if (attempt) g_msc_stat.recovered++;
+            return 0;
+        }
+        g_msc_stat.errors++;
+        g_msc_stat.last_rc  = r;
+        g_msc_stat.last_lba = lba;
+        if (r == -20) msc_request_sense(d);
+        else          msc_reset_recovery(d);
+        usb_delay_ms(20u * (uint32_t)(attempt + 1));
+    }
+    return r;
+}
+
 static int usb_msc_blkdev_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf) {
     usb_msc_dev_t *d = (usb_msc_dev_t *)dev->priv;
     if (lba + count > d->sector_count) return VFS_ERR_OVERFLOW;
 
     uint32_t sec_sz = d->sector_size ? d->sector_size : 512u;
-    uint32_t max_sectors = 65536u / sec_sz;   /* см. UHCI/EHCI_BULK_BUF_SIZE */
+    uint32_t max_sectors = 65536u / sec_sz;    
     if (max_sectors == 0) max_sectors = 1;
 
     uint8_t *dst = (uint8_t *)buf;
@@ -144,12 +163,12 @@ static int usb_msc_blkdev_read(blkdev_t *dev, uint64_t lba, uint32_t count, void
 
         uint8_t cb[10];
         memset(cb, 0, sizeof(cb));
-        cb[0] = 0x28;   /* READ (10) */
+        cb[0] = 0x28;    
         cb[2] = (uint8_t)(lba >> 24); cb[3] = (uint8_t)(lba >> 16);
         cb[4] = (uint8_t)(lba >> 8);  cb[5] = (uint8_t)lba;
         cb[7] = (uint8_t)(n >> 8);    cb[8] = (uint8_t)n;
 
-        if (msc_command(d, cb, 10, dst, n * sec_sz, true) != 0) return VFS_ERR_IO;
+        if (msc_command_retry(d, cb, 10, dst, n * sec_sz, true, lba) != 0) return VFS_ERR_IO;
 
         lba   += n;
         dst   += (uint64_t)n * sec_sz;
@@ -173,12 +192,12 @@ static int usb_msc_blkdev_write(blkdev_t *dev, uint64_t lba, uint32_t count, con
 
         uint8_t cb[10];
         memset(cb, 0, sizeof(cb));
-        cb[0] = 0x2A;   /* WRITE (10) */
+        cb[0] = 0x2A;    
         cb[2] = (uint8_t)(lba >> 24); cb[3] = (uint8_t)(lba >> 16);
         cb[4] = (uint8_t)(lba >> 8);  cb[5] = (uint8_t)lba;
         cb[7] = (uint8_t)(n >> 8);    cb[8] = (uint8_t)n;
 
-        if (msc_command(d, cb, 10, (void *)src, n * sec_sz, false) != 0) return VFS_ERR_IO;
+        if (msc_command_retry(d, cb, 10, (void *)src, n * sec_sz, false, lba) != 0) return VFS_ERR_IO;
 
         lba   += n;
         src   += (uint64_t)n * sec_sz;
@@ -195,9 +214,45 @@ static blkdev_ops_t g_usb_msc_ops = {
     .destroy       = usb_msc_blkdev_destroy,
 };
 
-/* =========================================================================
- * attach
- * ========================================================================= */
+ 
+
+
+
+ 
+
+
+static void msc_request_sense(usb_msc_dev_t *d) {
+    uint8_t cb[6] = { 0x03, 0, 0, 0, 18, 0 };
+    uint8_t buf[18];
+    memset(buf, 0, sizeof(buf));
+    msc_command(d, cb, 6, buf, sizeof(buf), true);
+}
+
+ 
+
+
+
+static void msc_reset_recovery(usb_msc_dev_t *d) {
+    if (d->speed != USB_SPEED_HIGH) return;
+    usb_setup_pkt_t sp;
+
+    sp.bmRequestType = USB_REQ_DIR_H2D | USB_REQ_TYPE_CLASS | USB_REQ_RECIP_INTERFACE;
+    sp.bRequest = 0xFF; sp.wValue = 0; sp.wIndex = 0; sp.wLength = 0;    
+    d->hcd->ops->control_transfer(d->hcd, d->addr, d->speed, 64, &sp, NULL, 0);
+
+    uint8_t eps[2] = { d->bulk_in_ep, d->bulk_out_ep };
+    for (int i = 0; i < 2; i++) {
+        sp.bmRequestType = USB_REQ_DIR_H2D | USB_REQ_TYPE_STANDARD | USB_REQ_RECIP_ENDPOINT;
+        sp.bRequest = USB_REQ_CLEAR_FEATURE; sp.wValue = 0; sp.wIndex = eps[i]; sp.wLength = 0;
+        d->hcd->ops->control_transfer(d->hcd, d->addr, d->speed, 64, &sp, NULL, 0);
+    }
+    d->toggle_in = 0;
+    d->toggle_out = 0;
+}
+
+ 
+
+
 int usb_msc_attach(usb_hcd_t *hcd, uint8_t addr, uint8_t speed,
                    uint8_t bulk_in_ep, uint16_t bulk_in_maxp,
                    uint8_t bulk_out_ep, uint16_t bulk_out_maxp) {
@@ -221,19 +276,43 @@ int usb_msc_attach(usb_hcd_t *hcd, uint8_t addr, uint8_t speed,
     d->bulk_out_ep   = bulk_out_ep;
     d->bulk_out_maxp = bulk_out_maxp;
 
-    /* TEST UNIT READY — "будильник", best effort: некоторые флешки не
-     * отвечают на самую первую команду сразу после enumerate, но не
-     * возражают ни против неё, ни против следующей READ CAPACITY. */
-    uint8_t tur[6];
-    memset(tur, 0, sizeof(tur));
-    msc_command(d, tur, 6, NULL, 0, true);
+     
+
+
+
+
+    bool ready = false;
+    int  xport_errs = 0;    
+    for (int i = 0; i < 25 && !ready; i++) {
+        uint8_t tur[6];
+        memset(tur, 0, sizeof(tur));
+        int r = msc_command(d, tur, 6, NULL, 0, true);
+        if (r == 0) { ready = true; break; }
+        if (r == -20)      msc_request_sense(d);       
+        else if (r > -10) {                            
+            msc_reset_recovery(d);
+            if (++xport_errs >= 3) break;
+        }
+        usb_delay_ms(100);
+    }
+    DBG_VAL("USBMSC", "unit ready (1=yes)", ready ? 1 : 0);
 
     uint8_t cap[8];
-    memset(cap, 0, sizeof(cap));
     uint8_t rc10[10];
-    memset(rc10, 0, sizeof(rc10));
-    rc10[0] = 0x25;   /* READ CAPACITY (10) */
-    if (msc_command(d, rc10, 10, cap, sizeof(cap), true) != 0) {
+    int cap_rc = -1;
+    for (int i = 0; i < 5 && cap_rc != 0; i++) {
+        memset(cap, 0, sizeof(cap));
+        memset(rc10, 0, sizeof(rc10));
+        rc10[0] = 0x25;    
+        cap_rc = msc_command(d, rc10, 10, cap, sizeof(cap), true);
+        if (cap_rc == -20)      msc_request_sense(d);
+        else if (cap_rc != 0 && cap_rc > -10) {
+            msc_reset_recovery(d);
+            if (++xport_errs >= 5) break;
+        }
+        if (cap_rc != 0) usb_delay_ms(100);
+    }
+    if (cap_rc != 0) {
         DBG_VAL("USBMSC", "READ CAPACITY(10) не удалась, addr", addr);
         return -1;
     }

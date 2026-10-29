@@ -1,4 +1,5 @@
-/* bootloader.c — UEFI загрузчик FEXOS + пошаговая отладка (serial + экран) */
+/* Fexox OS Project, EULA GPLv2 */
+ 
 #include <stdint.h>
 #include "debug_out.h"
 
@@ -59,9 +60,9 @@ static EFI_GUID EFI_LOADED_IMAGE_PROTOCOL_GUID =
 static EFI_GUID EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID =
     {0x9042a9de, 0x23dc, 0x4a38, {0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a}};
 
-/* ACPI RSDP GUID'ы в EFI ConfigurationTable — нужны для поиска RSDP без
- * сканирования памяти (на реальном железе RSDP не всегда лежит в
- * "классическом" диапазоне 0xE0000-0xFFFFF, как в BIOS/QEMU). */
+ 
+
+
 static EFI_GUID EFI_ACPI_20_TABLE_GUID =
     {0x8868e871, 0xe4f1, 0x11d3, {0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81}};
 static EFI_GUID EFI_ACPI_10_TABLE_GUID =
@@ -78,7 +79,7 @@ static int efi_guid_eq(const EFI_GUID *a, const EFI_GUID *b) {
     return 1;
 }
 
-/* ---- GOP (Graphics Output Protocol) ---- */
+ 
 typedef enum {
     PixelRedGreenBlueReserved8BitPerColor,
     PixelBlueGreenRedReserved8BitPerColor,
@@ -112,15 +113,15 @@ typedef struct {
     UINTN                              FrameBufferSize;
 } EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
 
-/* Forward-декларация: SetMode/QueryMode принимают указатель "на себя"
- * (This), поэтому struct-тег нужен до самого typedef. */
+ 
+
 typedef struct EFI_GRAPHICS_OUTPUT_PROTOCOL EFI_GRAPHICS_OUTPUT_PROTOCOL;
 
 struct EFI_GRAPHICS_OUTPUT_PROTOCOL {
-    /* QueryMode — вернуть параметры режима ModeNumber (0..MaxMode-1) без
-     * его активации; SetMode — реально переключить экран на ModeNumber
-     * (единственный способ по-настоящему сменить физическое разрешение —
-     * доступен только здесь, в загрузчике, пока живы Boot Services). */
+     
+
+
+
     EFI_STATUS (EFIAPI *QueryMode)(EFI_GRAPHICS_OUTPUT_PROTOCOL *This,
                                     UINT32 ModeNumber, UINTN *SizeOfInfo,
                                     EFI_GRAPHICS_OUTPUT_MODE_INFORMATION **Info);
@@ -129,7 +130,7 @@ struct EFI_GRAPHICS_OUTPUT_PROTOCOL {
     EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
 };
 
-/* ---- fb_info_t (должна совпадать с Framebuffer.h) ---- */
+ 
 #define FB_MODE_NONE    0
 #define FB_MODE_VGA     1
 #define FB_MODE_LINEAR  2
@@ -246,12 +247,12 @@ typedef struct {
     UINTN NumberOfTableEntries; void *ConfigurationTable;
 } EFI_SYSTEM_TABLE;
 
-/* Ищем RSDP в EFI ConfigurationTable: сперва ACPI 2.0, затем ACPI 1.0 как
- * фолбэк. Возвращает физический адрес RSDP или 0, если ACPI не найден
- * (тогда ядро просто не сможет сделать "настоящий" ACPI shutdown/reboot
- * и останется на старых фолбэках — не фатально).
- * Определена здесь (а не сразу после GUID'ов), т.к. нужен уже готовый
- * тип EFI_SYSTEM_TABLE. */
+ 
+
+
+
+
+
 static UINT64 efi_find_rsdp(EFI_SYSTEM_TABLE *SystemTable) {
     EFI_CONFIGURATION_TABLE *cfg = (EFI_CONFIGURATION_TABLE *)SystemTable->ConfigurationTable;
     void *rsdp10 = NULL;
@@ -279,7 +280,7 @@ typedef struct PACKED {
 
 #define PT_LOAD           1
 #define KERNEL_VIRT_BASE  0xFFFFFFFF80000000ULL
-#define KERNEL_PHYS_BASE  0x00200000ULL  /* MUST be 2MiB-aligned for 2MiB pages */
+#define KERNEL_PHYS_BASE  0x00200000ULL   
 
 typedef struct PACKED {
     UINT64 magic;
@@ -292,11 +293,11 @@ typedef struct PACKED {
     void    *gdt_ptr;
     void    *idt_ptr;
     fb_info_t fb;
-    UINT64  rsdp_phys;   /* физический адрес ACPI RSDP, 0 если не найден */
+    UINT64  rsdp_phys;    
 } BOOT_INFO;
 
 #define BOOT_INFO_MAGIC 0x4B45524E454C424FULL
-#define BOOT_FILE_PHYS  0x00800000ULL  /* temp ELF buffer: 8 MiB, well above kernel at 2 MiB */
+#define BOOT_FILE_PHYS  0x00800000ULL   
 #define IDENTITY_GB     4ULL
 #define PTE_P  (1ULL << 0)
 #define PTE_W  (1ULL << 1)
@@ -333,7 +334,7 @@ static void bl_log(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut, const char *str) {
     efi_print(ConOut, str);
 }
 
-// ИСПРАВЛЕНО: ConOut передается по указателю, а не по значению
+ 
 static void bl_fail(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut, const char *stage, EFI_STATUS st) {
     dbg_puts("\n*** BOOT FAILED at ");
     dbg_puts(stage);
@@ -343,17 +344,17 @@ static void bl_fail(EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut, const char *stage, 
     DBG_PANIC("BL", stage);
 }
 
-/* =========================================================================
- * "/display.cfg" — выбор разрешения из "Desktop settings" -> Display
- * (см. Framebuffer.c: apply_resolution() / ui_persist_display_cfg()).
- * Простой текстовый файл вида "1920x1080\n" в корне того же диска, с
- * которого грузится kernel.bin. Читаем его ЗДЕСЬ (пока живы Boot
- * Services) и, если найден подходящий GOP-режим, реально переключаем
- * экран через gop->SetMode() — единственное место, где это в принципе
- * возможно (ExitBootServices необратимо всё это отбирает).
- * ========================================================================= */
+ 
 
-/* Простой парсер "ШИРИНАxВЫСОТА" (например "1920x1080") — без libc. */
+
+
+
+
+
+
+
+
+ 
 static int parse_resolution(const char *s, UINT32 *w, UINT32 *h) {
     UINT32 a = 0, b = 0;
     int has_a = 0, has_b = 0;
@@ -369,16 +370,16 @@ static int parse_resolution(const char *s, UINT32 *w, UINT32 *h) {
     return 1;
 }
 
-/* Читает "\display.cfg" из уже открытого корня root FS. Возвращает 1 и
- * заполняет *out_w/*out_h при успехе, 0 если файла нет / битый формат —
- * это НЕ ошибка загрузки, просто "нет сохранённого выбора", вызывающий
- * код должен молча оставить текущий (прошивочный) режим. */
+ 
+
+
+
 static int bl_read_display_cfg(EFI_FILE_PROTOCOL *root, UINT32 *out_w, UINT32 *out_h) {
     if (!root) return 0;
 
     UINT16 cfg_path[] = L"\\display.cfg";
     EFI_FILE_PROTOCOL *cfg_file = NULL;
-    EFI_STATUS st = root->Open(root, (void **)&cfg_file, cfg_path, 0x01 /* EFI_FILE_MODE_READ */, 0);
+    EFI_STATUS st = root->Open(root, (void **)&cfg_file, cfg_path, 0x01  , 0);
     if (st != EFI_SUCCESS || !cfg_file) return 0;
 
     char buf[32];
@@ -395,6 +396,66 @@ static int bl_read_display_cfg(EFI_FILE_PROTOCOL *root, UINT32 *out_w, UINT32 *o
     return parse_resolution(buf, out_w, out_h);
 }
 
+ 
+
+
+
+
+
+
+
+
+
+static void bl_write_modes_txt(EFI_FILE_PROTOCOL *root, EFI_GRAPHICS_OUTPUT_PROTOCOL *gop) {
+    if (!root || !gop || !gop->Mode) return;
+
+    char   buf[512];
+    UINTN  len = 0;
+    UINT32 seen_w[48], seen_h[48];
+    int    seen = 0;
+
+    for (UINT32 m = 0; m < gop->Mode->MaxMode && seen < 48; m++) {
+        EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *qi = NULL;
+        UINTN qsz = 0;
+        if (gop->QueryMode(gop, m, &qsz, &qi) != EFI_SUCCESS || !qi) continue;
+        if (qi->PixelFormat == PixelBltOnly) continue;
+        UINT32 w = qi->HorizontalResolution, h = qi->VerticalResolution;
+        if (w < 640 || h < 480) continue;
+
+        int dup = 0;
+        for (int k = 0; k < seen; k++) if (seen_w[k] == w && seen_h[k] == h) dup = 1;
+        if (dup) continue;
+        if (len + 16 >= sizeof(buf)) break;    
+        seen_w[seen] = w; seen_h[seen] = h; seen++;
+
+        char t[12]; int n = 0; UINT32 v = w;
+        while (v > 0) { t[n++] = (char)('0' + (v % 10)); v /= 10; }
+        while (n > 0) buf[len++] = t[--n];
+        buf[len++] = 'x';
+        v = h;
+        while (v > 0) { t[n++] = (char)('0' + (v % 10)); v /= 10; }
+        while (n > 0) buf[len++] = t[--n];
+        buf[len++] = '\n';
+    }
+    if (len == 0) return;
+
+    UINT16 path[] = L"\\modes.txt";
+    EFI_FILE_PROTOCOL *f = NULL;
+
+     
+
+    if (root->Open(root, (void **)&f, path, 0x03  , 0) == EFI_SUCCESS && f) {
+        f->Delete(f);
+        f = NULL;
+    }
+    if (root->Open(root, (void **)&f, path, 0x8000000000000003ULL  , 0) != EFI_SUCCESS || !f)
+        return;
+    UINTN wsz = len;
+    f->Write(f, &wsz, buf);
+    f->Flush(f);
+    f->Close(f);
+}
+
 static UINT64 setup_boot_paging(UINT64 pml4_phys) {
     UINT64 *pml4    = (UINT64 *)(UINTN)pml4_phys;
     UINT64 *pdpt_id = (UINT64 *)(UINTN)(pml4_phys + 1 * PAGE_SIZE);
@@ -407,22 +468,22 @@ static UINT64 setup_boot_paging(UINT64 pml4_phys) {
 
     efi_memset(pml4, 0, 8 * PAGE_SIZE);
 
-    // === Identity: 4 GiB через 2-MiB страницы ===
+     
     pml4[0] = (UINT64)(UINTN)pdpt_id | PTE_P | PTE_W;
     
-    // Один PDPT может указывать на 4 разные PD (каждая по 1 GiB)
+     
     pdpt_id[0] = (UINT64)(UINTN)pd_id0 | PTE_P | PTE_W;
     pdpt_id[1] = (UINT64)(UINTN)pd_id1 | PTE_P | PTE_W;
     pdpt_id[2] = (UINT64)(UINTN)pd_id2 | PTE_P | PTE_W;
     pdpt_id[3] = (UINT64)(UINTN)pd_id3 | PTE_P | PTE_W;
 
-    // Заполняем 4 таблицы (2048 записей * 2 MiB = 4 GiB)
+     
     for (UINT64 i = 0; i < 2048; i++) {
         UINT64 *pd = (UINT64 *)(UINTN)(pml4_phys + (2 + (i / 512)) * PAGE_SIZE);
-        pd[i % 512] = (i << 21) | PTE_P | PTE_W | PTE_PS; // << 21 сдвиг для 2 MiB
+        pd[i % 512] = (i << 21) | PTE_P | PTE_W | PTE_PS;  
     }
 
-    // === Higher-half: ядро через 2-MiB страницы ===
+     
     UINT64 vaddr = KERNEL_VIRT_BASE;
     UINT64 pml4_idx = (vaddr >> 39) & 0x1FF;
     UINT64 pdpt_idx = (vaddr >> 30) & 0x1FF;
@@ -431,7 +492,7 @@ static UINT64 setup_boot_paging(UINT64 pml4_phys) {
     pml4[pml4_idx] = (UINT64)(UINTN)pdpt_hi | PTE_P | PTE_W;
     pdpt_hi[pdpt_idx] = (UINT64)(UINTN)pd_hi | PTE_P | PTE_W;
 
-    // Мапим 8 MiB (4 страницы по 2 MiB)
+     
     for (UINT64 i = 0; i < 4; i++) {
         pd_hi[pd_idx + i] = (KERNEL_PHYS_BASE + (i << 21)) | PTE_P | PTE_W | PTE_PS;
     }
@@ -446,13 +507,13 @@ static void jump_to_kernel_virt(UINT64 pml4_phys, UINT64 entry, BOOT_INFO *info,
     DBG_VAL("BL", "rsp", rsp);
     DBG_VAL("BL", "info", (UINT64)(UINTN)info);
 
-    // Минимальный GDT: Null, 64-bit Code (L=1), 64-bit Data
+     
     static __attribute__((aligned(16))) UINT64 gdt[3] = {0};
     static struct { UINT16 limit; UINT64 base; } __attribute__((packed)) gdtr;
 
-    // 0x00209A0000000000 -> P=1, DPL=0, S=1, Exec/Read, L=1 (64-bit mode)
+     
     gdt[1] = 0x00209A0000000000ULL;
-    // 0x0000920000000000 -> P=1, DPL=0, S=1, Data/RW
+     
     gdt[2] = 0x0000920000000000ULL;
     
     gdtr.limit = sizeof(gdt) - 1;
@@ -460,25 +521,25 @@ static void jump_to_kernel_virt(UINT64 pml4_phys, UINT64 entry, BOOT_INFO *info,
 
     __asm__ volatile (
         "cli\n\t"
-        "mov %[cr3], %%cr3\n\t"   // Включаем пейджинг
-        "lgdt %[gdtr]\n\t"        // Загружаем наш GDT
+        "mov %[cr3], %%cr3\n\t"    
+        "lgdt %[gdtr]\n\t"         
         
-        // 🔥 FAR JUMP для перезагрузки CS (обязательно для long mode)
-        "pushq $0x08\n\t"         // Селектор кодового сегмента (0x08 -> gdt[1])
+         
+        "pushq $0x08\n\t"          
         "lea 1f(%%rip), %%rax\n\t"
         "pushq %%rax\n\t"
-        "lretq\n\t"               // Извлекает RIP и CS, переключая в 64-bit режим
+        "lretq\n\t"                
         "1:\n\t"
         
-        // Сбрасываем сегментные регистры данных на наш новый GDT
-        "mov $0x10, %%ax\n\t"     // Селектор данных (0x10 -> gdt[2])
+         
+        "mov $0x10, %%ax\n\t"      
         "mov %%ax, %%ds\n\t"
         "mov %%ax, %%es\n\t"
         "mov %%ax, %%fs\n\t"
         "mov %%ax, %%gs\n\t"
         "mov %%ax, %%ss\n\t"
         
-        // Устанавливаем стек и передаём управление ядру
+         
         "mov %[rsp], %%rsp\n\t"
         "mov %[arg], %%rdi\n\t"
         "jmp *%[entry]\n\t"
@@ -502,12 +563,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL *ConOut = SystemTable->ConOut;
 
     BS->SetWatchdogTimer(0, 0, 0, NULL);
-    bl_log(ConOut, "=== FEXOS Bootloader ===\r\n");
+    bl_log(ConOut, "=== Fexox OS Bootloader ===\r\n");
     DBG_MSG("BL", "01 ConOut ok");
 
-    /* RSDP берём из ConfigurationTable сразу, пока SystemTable точно валиден
-     * (это просто чтение массива, не boot-service вызов — безопасно делать
-     * и после ExitBootServices, но удобнее сохранить пораньше). */
+     
+
+
     UINT64 rsdp_phys = efi_find_rsdp(SystemTable);
     DBG_VAL("BL", "01b rsdp_phys", rsdp_phys);
 
@@ -516,7 +577,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     UINT32 DescriptorVersion = 0;
     EFI_STATUS status;
 
-    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL; // ИСПРАВЛЕНО: убран пробел в имени типа
+    EFI_SIMPLE_FILE_SYSTEM_PROTOCOL *fs = NULL;  
     EFI_FILE_PROTOCOL *root = NULL;
 
     DBG_MSG("BL", "02 open FS (boot device)...");
@@ -599,7 +660,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         if (seg_pages == 0) continue;
 
         EFI_PHYSICAL_ADDRESS seg = seg_lo;
-        status = BS->AllocatePages(AllocateAddress, EfiLoaderCode, seg_pages, &seg); // ИСПРАВЛЕНО: sta tus -> status
+        status = BS->AllocatePages(AllocateAddress, EfiLoaderCode, seg_pages, &seg);  
         if (status != EFI_SUCCESS) {
             dbg_puts("[BL] seg alloc failed i=");
             dbg_dec64(i);
@@ -616,7 +677,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     DBG_VAL("BL", "segments", seg_n);
 
     EFI_PHYSICAL_ADDRESS pt_phys = 0;
-    // Выделяем 8 страниц: 1 PML4 + 1 PDPT (ID) + 4 PD (ID) + 1 PDPT (HI) + 1 PD (HI)
+     
     status = BS->AllocatePages(AllocateAnyPages, EfiLoaderData, 8, &pt_phys);
     if (status != EFI_SUCCESS) bl_fail(ConOut, "Alloc page tables", status);
     
@@ -624,25 +685,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     DBG_VAL("BL", "pml4", pml4_phys);
     DBG_MSG("BL", "08 paging built");
 
-    /* ==========================================================
-     * GOP — получаем framebuffer ДО ExitBootServices.
-     * После EBS обращаться к Boot Services нельзя.
-     * ========================================================== */
+     
+
+
+
     DBG_MSG("BL", "08b GOP init...");
     efi_memset(&g_boot_info.fb, 0, sizeof(fb_info_t));
-    g_boot_info.fb.mode = FB_MODE_VGA; /* fallback */
+    g_boot_info.fb.mode = FB_MODE_VGA;  
     {
         EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
         EFI_STATUS gop_status = BS->LocateProtocol(
             &EFI_GRAPHICS_OUTPUT_PROTOCOL_GUID, NULL, (void **)&gop);
 
         if (gop_status == EFI_SUCCESS && gop && gop->Mode && gop->Mode->Info) {
-            /* Если раньше из "Desktop settings" -> Display сохранили выбор
-             * ("/display.cfg", см. Framebuffer.c: apply_resolution()) —
-             * ищем среди gop->QueryMode() режим с точным совпадением
-             * width/height и реально переключаем экран через SetMode.
-             * Не нашли файл / нет такого режима — молча остаёмся на том,
-             * что уже выбрала прошивка (как и раньше, ничего не меняется). */
+             
+
+
+
+
+
+            bl_write_modes_txt(root, gop);    
             UINT32 want_w = 0, want_h = 0;
             if (bl_read_display_cfg(root, &want_w, &want_h)) {
                 DBG_VAL("BL", "display.cfg want_w", want_w);
@@ -654,6 +716,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *qi = NULL;
                     UINTN qsz = 0;
                     if (gop->QueryMode(gop, m, &qsz, &qi) != EFI_SUCCESS || !qi) continue;
+                    if (qi->PixelFormat == PixelBltOnly) continue;
                     if (qi->HorizontalResolution == want_w && qi->VerticalResolution == want_h) {
                         match_mode = m;
                         found = 1;
@@ -674,12 +737,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     DBG_MSG("BL", "display.cfg resolution not supported by GOP");
                     bl_log(ConOut, "[WARN] display.cfg resolution not supported\r\n");
                 }
-                /* found && match_mode == gop->Mode->Mode — уже тот режим, ничего делать не надо */
+                 
             }
 
-            /* gop->Mode->Info — тот же указатель, что и раньше, но после
-             * SetMode прошивка обновляет его содержимое на НОВЫЙ активный
-             * режим, поэтому перечитываем mi здесь, а не до блока выше. */
+             
+
+
             EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *mi = gop->Mode->Info;
 
             g_boot_info.fb.mode     = FB_MODE_LINEAR;
@@ -689,7 +752,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             g_boot_info.fb.pitch    = mi->PixelsPerScanLine * 4;
             g_boot_info.fb.phys_addr = (UINT64)gop->Mode->FrameBufferBase;
 
-            /* Определяем порядок каналов */
+             
             if (mi->PixelFormat == PixelRedGreenBlueReserved8BitPerColor) {
                 g_boot_info.fb.red_mask   = 0x000000FF;
                 g_boot_info.fb.green_mask = 0x0000FF00;
@@ -699,7 +762,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 g_boot_info.fb.green_mask = mi->PixelInformation.GreenMask;
                 g_boot_info.fb.blue_mask  = mi->PixelInformation.BlueMask;
             } else {
-                /* PixelBlueGreenRedReserved8BitPerColor (самый частый) и default */
+                 
                 g_boot_info.fb.red_mask   = 0x00FF0000;
                 g_boot_info.fb.green_mask = 0x0000FF00;
                 g_boot_info.fb.blue_mask  = 0x000000FF;
@@ -717,11 +780,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         }
     }
 
-    /* ==========================================================
-       GetMemoryMap + ExitBootServices: MapKey устаревает после 
-       ЛЮБОГО вызова Boot Service. Между ними не должно быть 
-       НИЧЕГО, даже отладочного вывода.
-       ========================================================== */
+     
+
+
+
+
     DBG_MSG("BL", "09 GetMemoryMap + ExitBootServices...");
     MemoryMap = NULL;
     MemoryMapSize = 0;
@@ -757,15 +820,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             continue;
         }
         if (status != EFI_SUCCESS) {
-            dbg_puts("[BL] GetMemoryMap fill failed: "); // ИСПРАВЛЕНО: bl_ fail -> dbg_puts для безопасности
+            dbg_puts("[BL] GetMemoryMap fill failed: ");  
             dbg_hex64(status);
             dbg_puts("\n");
             for(;;) __asm__ volatile("hlt");
         }
         MemoryMapSize = new_size;
 
-        // !!! СТРОГО НИКАКИХ ВЫЗОВОВ ЗДЕСЬ !!!
-        // Ни bl_log, ни dbg_puts, ни Allocate, ни Free
+         
+         
         
         status = BS->ExitBootServices(ImageHandle, MapKey);
         if (status == EFI_SUCCESS) {
@@ -797,10 +860,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     g_boot_info.gdt_ptr = NULL;
     g_boot_info.idt_ptr = NULL;
     g_boot_info.rsdp_phys = rsdp_phys;
-    /* g_boot_info.fb уже заполнена выше (до ExitBootServices) */
+     
 
     UINT64 rsp = (UINT64)(UINTN)(bl_exit_stack + sizeof(bl_exit_stack));
-    jump_to_kernel_virt(pml4_phys, elf->e_entry, &g_boot_info, rsp); // ИСПРАВЛЕНО: убран пробел
+    jump_to_kernel_virt(pml4_phys, elf->e_entry, &g_boot_info, rsp);  
 
     DBG_PANIC("BL", "jump returned");
     return EFI_SUCCESS;

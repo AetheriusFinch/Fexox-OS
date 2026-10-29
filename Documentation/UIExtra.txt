@@ -1,0 +1,35 @@
+Fexox OS Project, EULA GPLv2
+
+Mouse Pointer and User Interface Update Module
+
+Purpose
+
+ui_extra.c manages the mouse pointer, pointer coordinates and buttons, desktop clock updates, and synchronization of changed screen regions with the display framebuffer.
+
+Initialization
+
+Call ui_extra_init() after drawing the desktop. The function attempts to load a pointer image through the VFS from UI/cursor.png or /UI/cursor.png. The image must be a PNG no larger than 32 by 32 pixels. The file-reading limit is 256 KiB.
+
+If the file is missing, invalid, or exceeds the supported dimensions, the module uses its built-in pointer instead. A pointer image loading failure does not prevent initialization. ui_extra_init() returns 0.
+
+Public Interface
+
+ui_set_mouse_pos(x, y) sets the pointer coordinates in pixels.
+
+ui_get_mouse_pos(out_x, out_y) returns the current coordinates. Either output pointer may be NULL.
+
+ui_tick() updates the pointer and the interface regions associated with it. The scheduler calls this function while handling timer ticks. It does nothing when the framebuffer is not in linear mode.
+
+Pointer Rendering
+
+Before drawing the pointer at its new position, the module restores the background saved beneath the previous pointer. It then saves the background beneath the new position and draws the pointer over it.
+
+PNG pointer images are rendered with alpha blending. If no supported image is available, the module draws a built-in black-and-white arrow measuring 12 by 19 pixels.
+
+The button state combines input from the PS/2 mouse and USB HID mice. The current coordinates and button state are passed to the desktop mouse handler.
+
+Display Updates
+
+While the left mouse button is held, the module updates the entire framebuffer so that window dragging is displayed correctly. Otherwise, it synchronizes the rectangular area covering the pointer's old and new positions. The clock region is synchronized separately when its displayed contents change.
+
+User-space windows are synchronized periodically rather than on every ui_tick() call to limit processor overhead.

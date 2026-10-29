@@ -1,4 +1,5 @@
-/* kernel.ld - Linker script for x86_64 UEFI Monolithic Kernel (LLD Compatible) */
+/* Fexox OS Project, EULA GPLv2 */
+ 
 
 OUTPUT_FORMAT("elf64-x86-64")
 
@@ -10,7 +11,7 @@ ENTRY(boot_stub_entry)
 
 KERNEL_VIRT_BASE = 0xFFFFFFFF80000000;
 
-PHYS_BASE        = 0x00200000;  /* 2 MiB — must match KERNEL_PHYS_BASE in bootloader, aligned to 2MiB page */
+PHYS_BASE        = 0x00200000;   
 
 
 
@@ -70,7 +71,7 @@ SECTIONS {
 
 
 
-    /* bss + стек ядра в одном PT_LOAD (все адреса кратны 4K для UEFI AllocatePages) */
+     
 
     .bss : ALIGN(4K) {
 

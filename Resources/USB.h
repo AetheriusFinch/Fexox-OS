@@ -1,27 +1,8 @@
-/*
- * USB.h — ядро USB-подсистемы FEXOS (не зависит от конкретного контроллера)
- *
- * Архитектура: любой хост-контроллер (UHCI.c, EHCI.c, в будущем OHCI/xHCI)
- * реализует usb_hcd_ops_t (control_transfer + port_reset) и регистрируется
- * через usb_register_hcd(). Само ядро (USB.c) ничего не знает о регистрах
- * конкретного контроллера — оно только гоняет стандартные control-запросы
- * через ops->control_transfer и разбирает дескрипторы.
- *
- * Текущий охват:
- *   - Перечисление устройств: reset порта -> адрес -> device descriptor ->
- *     config descriptor -> SET_CONFIGURATION.
- *   - Классовые драйверы поверх ядра (подключаются автоматически во время
- *     перечисления, см. usb_enumerate_port() в USB.c):
- *       * HID (клавиатура/мышь, Boot Protocol) — Resources/USBHID.c
- *       * Mass Storage BOT (SCSI/Bulk-Only) — Resources/USBMassStorage.c
- *     Оба задокументированы каждый в своей шапке файла, включая границы
- *     первой версии (что сознательно не реализовано).
- *   - Все структуры HCD и все временные буферы под DMA обязаны лежать
- *     физически < 4 ГБ (см. pmm_alloc_frames_range в MemoryControl.c) —
- *     справедливо и для UHCI (аппаратно всегда 32-бит), и для EHCI в
- *     этом драйвере (64-bit addressing capability мы не включаем —
- *     не нужно при DIRECT_MAP-модели памяти этого ядра).
- */
+/* Fexox OS Project, EULA GPLv2 */
+ 
+
+
+
 #ifndef USB_H
 #define USB_H
 
@@ -29,19 +10,20 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-/* =========================================================================
- * bmRequestType (USB 2.0 spec, §9.3)
- * ========================================================================= */
-#define USB_REQ_DIR_H2D          0x00u   /* host -> device (OUT) */
-#define USB_REQ_DIR_D2H          0x80u   /* device -> host (IN) */
+ 
+
+
+#define USB_REQ_DIR_H2D          0x00u    
+#define USB_REQ_DIR_D2H          0x80u    
 #define USB_REQ_TYPE_STANDARD    0x00u
 #define USB_REQ_TYPE_CLASS       0x20u
 #define USB_REQ_TYPE_VENDOR      0x40u
 #define USB_REQ_RECIP_DEVICE     0x00u
 #define USB_REQ_RECIP_INTERFACE  0x01u
 #define USB_REQ_RECIP_ENDPOINT   0x02u
+#define USB_REQ_RECIP_OTHER      0x03u    
 
-/* Стандартные bRequest */
+ 
 #define USB_REQ_GET_STATUS        0x00u
 #define USB_REQ_CLEAR_FEATURE     0x01u
 #define USB_REQ_SET_FEATURE       0x03u
@@ -52,20 +34,21 @@
 #define USB_REQ_SET_CONFIGURATION 0x09u
 #define USB_REQ_SET_INTERFACE     0x0Bu
 
-/* Типы дескрипторов */
+ 
 #define USB_DESC_DEVICE           0x01u
 #define USB_DESC_CONFIGURATION    0x02u
 #define USB_DESC_STRING           0x03u
 #define USB_DESC_INTERFACE        0x04u
 #define USB_DESC_ENDPOINT         0x05u
 
-/* Скорость устройства — влияет на кодирование транзакций у HCD (низкая
- * скорость требует бита LS в UHCI TD, EHCI низкоскоростные устройства
- * обслуживает только через split-транзакции/companion-контроллер, что в
- * этой первой версии НЕ поддержано, см. EHCI.c). */
-#define USB_SPEED_LOW    0   /* 1.5 Мбит/с */
-#define USB_SPEED_FULL   1   /* 12 Мбит/с */
-#define USB_SPEED_HIGH   2   /* 480 Мбит/с, только EHCI */
+ 
+
+
+
+#define USB_SPEED_LOW    0    
+#define USB_SPEED_FULL   1    
+#define USB_SPEED_HIGH   2    
+#define USB_SPEED_SUPER  3    
 
 #pragma pack(push, 1)
 
@@ -136,79 +119,173 @@ typedef struct {
 #define USB_EP_XFER_BULK     0x02u
 #define USB_EP_XFER_INTR     0x03u
 
-/* =========================================================================
- * Абстракция хост-контроллера — реализуется UHCI.c/EHCI.c
- * ========================================================================= */
+ 
+
+
 typedef struct usb_hcd usb_hcd_t;
 
 typedef struct {
-    /*
-     * control_transfer — полная control-транзакция (SETUP [+ DATA] +
-     * STATUS), синхронно (функция не возвращается, пока HC не завершит
-     * или не истечёт таймаут — драйверы этого ядра, как AHCI/IDE рядом,
-     * работают через polling, без прерываний).
-     *
-     *   dev_addr    — текущий адрес устройства (0 — устройство ещё не
-     *                 адресовано, используется только на этапе enumerate)
-     *   speed       — USB_SPEED_*
-     *   max_packet0 — размер пакета EP0 (до первого GET_DESCRIPTOR — 8,
-     *                 дальше берётся из usb_device_desc_t.bMaxPacketSize0)
-     *   data/len    — буфер DATA-стадии; data может быть NULL при len==0
-     *
-     * Возвращает 0 при успехе, отрицательный код при ошибке/таймауте.
-     */
+     
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     int (*control_transfer)(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
                             uint8_t max_packet0, const usb_setup_pkt_t *setup,
                             void *data, uint16_t len);
 
-    /*
-     * port_reset — выдать USB reset на порт (обязательно перед выдачей
-     * адреса свежеподключённому устройству, см. usb_enumerate_port).
-     * out_speed заполняется по факту сброса (для UHCI — по PORTSC.LSDA,
-     * для EHCI — full/high по PORTSC после reset, low не поддержан, см.
-     * EHCI.c). Возвращает false, если порт пуст/устройство не поднялось.
-     */
+     
+
+
+
+
+
+
     bool (*port_reset)(usb_hcd_t *hcd, uint8_t port, uint8_t *out_speed);
 
-    /*
-     * bulk_transfer — одна bulk-транзакция (без SETUP/STATUS стадий, в
-     * отличие от control_transfer) — нужна классовым драйверам поверх
-     * (Mass Storage BOT, см. Resources/USBMassStorage.c). В отличие от
-     * control-адреса EP0, bulk-эндпоинты помнят Data Toggle МЕЖДУ
-     * вызовами — поэтому toggle_inout передаётся вызывающим (он же его
-     * хранит, per-endpoint) и обновляется драйвером по факту отправки.
-     *
-     *   ep_addr     — адрес эндпоинта СО старшим битом направления
-     *                 (0x80 = IN), как в usb_ep_desc_t.bEndpointAddress
-     *   max_packet  — wMaxPacketSize эндпоинта (из дескриптора)
-     *   data/len    — буфер целиком; максимум зависит от реализации HCD
-     *                 (см. комментарий у bulk_buf в UHCI.c/EHCI.c — сейчас
-     *                 64 КБ за один вызов, для большего вызывающий сам
-     *                 разбивает на несколько вызовов)
-     *
-     * Возвращает 0 при успехе, отрицательное при ошибке/таймауте/STALL.
-     */
+     
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     int (*bulk_transfer)(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
                          uint8_t ep_addr, uint16_t max_packet,
                          void *data, uint32_t len, uint8_t *toggle_inout);
+
+     
+
+
+
+
+
+
+
+
+
+    void (*set_route)(usb_hcd_t *hcd, uint8_t dev_addr,
+                      uint8_t tt_hub_addr, uint8_t tt_port);
+
+     
+
+
+
+
+
+
+
+
+
+    bool (*port_connected)(usb_hcd_t *hcd, uint8_t port, bool *out_connected);
+
+     
+
+
+
+
+
+
+    int (*int_in_poll)(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                       uint8_t ep_addr, uint16_t max_packet,
+                       void *data, uint32_t len, uint8_t *toggle_inout,
+                       uint32_t timeout_us);
+
+     
+
+
+
+
+
+
+
+
+    int (*bulk_in_poll)(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                        uint8_t ep_addr, uint16_t max_packet,
+                        void *data, uint32_t len, uint8_t *toggle_inout,
+                        uint32_t timeout_us);
+
+     
+
+    bool supports_hubs;
 } usb_hcd_ops_t;
 
 struct usb_hcd {
     const usb_hcd_ops_t *ops;
-    void                *priv;    /* приватные данные конкретного драйвера — uhci_ctrl_t или ehci_ctrl_t */
-    const char          *name;    /* "uhci0", "ehci0", ... — для логов */
+    void                *priv;     
+    const char          *name;     
     uint8_t              num_ports;
 };
 
-/* Зарегистрировать хост-контроллер (вызывается из uhci_pci_scan()/
- * ehci_pci_scan() после успешного поднятия железа). usb_init() сама
- * пройдётся по портам через ops->port_reset и перечислит устройства. */
+ 
+
+
 void usb_register_hcd(usb_hcd_t *hcd);
 
-/* Инициализация USB-подсистемы целиком: сканирует PCI (uhci_pci_scan() +
- * ehci_pci_scan()), затем перечисляет устройства на всех портах всех
- * найденных контроллеров. Вызывать один раз при старте ядра, ПОСЛЕ того
- * как PMM/kmalloc и PCI config space доступны. */
+ 
+
+
+void     usb_delay_ms(uint32_t ms);
+uint64_t usb_tsc_per_ms(void);
+
+ 
+
+
+#define USB_DEV_LIST_MAX 12
+typedef struct {
+    uint16_t vid, pid;
+    uint8_t  dev_class;    
+    uint8_t  depth;        
+} usb_dev_info_t;
+
+typedef struct {
+    uint8_t hcds;             
+    uint8_t devices;          
+    uint8_t hubs;             
+    uint8_t hid;              
+    uint8_t msc;              
+    uint8_t split_skipped;    
+    uint8_t enum_fail;        
+    uint8_t fail_step;        
+    uint8_t net;              
+    int8_t  fail_rc;          
+    uint8_t n_list;
+    usb_dev_info_t list[USB_DEV_LIST_MAX];
+} usb_stats_t;
+
+const usb_stats_t *usb_get_stats(void);
+
+ 
+
+
+
 void usb_init(void);
 
-#endif /* USB_H */
+ 
+
+
+
+void usb_hotplug_poll(void);
+
+#endif  

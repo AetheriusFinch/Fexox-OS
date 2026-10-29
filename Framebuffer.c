@@ -1,11 +1,7 @@
-/*
- * Framebuffer.c — драйвер экрана FEXOS
- *
- * Зависимости ядра:
- *   MemoryControl: kmalloc / kfree, DIRECT_MAP_OFFSET
- *   klibc:         memset / memcpy
- *   debug_out.h:   DBG_MSG / DBG_VAL
- */
+/* Fexox OS Project, EULA GPLv2 */
+ 
+
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -14,233 +10,230 @@
 #include "debug_out.h"
 #include "AcpiControl.h"
 #include "Resources/fxapp.h"
+#include "USBHID.h"
 
-/* =========================================================================
- * Внешние зависимости ядра
- * ========================================================================= */
+ 
+
+
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
-/* klibc — нужны для сборки пути к иконке из fxapp-манифеста
- * (см. блок "fxapp: иконка на рабочем столе" ниже) */
+ 
+
 extern size_t strlcpy(char *dst, const char *src, size_t n);
 extern char  *strncat(char *dst, const char *src, size_t n);
 extern size_t strlen(const char *s);
 extern int    strcmp(const char *a, const char *b);
 extern char  *strrchr(const char *s, int c);
 
-/* DIRECT_MAP_OFFSET из MemoryControl.c:
-   физический адрес pa → виртуальный = pa + DIRECT_MAP_OFFSET */
+ 
+
 #define DIRECT_MAP_OFFSET 0xFFFF880000000000ULL
 
-/* klibc */
+ 
 extern void *memset(void *dst, int c, size_t n);
 extern void *memcpy(void *dst, const void *src, size_t n);
 
-/* =========================================================================
- * Встроенный шрифт 8×16 (VGA BIOS ROM font, 96 символов: 0x20–0x7F)
- *
- * Каждый символ — 16 байт (по одному на строку).
- * Бит 7 = левый пиксель, бит 0 = правый.
- * ========================================================================= */
+ 
+
 static const uint8_t g_font8x16[96][16] = {
-    /* 0x20 space */
+     
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x21 ! */
+     
     {0x00,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x00,0x18,0x18,0x00,0x00,0x00,0x00,0x00},
-    /* 0x22 " */
+     
     {0x00,0x66,0x66,0x66,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x23 # */
+     
     {0x00,0x36,0x36,0x7F,0x36,0x36,0x36,0x7F,0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x24 $ */
+     
     {0x18,0x18,0x7C,0xC6,0xC2,0xC0,0x7C,0x06,0x06,0x86,0xC6,0x7C,0x18,0x18,0x00,0x00},
-    /* 0x25 % */
+     
     {0x00,0x00,0xC2,0xC6,0x0C,0x18,0x30,0x60,0xC6,0x86,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x26 & */
+     
     {0x00,0x38,0x6C,0x6C,0x38,0x76,0xDC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x27 ' */
+     
     {0x00,0x30,0x30,0x30,0x60,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x28 ( */
+     
     {0x00,0x0C,0x18,0x30,0x60,0x60,0x60,0x60,0x60,0x30,0x18,0x0C,0x00,0x00,0x00,0x00},
-    /* 0x29 ) */
+     
     {0x00,0x60,0x30,0x18,0x0C,0x0C,0x0C,0x0C,0x0C,0x18,0x30,0x60,0x00,0x00,0x00,0x00},
-    /* 0x2A * */
+     
     {0x00,0x00,0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x2B + */
+     
     {0x00,0x00,0x00,0x18,0x18,0x18,0xFF,0x18,0x18,0x18,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x2C , */
+     
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x18,0x30,0x00,0x00,0x00},
-    /* 0x2D - */
+     
     {0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x2E . */
+     
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x00,0x00},
-    /* 0x2F / */
+     
     {0x00,0x00,0x02,0x06,0x0C,0x18,0x30,0x60,0xC0,0x80,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x30 0 */
+     
     {0x00,0x3C,0x66,0xC3,0xC3,0xDB,0xDB,0xC3,0xC3,0x66,0x3C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x31 1 */
+     
     {0x00,0x18,0x38,0x58,0x18,0x18,0x18,0x18,0x18,0x18,0x7E,0x00,0x00,0x00,0x00,0x00},
-    /* 0x32 2 */
+     
     {0x00,0x7C,0xC6,0x06,0x0C,0x18,0x30,0x60,0xC0,0xC6,0xFE,0x00,0x00,0x00,0x00,0x00},
-    /* 0x33 3 */
+     
     {0x00,0x7C,0xC6,0x06,0x06,0x3C,0x06,0x06,0x06,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x34 4 */
+     
     {0x00,0x0C,0x1C,0x3C,0x6C,0xCC,0xFE,0x0C,0x0C,0x0C,0x1E,0x00,0x00,0x00,0x00,0x00},
-    /* 0x35 5 */
+     
     {0x00,0xFE,0xC0,0xC0,0xC0,0xFC,0x06,0x06,0x06,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x36 6 */
+     
     {0x00,0x38,0x60,0xC0,0xC0,0xFC,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x37 7 */
+     
     {0x00,0xFE,0xC6,0x06,0x06,0x0C,0x18,0x30,0x30,0x30,0x30,0x00,0x00,0x00,0x00,0x00},
-    /* 0x38 8 */
+     
     {0x00,0x7C,0xC6,0xC6,0xC6,0x7C,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x39 9 */
+     
     {0x00,0x7C,0xC6,0xC6,0xC6,0x7E,0x06,0x06,0x06,0x0C,0x78,0x00,0x00,0x00,0x00,0x00},
-    /* 0x3A : */
+     
     {0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x3B ; */
+     
     {0x00,0x00,0x00,0x18,0x18,0x00,0x00,0x00,0x18,0x18,0x18,0x30,0x00,0x00,0x00,0x00},
-    /* 0x3C < */
+     
     {0x00,0x00,0x06,0x0C,0x18,0x30,0x60,0x30,0x18,0x0C,0x06,0x00,0x00,0x00,0x00,0x00},
-    /* 0x3D = */
+     
     {0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0xFF,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x3E > */
+     
     {0x00,0x00,0x60,0x30,0x18,0x0C,0x06,0x0C,0x18,0x30,0x60,0x00,0x00,0x00,0x00,0x00},
-    /* 0x3F ? */
+     
     {0x00,0x7C,0xC6,0xC6,0x0C,0x18,0x18,0x18,0x00,0x18,0x18,0x00,0x00,0x00,0x00,0x00},
-    /* 0x40 @ */
+     
     {0x00,0x7C,0xC6,0xC6,0xDE,0xDE,0xDE,0xDC,0xC0,0xC4,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x41 A */
+     
     {0x00,0x10,0x38,0x6C,0xC6,0xC6,0xFE,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x42 B */
+     
     {0x00,0xFC,0x66,0x66,0x66,0x7C,0x66,0x66,0x66,0x66,0xFC,0x00,0x00,0x00,0x00,0x00},
-    /* 0x43 C */
+     
     {0x00,0x3C,0x66,0xC2,0xC0,0xC0,0xC0,0xC0,0xC2,0x66,0x3C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x44 D */
+     
     {0x00,0xF8,0x6C,0x66,0x66,0x66,0x66,0x66,0x66,0x6C,0xF8,0x00,0x00,0x00,0x00,0x00},
-    /* 0x45 E */
+     
     {0x00,0xFE,0x66,0x62,0x68,0x78,0x68,0x60,0x62,0x66,0xFE,0x00,0x00,0x00,0x00,0x00},
-    /* 0x46 F */
+     
     {0x00,0xFE,0x66,0x62,0x68,0x78,0x68,0x60,0x60,0x60,0xF0,0x00,0x00,0x00,0x00,0x00},
-    /* 0x47 G */
+     
     {0x00,0x3C,0x66,0xC2,0xC0,0xC0,0xDE,0xC6,0xC6,0x66,0x3A,0x00,0x00,0x00,0x00,0x00},
-    /* 0x48 H */
+     
     {0x00,0xC6,0xC6,0xC6,0xC6,0xFE,0xC6,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x49 I */
+     
     {0x00,0x3C,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x4A J */
+     
     {0x00,0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0xCC,0xCC,0xCC,0x78,0x00,0x00,0x00,0x00,0x00},
-    /* 0x4B K */
+     
     {0x00,0xE6,0x66,0x6C,0x6C,0x78,0x78,0x6C,0x66,0x66,0xE6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x4C L */
+     
     {0x00,0xF0,0x60,0x60,0x60,0x60,0x60,0x60,0x62,0x66,0xFE,0x00,0x00,0x00,0x00,0x00},
-    /* 0x4D M */
+     
     {0x00,0xC6,0xEE,0xFE,0xFE,0xD6,0xC6,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x4E N */
+     
     {0x00,0xC6,0xE6,0xF6,0xFE,0xDE,0xCE,0xC6,0xC6,0xC6,0xC6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x4F O */
+     
     {0x00,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x50 P */
+     
     {0x00,0xFC,0x66,0x66,0x66,0x7C,0x60,0x60,0x60,0x60,0xF0,0x00,0x00,0x00,0x00,0x00},
-    /* 0x51 Q */
+     
     {0x00,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xD6,0xDE,0x7C,0x0C,0x0E,0x00,0x00,0x00},
-    /* 0x52 R */
+     
     {0x00,0xFC,0x66,0x66,0x66,0x7C,0x6C,0x66,0x66,0x66,0xE6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x53 S */
+     
     {0x00,0x7C,0xC6,0xC6,0x60,0x38,0x0C,0x06,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x54 T */
+     
     {0x00,0xFF,0xDB,0x99,0x18,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x55 U */
+     
     {0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x56 V */
+     
     {0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0xC6,0x6C,0x38,0x10,0x00,0x00,0x00,0x00,0x00},
-    /* 0x57 W */
+     
     {0x00,0xC6,0xC6,0xC6,0xC6,0xD6,0xD6,0xD6,0xFE,0xEE,0xC6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x58 X */
+     
     {0x00,0xC6,0xC6,0x6C,0x6C,0x38,0x38,0x6C,0x6C,0xC6,0xC6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x59 Y */
+     
     {0x00,0xCC,0xCC,0xCC,0xCC,0x78,0x30,0x30,0x30,0x30,0x78,0x00,0x00,0x00,0x00,0x00},
-    /* 0x5A Z */
+     
     {0x00,0xFE,0xC6,0x86,0x0C,0x18,0x30,0x60,0xC2,0xC6,0xFE,0x00,0x00,0x00,0x00,0x00},
-    /* 0x5B [ */
+     
     {0x00,0x3C,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x30,0x3C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x5C \ */
+     
     {0x00,0x00,0x80,0xC0,0x60,0x30,0x18,0x0C,0x06,0x02,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x5D ] */
+     
     {0x00,0x3C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x0C,0x3C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x5E ^ */
+     
     {0x10,0x38,0x6C,0xC6,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x5F _ */
+     
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF,0x00,0x00,0x00,0x00},
-    /* 0x60 ` */
+     
     {0x00,0x30,0x18,0x0C,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x61 a */
+     
     {0x00,0x00,0x00,0x00,0x78,0x0C,0x7C,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00,0x00},
-    /* 0x62 b */
+     
     {0x00,0xE0,0x60,0x60,0x78,0x6C,0x66,0x66,0x66,0x66,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x63 c */
+     
     {0x00,0x00,0x00,0x00,0x7C,0xC6,0xC0,0xC0,0xC0,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x64 d */
+     
     {0x00,0x1C,0x0C,0x0C,0x3C,0x6C,0xCC,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00,0x00},
-    /* 0x65 e */
+     
     {0x00,0x00,0x00,0x00,0x7C,0xC6,0xFE,0xC0,0xC0,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x66 f */
+     
     {0x00,0x1C,0x36,0x32,0x30,0x78,0x30,0x30,0x30,0x30,0x78,0x00,0x00,0x00,0x00,0x00},
-    /* 0x67 g */
+     
     {0x00,0x00,0x00,0x00,0x76,0xCC,0xCC,0xCC,0xCC,0x7C,0x0C,0xCC,0x78,0x00,0x00,0x00},
-    /* 0x68 h */
+     
     {0x00,0xE0,0x60,0x60,0x6C,0x76,0x66,0x66,0x66,0x66,0xE6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x69 i */
+     
     {0x00,0x18,0x18,0x00,0x38,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x6A j */
+     
     {0x00,0x06,0x06,0x00,0x0E,0x06,0x06,0x06,0x06,0x06,0x66,0x66,0x3C,0x00,0x00,0x00},
-    /* 0x6B k */
+     
     {0x00,0xE0,0x60,0x60,0x66,0x6C,0x78,0x78,0x6C,0x66,0xE6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x6C l */
+     
     {0x00,0x38,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x3C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x6D m */
+     
     {0x00,0x00,0x00,0x00,0xEC,0xFE,0xD6,0xD6,0xD6,0xD6,0xC6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x6E n */
+     
     {0x00,0x00,0x00,0x00,0xDC,0x66,0x66,0x66,0x66,0x66,0x66,0x00,0x00,0x00,0x00,0x00},
-    /* 0x6F o */
+     
     {0x00,0x00,0x00,0x00,0x7C,0xC6,0xC6,0xC6,0xC6,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x70 p */
+     
     {0x00,0x00,0x00,0x00,0xDC,0x66,0x66,0x66,0x66,0x7C,0x60,0x60,0xF0,0x00,0x00,0x00},
-    /* 0x71 q */
+     
     {0x00,0x00,0x00,0x00,0x76,0xCC,0xCC,0xCC,0xCC,0x7C,0x0C,0x0C,0x1E,0x00,0x00,0x00},
-    /* 0x72 r */
+     
     {0x00,0x00,0x00,0x00,0xDC,0x76,0x66,0x60,0x60,0x60,0xF0,0x00,0x00,0x00,0x00,0x00},
-    /* 0x73 s */
+     
     {0x00,0x00,0x00,0x00,0x7C,0xC6,0x60,0x38,0x0C,0xC6,0x7C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x74 t */
+     
     {0x00,0x10,0x30,0x30,0xFC,0x30,0x30,0x30,0x30,0x36,0x1C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x75 u */
+     
     {0x00,0x00,0x00,0x00,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0x76,0x00,0x00,0x00,0x00,0x00},
-    /* 0x76 v */
+     
     {0x00,0x00,0x00,0x00,0xC6,0xC6,0xC6,0xC6,0xC6,0x6C,0x38,0x00,0x00,0x00,0x00,0x00},
-    /* 0x77 w */
+     
     {0x00,0x00,0x00,0x00,0xC6,0xC6,0xC6,0xD6,0xD6,0xFE,0x6C,0x00,0x00,0x00,0x00,0x00},
-    /* 0x78 x */
+     
     {0x00,0x00,0x00,0x00,0xC6,0x6C,0x38,0x38,0x38,0x6C,0xC6,0x00,0x00,0x00,0x00,0x00},
-    /* 0x79 y */
+     
     {0x00,0x00,0x00,0x00,0xCC,0xCC,0xCC,0xCC,0xCC,0x7C,0x0C,0xCC,0x78,0x00,0x00,0x00},
-    /* 0x7A z */
+     
     {0x00,0x00,0x00,0x00,0xFE,0xCC,0x18,0x30,0x60,0xC6,0xFE,0x00,0x00,0x00,0x00,0x00},
-    /* 0x7B { */
+     
     {0x00,0x0E,0x18,0x18,0x18,0x70,0x18,0x18,0x18,0x18,0x0E,0x00,0x00,0x00,0x00,0x00},
-    /* 0x7C | */
+     
     {0x00,0x18,0x18,0x18,0x18,0x00,0x00,0x18,0x18,0x18,0x18,0x00,0x00,0x00,0x00,0x00},
-    /* 0x7D } */
+     
     {0x00,0x70,0x18,0x18,0x18,0x0E,0x18,0x18,0x18,0x18,0x70,0x00,0x00,0x00,0x00,0x00},
-    /* 0x7E ~ */
+     
     {0x00,0x76,0xDC,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
-    /* 0x7F DEL (заглушка) */
+     
     {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00},
 };
 
-/* =========================================================================
- * Внутреннее состояние драйвера
- * ========================================================================= */
+ 
+
+
 typedef struct {
     int      mode;
     uint32_t width;
@@ -249,18 +242,18 @@ typedef struct {
     uint8_t  bpp;
     uint8_t  bytes_pp;
 
-    /* "Родное" разрешение, выставленное загрузчиком при старте (GOP-режим
-     * менять на лету нельзя — UEFI Boot Services уже завершены). width/
-     * height выше — ТЕКУЩЕЕ логическое разрешение рабочего стола, может
-     * быть меньше native_* (см. fb_apply_virtual_resolution ниже —
-     * используется из "Desktop settings" -> Display). native_* задаются
-     * ровно один раз в fb_init и больше не меняются. */
+     
+
+
+
+
+
     uint32_t native_width;
     uint32_t native_height;
 
     uint8_t *front;
     uint8_t *back;
-    uint64_t phys_addr;   /* физический адрес front-буфера (для sys_get_framebuffer) */
+    uint64_t phys_addr;    
 
     uint8_t  r_shift;
     uint8_t  g_shift;
@@ -289,9 +282,9 @@ static inline uint8_t *draw_buf(void) {
     return g_fb.back ? g_fb.back : g_fb.front;
 }
 
-/* =========================================================================
- * fb_init
- * ========================================================================= */
+ 
+
+
 int fb_init(const fb_info_t *info) {
     for (int i = 0; i < (int)sizeof(fb_state_t); i++)
         ((uint8_t *)&g_fb)[i] = 0;
@@ -342,31 +335,31 @@ int      fb_get_mode(void)   { return g_fb.mode; }
 uint32_t fb_width(void)      { return g_fb.width; }
 uint32_t fb_height(void)     { return g_fb.height; }
 
-/* Нужны Syscall.c (sys_get_framebuffer), чтобы отдавать userspace-процессам
- * настоящий GOP linear framebuffer вместо VGA text заглушки. В VGA-режиме
- * (g_fb.mode != FB_MODE_LINEAR) возвращают 0 — Syscall.c сам подставляет
- * VGA fallback (0xB8000, 80x25) в этом случае. */
+ 
+
+
+
 uint64_t fb_phys_addr(void)  { return (g_fb.mode == FB_MODE_LINEAR) ? g_fb.phys_addr : 0; }
 uint32_t fb_pitch(void)      { return (g_fb.mode == FB_MODE_LINEAR) ? g_fb.pitch     : 0; }
 uint8_t  fb_bpp(void)        { return (g_fb.mode == FB_MODE_LINEAR) ? g_fb.bpp       : 0; }
 
-/* Сдвиги R/G/B каналов в "родном" 32-битном пикселе GOP (см.
- * rgb_to_native выше) — берутся из реального EFI_GRAPHICS_PIXEL_FORMAT
- * при инициализации и МОГУТ отличаться между прошивками (BGRA/RGBA/
- * произвольные битовые маски). userspace-приложениям, рисующим прямо в
- * маппленный framebuffer (см. sys_get_framebuffer/sys_win_get_rect в
- * Syscall.c), эти сдвиги нужны, чтобы правильно собрать 32-битный
- * пиксель самим — без них цвета "поплывут" на любой прошивке, где
- * порядок каналов не совпадает с тем, что было при разработке. */
+ 
+
+
+
+
+
+
+
 void fb_get_channel_shifts(uint8_t *r_shift, uint8_t *g_shift, uint8_t *b_shift) {
     if (r_shift) *r_shift = g_fb.r_shift;
     if (g_shift) *g_shift = g_fb.g_shift;
     if (b_shift) *b_shift = g_fb.b_shift;
 }
 
-/* =========================================================================
- * Double-buffering
- * ========================================================================= */
+ 
+
+
 int fb_enable_double_buffer(void) {
     if (g_fb.mode != FB_MODE_LINEAR) return -1;
     if (g_fb.back) return 0;
@@ -375,9 +368,9 @@ int fb_enable_double_buffer(void) {
     g_fb.back = (uint8_t *)kmalloc(size);
     if (!g_fb.back) { DBG_MSG("FB", "double-buffer: kmalloc failed"); return -1; }
 
-    /* Не читаем g_fb.front — физический framebuffer может лежать за пределами
-     * DIRECT_MAP (MMIO-регион, EFI-reserved), чтение оттуда вызовет page fault.
-     * Обнуляем back-buffer: ui_draw_desktop всё равно перерисует весь экран. */
+     
+
+
     memset(g_fb.back, 0, size);
     DBG_MSG("FB", "double-buffer enabled");
     return 0;
@@ -387,20 +380,20 @@ void fb_disable_double_buffer(void) {
     if (g_fb.back) { kfree(g_fb.back); g_fb.back = 0; }
 }
 
-/*
- * memcpy_nt — копирование в MMIO-регион через non-temporal stores (movnti).
- *
- * Обычный memcpy на UC/WC GOP framebuffer работает крайне медленно:
- * процессор не может объединять UC-записи в burst, каждая запись
- * уходит на шину по отдельности. На буфере 4+ МБ это выглядит как
- * зависание на несколько секунд.
- *
- * movnti обходит кэш и пишет напрямую через write-combining буфер:
- * скорость записи вырастает в 10-50× по сравнению с UC memcpy.
- * sfence гарантирует, что все NT-записи видны на шине до возврата.
- *
- * Требования: x86-64 (movnti поддерживается с Pentium 4 / Athlon 64).
- */
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
 static void memcpy_nt(void *dst, const void *src, size_t n) {
     uint64_t       *d = (uint64_t *)dst;
     const uint64_t *s = (const uint64_t *)src;
@@ -415,10 +408,10 @@ static void memcpy_nt(void *dst, const void *src, size_t n) {
         );
     }
 
-    /* sfence: сбрасывает write-combining буфер, делает NT-записи видимыми */
+     
     __asm__ volatile ("sfence" ::: "memory");
 
-    /* Хвост (если pitch*height не кратен 8 байтам) */
+     
     size_t tail = n & 7u;
     if (tail) {
         uint8_t       *db = (uint8_t *)(d + count);
@@ -429,38 +422,38 @@ static void memcpy_nt(void *dst, const void *src, size_t n) {
 
 void fb_flip(void) {
     if (!g_fb.back || !g_fb.front) return;
-    /* NT-stores вместо обычного memcpy: критично для GOP MMIO-региона,
-     * который отображён как UC или WC. Обычный memcpy там в 10-50 раз
-     * медленнее и вызывает зависание при копировании 4+ МБ. */
+     
+
+
     memcpy_nt(g_fb.front, g_fb.back, (size_t)g_fb.pitch * g_fb.height);
 }
 
-/* =========================================================================
- * fb_apply_virtual_resolution — "смена разрешения" рабочего стола
- * (Desktop settings -> Display).
- *
- * Физический GOP-режим (native_width/native_height, pitch) выставляется
- * загрузчиком ДО старта ядра — переключить его на лету нельзя, GOP
- * SetMode доступен только через UEFI Boot Services, которые к этому
- * моменту уже завершены (ExitBootServices). Поэтому здесь меняются
- * ЛОГИЧЕСКИЕ g_fb.width/height, которыми и так ограничены все
- * fb_put_pixel/fb_fill_rect/fb_get_pixel (см. их клиппинг выше по файлу):
- * рабочий стол просто рисуется в меньшей области левого верхнего угла
- * физического экрана, остальная площадь остаётся чёрной. back-буфер уже
- * выделен под native_width×native_height (fb_enable_double_buffer), так
- * что любые width/height <= native_* укладываются в него безопасно —
- * никаких перевыделений не требуется.
- * ========================================================================= */
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 static bool fb_apply_virtual_resolution(uint32_t w, uint32_t h) {
     if (g_fb.mode != FB_MODE_LINEAR) return false;
     if (!w || !h) return false;
     if (w > g_fb.native_width)  w = g_fb.native_width;
     if (h > g_fb.native_height) h = g_fb.native_height;
 
-    /* Сначала стираем ВЕСЬ физический экран, включая область, которая
-     * станет невидимой при уменьшении разрешения — иначе за пределами
-     * новых width/height навсегда останутся старые пиксели (fb_flip
-     * копирует только pitch*height байт, а не весь физический буфер). */
+     
+
+
+
     g_fb.width  = g_fb.native_width;
     g_fb.height = g_fb.native_height;
     fb_clear(FB_BLACK);
@@ -471,25 +464,25 @@ static bool fb_apply_virtual_resolution(uint32_t w, uint32_t h) {
     return true;
 }
 
-/* fb_flip_rect — переносит на экран ТОЛЬКО прямоугольник [x,y,w,h],
- * а не весь кадр целиком.
- *
- * ВАЖНО (баг, из-за которого калькулятор не открывался): ui_tick()
- * вызывал ПОЛНЫЙ fb_flip() КАЖДЫЙ таймерный тик — даже когда реально
- * поменялся только курсор 32x32. Под QEMU без аппаратного ускорения
- * (см. run.sh: -cpu qemu64 без -accel kvm/whpx — чистый TCG) копирование
- * ~8 МБ в VRAM `-vga std` через movnti стоит около 1 СЕКУНДЫ за кадр —
- * при таймере ~100Гц это гарантированно съедает вообще весь процессор:
- * ни один пользовательский поток (включая только что созданный
- * task_wrapper калькулятора) физически не успевал получить ни одного
- * такта между двумя таймерными прерываниями. Отсюда и картина в
- * qemu.log — RIP/RSP заморожены ровно на входе в task_wrapper,
- * тысячи тиков подряд.
- *
- * Решение — переносить в VRAM только реально изменившийся регион
- * (курсор +, раз в секунду, часы), а не весь экран. Полный fb_flip()
- * по-прежнему используется там, где меняется весь стол/окно (клик,
- * перетаскивание — см. вызов в ui_tick() ниже). */
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 void fb_flip_rect(int32_t x, int32_t y, uint32_t w, uint32_t h) {
     if (!g_fb.back || !g_fb.front) return;
     if (w == 0 || h == 0) return;
@@ -510,15 +503,15 @@ void fb_flip_rect(int32_t x, int32_t y, uint32_t w, uint32_t h) {
 
 void *fb_back_ptr(void) { return g_fb.back; }
 
-/* ui_flip_userspace_windows — объявлена здесь как forward declaration,
- * реализация перенесена ниже (после определения UI_MAX_WINDOWS /
- * ui_window_t / g_windows, которые ей нужны). См. определение рядом с
- * g_windows. */
+ 
+
+
+
 void ui_flip_userspace_windows(void);
 
-/* =========================================================================
- * Примитивы рисования
- * ========================================================================= */
+ 
+
+
 
 void fb_put_pixel(int32_t x, int32_t y, fb_color_t color) {
     if (g_fb.mode != FB_MODE_LINEAR) return;
@@ -528,9 +521,9 @@ void fb_put_pixel(int32_t x, int32_t y, fb_color_t color) {
     uint8_t *dst = draw_buf() + (uint64_t)y * g_fb.pitch + (uint64_t)x * g_fb.bytes_pp;
 
     switch (g_fb.bytes_pp) {
-        case 4: dst[3] = (uint8_t)(native >> 24); /* fall through */
-        case 3: dst[2] = (uint8_t)(native >> 16); /* fall through */
-        case 2: dst[1] = (uint8_t)(native >>  8); /* fall through */
+        case 4: dst[3] = (uint8_t)(native >> 24);  
+        case 3: dst[2] = (uint8_t)(native >> 16);  
+        case 2: dst[1] = (uint8_t)(native >>  8);  
         case 1: dst[0] = (uint8_t)(native      ); break;
     }
 }
@@ -542,9 +535,9 @@ fb_color_t fb_get_pixel(int32_t x, int32_t y) {
     const uint8_t *src = draw_buf() + (uint64_t)y * g_fb.pitch + (uint64_t)x * g_fb.bytes_pp;
     uint32_t native = 0;
     switch (g_fb.bytes_pp) {
-        case 4: native |= (uint32_t)src[3] << 24; /* fall through */
-        case 3: native |= (uint32_t)src[2] << 16; /* fall through */
-        case 2: native |= (uint32_t)src[1] <<  8; /* fall through */
+        case 4: native |= (uint32_t)src[3] << 24;  
+        case 3: native |= (uint32_t)src[2] << 16;  
+        case 2: native |= (uint32_t)src[1] <<  8;  
         case 1: native |= (uint32_t)src[0];       break;
     }
     uint8_t r = (uint8_t)((native >> g_fb.r_shift) & 0xFF);
@@ -570,8 +563,8 @@ void fb_hline(int32_t x, int32_t y, uint32_t len, fb_color_t color) {
         for (uint32_t i = 0; i < len; i++) {
             uint8_t *p = row + i * g_fb.bytes_pp;
             switch (g_fb.bytes_pp) {
-                case 3: p[2] = (uint8_t)(native >> 16); /* fall through */
-                case 2: p[1] = (uint8_t)(native >>  8); /* fall through */
+                case 3: p[2] = (uint8_t)(native >> 16);  
+                case 2: p[1] = (uint8_t)(native >>  8);  
                 case 1: p[0] = (uint8_t)(native      ); break;
             }
         }
@@ -644,9 +637,9 @@ void fb_line(int32_t x0, int32_t y0, int32_t x1, int32_t y1, fb_color_t color) {
     }
 }
 
-/* =========================================================================
- * Текст
- * ========================================================================= */
+ 
+
+
 void fb_draw_char(int32_t x, int32_t y, char c, fb_color_t fg, fb_color_t bg) {
     if (g_fb.mode != FB_MODE_LINEAR) return;
 
@@ -678,9 +671,9 @@ int32_t fb_draw_string(int32_t x, int32_t y, const char *str,
     return x;
 }
 
-/* =========================================================================
- * fb_console
- * ========================================================================= */
+ 
+
+
 typedef struct {
     uint32_t   ox, oy;
     uint32_t   ow, oh;
@@ -785,11 +778,11 @@ void fbcon_puts(const char *str) {
     while (*str) fbcon_putc(*str++);
 }
 
-/* =========================================================================
- * UI — Рабочий стол FEXOS
- * ========================================================================= */
+ 
 
-/* ---- CMOS RTC ---- */
+
+
+ 
 static inline uint8_t cmos_read(uint8_t reg) {
     dbg_outb(0x70, reg);
     for (volatile int i = 0; i < 64; i++) (void)dbg_inb(0x80);
@@ -801,13 +794,13 @@ static inline int bcd_to_bin(uint8_t v) {
 }
 
 static void rtc_get_msk(int *out_h, int *out_m, int *out_s) {
-    /* Читаем ss/mm/hh ДВАЖДЫ и сравниваем. Если RTC начинает своё
-     * внутреннее обновление ровно между отдельными inb() (проверка UIP
-     * перед чтением не гарантирует атомарность всех трёх регистров разом),
-     * можно получить "рваный" набор — например старое hh + новое mm.
-     * На следующей секунде показания сами исправляются, что визуально
-     * выглядит как скачок часов сразу на 2 секунды. Двойное чтение с
-     * сверкой убирает эту гонку. */
+     
+
+
+
+
+
+
     uint8_t ss, mm, hh, ss2, mm2, hh2;
     int guard;
     do {
@@ -856,198 +849,216 @@ static void fb_draw_digit2(int32_t x, int32_t y, int val,
     fb_draw_string(x, y, buf, fg, bg);
 }
 
-/* Панель задач — уменьшена (52 -> 38), верхней полоски-бевела нет —
- * заливка панели начинается сразу с panel_y, без отступа. */
-#define TASKBAR_H            38u
-/* Цвет панели задач — раньше был #define-константой; теперь переменная,
- * т.к. меняется при смене темы рабочего стола (см. "Desktop settings"
- * ниже, блок ui_theme_t/apply_theme). */
-static fb_color_t TASKBAR_BG = 0xD4D0C8U;
+ 
 
-/* Кнопка Menu — размер/пропорции как у кнопки "Пуск" в Windows XP.
- * Высота кнопки равна высоте всей панели задач (во всю высоту),
- * закруглена только с правого торца (левый край прижат к краю экрана,
- * как в XP), радиус увеличен для более заметного скругления. */
-#define MENU_BTN_X      0   /* вплотную к левому краю экрана — без зазора */
+#define TASKBAR_H            38u
+ 
+
+
+static fb_color_t TASKBAR_BG = 0xDCC2A0U;
+
+ 
+
+
+
+#define MENU_BTN_X      0    
 #define MENU_BTN_W      94u
 #define MENU_BTN_H      TASKBAR_H
-#define MENU_BTN_RADIUS  16   /* радиус скругления правых углов, px */
-/* Цвет кнопки Menu — тоже переменная (меняется по теме, см. ниже). */
-static fb_color_t MENU_BTN_BG = 0xFFFAA0U;
+#define MENU_BTN_RADIUS  16    
+ 
+static fb_color_t MENU_BTN_BG = 0xFF9F40U;
 #define MENU_BTN_FG     0x202020U
 #define WALLPAPER_COLOR 0x6C9FCEU
 #define CLOCK_FG        0x101010U
 #define CLOCK_BG        TASKBAR_BG
 
-/* =========================================================================
- * Темы рабочего стола ("Desktop settings" — правый клик по пустому месту
- * рабочего стола -> "Desktop settings" -> квадратик с именем темы + кнопка
- * со стрелкой ">" листает темы по кругу: Desert -> Space -> Lines -> Desert.
- *
- * Каждая тема — это: обои (файл в UI/), цвет панели задач, цвет кнопки
- * Menu, цвет кнопок открытых окон на панели задач и цвет заголовка окон
- * ("верхняя рамка" всех окон, см. UI_WIN_TITLEBAR_BG ниже). apply_theme()
- * (объявлена ниже, реализация — рядом с окном "Desktop settings", перед
- * ui_desktop_handle_mouse) применяет всё разом и вызывает полный
- * ui_draw_desktop(), чтобы обои и цвета обновились везде сразу.
- * ========================================================================= */
+ 
+
+
+
+
+
+
+
+
+
+
+
 typedef struct {
-    const char *name;            /* подпись в квадратике настроек */
-    const char *wallpaper_file;  /* имя файла внутри UI/ (без пути) */
+    const char *name;             
+    const char *wallpaper_file;   
     fb_color_t  taskbar_bg;
     fb_color_t  menu_btn_bg;
     fb_color_t  app_btn_bg;
     fb_color_t  win_titlebar_bg;
 } ui_theme_t;
 
-#define UI_THEME_DESERT 0   /* тема по умолчанию — нынешний вид рабочего стола */
+#define UI_THEME_DESERT 0    
 #define UI_THEME_SPACE  1
 #define UI_THEME_LINES  2
 #define UI_THEME_COUNT  3
 
 static const ui_theme_t g_themes[UI_THEME_COUNT] = {
-    /* Desert — как сейчас: жёлтая Menu, серая панель, синий заголовок */
-    { "Desert", "FexoxLightW.png", 0xD4D0C8U, 0xFFFAA0U, 0xECE9D8U, 0x2255AAU },
-    /* Space — синевато-голубая гамма */
+     
+
+    { "Desert", "FexoxLightW.png", 0xDCC2A0U, 0xFF9F40U, 0xECE9D8U, 0xC2661AU },
+     
     { "Space",  "SpaceTheme.png",  0xE4EEF8U, 0x3BA8DEU, 0x3BA8DEU, 0x3BA8DEU },
-    /* Lines — бирюзовая гамма (Menu/кнопки — светло-бирюзовые, заголовок
-     * окон — чуть темнее/насыщеннее, панель задач — светло-бирюзовая) */
+     
+
     { "Lines",  "ThemeLines.png",  0xBEF2EDU, 0x3ED6C4U, 0x3ED6C4U, 0x20B2AAU },
 };
 
 static int g_theme_idx = UI_THEME_DESERT;
-static void apply_theme(int idx);   /* реализация — перед ui_desktop_handle_mouse */
+static void apply_theme(int idx);    
 
-/* =========================================================================
- * Всплывающее меню "Menu" (Пуск) — Shutdown / Reboot
- *
- * Прикреплено вплотную к taskbar (без зазора) и к левому краю кнопки
- * Menu. Панель светло-жёлтая (в цвет кнопки Menu), внутри две растянутые
- * по ширине светлые кнопки; при наведении курсора кнопка под ним
- * подсвечивается жёлтым.
- *
- * ВАЖНО: встроенный шрифт (g_font8x16) содержит только ASCII 0x20–0x7E,
- * кириллицы в нём нет, поэтому подписи — транслит.
- * ========================================================================= */
+ 
+
+
+
+
+
+
+
+
+
+
 #define MENU_POPUP_W        190u
 #define MENU_POPUP_H         98u
-#define MENU_POPUP_GAP        0   /* 0 — панель "прилеплена" вплотную к taskbar */
-#define MENU_POPUP_BG        0xFFFAA0U   /* светло-жёлтый, как кнопка Menu */
-#define MENU_POPUP_BORDER    0xC8B860U   /* тёплая рамка в тон панели */
+#define MENU_POPUP_GAP        0    
+#define MENU_POPUP_BG        0xFFD9A6U    
+#define MENU_POPUP_BORDER    0xC98A4EU    
 #define MENU_ITEM_W          (MENU_POPUP_W - 20u)
 #define MENU_ITEM_H           36u
 #define MENU_ITEM_GAP          8
-#define MENU_ITEM_BG          0xFFFCE8U  /* светлая (почти белая) кнопка */
-#define MENU_ITEM_BG_HOVER    0xFFE066U  /* жёлтая подсветка при наведении */
+#define MENU_ITEM_BG          0xFFF1DCU   
+#define MENU_ITEM_BG_HOVER    0xFFB966U   
 #define MENU_ITEM_FG          0x202020U
 
 static bool       g_menu_open  = false;
-static int        g_menu_hover = -1;      /* -1 нет, 0 = Shutdown, 1 = Reboot */
+static int        g_menu_hover = -1;       
 static uint8_t    g_prev_buttons = 0;
 static fb_color_t *g_menu_saved_bg = NULL;
 
 static void ui_system_shutdown(void);
 static void ui_system_reboot(void);
 
-/* =========================================================================
- * fxapp: иконка на рабочем столе + окно приложения (заглушка)
- *
- * Первое приложение в новом формате .fxapp — "My Computer". Манифест
- * (если есть на диске) — APPS/MyComputer.fxapp, иконка — UI/MyPC.png
- * (или icon-поле манифеста), 64×64. Иконка стоит в правом верхнем углу
- * рабочего стола; при наведении курсора вокруг неё рисуется полупрозрачный
- * фиолетовый квадратик чуть больше самой иконки. Клик открывает окно
- * простого оконного менеджера: заголовок слева (имя из манифеста, по
- * умолчанию "My Computer"), кнопка закрытия (UI/close.png) справа,
- * белое тело окна. Окно можно таскать за заголовок. Содержимое окна
- * пока не реализовано — это только "рама" (см. постановку задачи).
- * ========================================================================= */
+ 
+
+
+
+
+
+
+
+
+
+
+
+
 #define FXAPP_ICON_W          64u
 #define FXAPP_ICON_H          64u
-#define FXAPP_ICON_MARGIN     16   /* отступ от правого и верхнего края экрана */
-#define FXAPP_ICON_HALO_PAD    6   /* насколько подсветка больше самой иконки */
-#define FXAPP_ICON_HALO_COLOR  0x9B59B6U   /* фиолетовый */
-#define FXAPP_ICON_HALO_ALPHA  90U         /* 0..255, непрозрачность подсветки */
+#define FXAPP_ICON_MARGIN     16    
+#define FXAPP_ICON_HALO_PAD    6    
+#define FXAPP_ICON_HALO_COLOR  0x9B59B6U    
+#define FXAPP_ICON_HALO_ALPHA  90U          
 
 #define FXAPP_ICON_FILE_MAXSZ  (256u * 1024u)
 
-#define FXAPP_WIN_CLOSE_SZ     20u    /* размер close.png — общий для всех окон */
-#define FXAPP_WIN_W           420u    /* размер окна "My Computer" — увеличено под
-                                        * сетку иконок дисков/папок/файлов 64x64 (см. ниже) */
-#define FXAPP_WIN_H           360u    /* включая заголовок */
-/* Остальная геометрия/цвета окна теперь общие для ВСЕХ окон —
- * см. UI_WIN_TITLEBAR_H / UI_WIN_CLOSE_SZ / UI_WIN_*_BG в блоке
- * генерического оконного менеджера ниже. */
+#define FXAPP_WIN_CLOSE_SZ     20u     
+#define FXAPP_WIN_W           420u     
 
-static png_image_t g_fxapp_icon_img;              /* MyPC.png (или из манифеста) */
+#define FXAPP_WIN_H           360u     
+ 
+
+
+
+static png_image_t g_fxapp_icon_img;               
 static int          g_fxapp_icon_loaded  = 0;
-static png_image_t g_fxapp_close_img;             /* close.png — общая иконка закрытия для ЛЮБОГО окна */
+static png_image_t g_fxapp_close_img;              
 static int          g_fxapp_close_loaded = 0;
-static png_image_t g_fxapp_expand_img;             /* expand.png — развернуть/восстановить окно */
+static png_image_t g_fxapp_expand_img;              
 static int          g_fxapp_expand_loaded = 0;
-static png_image_t g_fxapp_minimize_img;           /* minimize.png — свернуть окно в панель задач */
+static png_image_t g_fxapp_minimize_img;            
 static int          g_fxapp_minimize_loaded = 0;
 
 static char g_fxapp_title[FXAPP_NAME_MAX] = "My Computer";
 static char g_fxapp_icon_rel[FXAPP_ICON_MAX] = "MyPC.png";
 
-static fb_color_t *g_fxapp_icon_clean_bg = NULL;   /* фон под иконкой+halo */
+static fb_color_t *g_fxapp_icon_clean_bg = NULL;    
 static bool         g_fxapp_icon_hover = false;
 
-/* id окна "My Computer" в генерическом оконном менеджере ниже
- * (UI_WIN_INVALID, пока окно не открыто). Иконка на рабочем столе —
- * единственное, что осталось специфичного для My Computer; само окно
- * и его кнопка на панели задач ведёт общий for-all-apps код. */
-static int g_fxapp_win_id = -1; /* UI_WIN_INVALID */
+ 
 
-/* id окна "Desktop settings" (смена темы) — тот же генерический оконный
- * менеджер, что и у "My Computer" (owner_pid = -1, окно ядра). Реализация
- * theme_win_draw/theme_win_handle_click/ui_open_theme_window — рядом с
- * контекстным меню рабочего стола, перед ui_desktop_handle_mouse. Forward-
- * декларация здесь нужна, т.к. на неё уже ссылаются ui_win_move_ex/
- * ui_win_minimize/ui_win_toggle_maximize ниже (они определены раньше). */
-static int g_theme_win_id = -1; /* UI_WIN_INVALID */
+
+
+static int g_fxapp_win_id = -1;  
+
+ 
+
+
+
+
+
+static int g_theme_win_id = -1;  
 static void theme_win_draw(int win_id);
 
-/* ---- Калькулятор — вторая иконка рабочего стола, НО в отличие от
- * "My Computer" (который просто открывает встроенное окно ядра) это
- * настоящее userspace-приложение: клик по иконке запускает APPS/calc.elf
- * через elf64_spawn (см. calc_icon_click ниже) — тот же путь, каким
- * .fxapp-манифесты запускают себя через fxapp_launch(). Своё окно и
- * рисование в нём калькулятор делает сам через syscall'ы
- * SYS_WIN_CREATE/SYS_WIN_GET_RECT/SYS_GET_FRAMEBUFFER/SYS_INPUT_POLL. */
-static png_image_t g_calc_icon_img;                /* calc.png (или из манифеста) */
+ 
+
+
+
+
+
+
+static png_image_t g_calc_icon_img;                 
 static int          g_calc_icon_loaded = 0;
 static char g_calc_title[FXAPP_NAME_MAX] = "Calculator";
 static char g_calc_icon_rel[FXAPP_ICON_MAX] = "calc.png";
-static char g_calc_elf_path[FXAPP_PATH_MAX] = "/APPS/calc.elf";  /* ВАЖНО: с ведущим
-    слэшем — vfs_open() в этой VFS не резолвит относительные пути без "/"
-    (см. тот же паттерн у cursor.png/UI-иконок: "UI/x" не находится,
-    "/UI/x" — находится; elf64_spawn->vfs_open здесь не делает fallback
-    сам, поэтому путь сразу должен быть абсолютным). */
+static char g_calc_elf_path[FXAPP_PATH_MAX] = "/APPS/calc.elf";   
+
+
+
+
 static fb_color_t *g_calc_icon_clean_bg = NULL;
 static bool         g_calc_icon_hover = false;
-static int32_t      g_calc_running_tid = -1;  /* -1 = сейчас никакого экземпляра не запущено */
-extern bool sched_task_alive(uint32_t tid);   /* Scheduler.c */
+static int32_t      g_calc_running_tid = -1;   
+extern bool sched_task_alive(uint32_t tid);    
 
-/* ---- SysLogs — третья иконка рабочего стола, сразу под калькулятором.
- * Тот же паттерн, что и калькулятор: реальный userspace-процесс
- * (APPS/syslogs.elf), запускается через elf64_spawn, своё окно и
- * содержимое рисует сам через SYS_WIN_CREATE/SYS_WIN_GET_RECT/
- * SYS_GET_FRAMEBUFFER — ядро знает только про иконку на рабочем столе. */
-static png_image_t g_syslogs_icon_img;             /* SysLogs.png (или из манифеста) */
+ 
+
+
+
+
+static png_image_t g_syslogs_icon_img;              
 static int          g_syslogs_icon_loaded = 0;
 static char g_syslogs_title[FXAPP_NAME_MAX] = "System Logs";
 static char g_syslogs_icon_rel[FXAPP_ICON_MAX] = "SysLogs.png";
-static char g_syslogs_elf_path[FXAPP_PATH_MAX] = "/APPS/syslogs.elf";  /* см. комментарий
-    у g_calc_elf_path выше — путь обязан быть абсолютным (с ведущим слэшем) */
+static char g_syslogs_elf_path[FXAPP_PATH_MAX] = "/APPS/syslogs.elf";   
+
 static fb_color_t *g_syslogs_icon_clean_bg = NULL;
 static bool         g_syslogs_icon_hover = false;
-static int32_t      g_syslogs_running_tid = -1;  /* -1 = сейчас никакого экземпляра не запущено */
+static int32_t      g_syslogs_running_tid = -1;   
+
+ 
+
+
+
+
+
+static png_image_t g_browser_icon_img;              
+static int          g_browser_icon_loaded = 0;
+static char g_browser_title[FXAPP_NAME_MAX] = "Browser";
+static char g_browser_icon_rel[FXAPP_ICON_MAX] = "Browser.png";
+static char g_browser_elf_path[FXAPP_PATH_MAX] = "/APPS/browser.elf";   
+
+static fb_color_t *g_browser_icon_clean_bg = NULL;
+static bool         g_browser_icon_hover = false;
+static int32_t      g_browser_running_tid = -1;   
 
 static void icon_rect(int32_t *ix, int32_t *iy);
 static void calc_icon_rect(int32_t *ix, int32_t *iy);
 static void syslogs_icon_rect(int32_t *ix, int32_t *iy);
+static void browser_icon_rect(int32_t *ix, int32_t *iy);
 static void fxapp_ensure_assets_loaded(void);
 static void fxapp_capture_icon_bg(void);
 static void fxapp_draw_icon(bool hovered);
@@ -1055,112 +1066,165 @@ static void calc_capture_icon_bg(void);
 static void calc_draw_icon(bool hovered);
 static void syslogs_capture_icon_bg(void);
 static void syslogs_draw_icon(bool hovered);
+static void browser_draw_icon(bool hovered);
 
-/* =========================================================================
- * Генерический оконный менеджер — см. Framebuffer.h: ui_win_create/
- * ui_win_close/ui_win_move. Используется и внутренним кодом ядра (иконка
- * My Computer ниже), и системными вызовами SYS_WIN_CREATE/CLOSE/MOVE
- * из Syscall.c — то есть настоящими userspace-приложениями. Один и тот
- * же код рисования окна и кнопки на панели задач для ВСЕХ приложений.
- * ========================================================================= */
+ 
+
+
+
+
+
+
 #define UI_MAX_WINDOWS        8u
 
 #define UI_WIN_TITLEBAR_H     28u
 #define UI_WIN_CLOSE_SZ       20u
 #define UI_WIN_EXPAND_SZ      20u
 #define UI_WIN_MIN_SZ         20u
-#define UI_WIN_BTN_GAP         4u   /* зазор между кнопками close/expand/minimize */
-/* Цвет заголовка ("верхней рамки") окон — переменная, меняется по теме. */
-static fb_color_t UI_WIN_TITLEBAR_BG = 0x2255AAU;
+#define UI_WIN_BTN_GAP         4u    
+ 
+static fb_color_t UI_WIN_TITLEBAR_BG = 0xC2661AU;
 #define UI_WIN_TITLEBAR_FG    FB_WHITE
 #define UI_WIN_BODY_BG        FB_WHITE
 #define UI_WIN_BORDER         0x404040U
 
-/* Кнопки открытых окон на панели задач — справа от кнопки Menu,
- * отделены от неё небольшим зазором. */
-#define TASKBAR_APP_BTN_GAP        8u    /* зазор между Menu и первой кнопкой,
-                                           * и между соседними кнопками     */
-#define TASKBAR_APP_BTN_W         140u   /* "квадратик", расширенный по ширине */
+ 
+
+#define TASKBAR_APP_BTN_GAP        8u     
+
+#define TASKBAR_APP_BTN_W         140u    
 #define TASKBAR_APP_BTN_H         (MENU_BTN_H)
-/* Цвет "квадратиков" открытых приложений на панели задач — переменная,
- * меняется по теме вместе с MENU_BTN_BG. */
+ 
+
 static fb_color_t TASKBAR_APP_BTN_BG = 0xECE9D8U;
 #define TASKBAR_APP_BTN_FG        0x202020U
 #define TASKBAR_APP_BTN_TEXT_PAD   8
 
 typedef struct {
-    bool     used;          /* слот занят */
-    bool     open;          /* окно сейчас видимо */
+    bool     used;           
+    bool     open;           
     char     title[UI_WIN_TITLE_MAX];
-    uint32_t w, h;           /* размер тела+заголовка окна */
+    uint32_t w, h;            
     int32_t  x, y;
-    int32_t  owner_pid;      /* -1 = встроенное окно ядра */
+    int32_t  owner_pid;       
 
-    uint8_t    *saved_bg;    /* фон под окном (сырые байты кадра), для переноса при drag */
-    uint8_t    *content_bak; /* СВОИ пиксели окна (рамка+тело как есть на
-                               * экране) — захватываются перед перемещением
-                               * и переносятся на новое место как картинка,
-                               * вместо стирания тела в белый и ожидания,
-                               * пока приложение (кооперативно!) не
-                               * перерисуется само. См. ui_win_move_ex. */
+    uint8_t    *saved_bg;     
+    uint8_t    *content_bak;  
+
+
+
+
+
     bool        dragging;
     int32_t     drag_off_x, drag_off_y;
 
-    bool        minimized;   /* окно скрыто с экрана, но живо (см. кнопку
-                               * на панели задач) — used/open НЕ трогаем,
-                               * иначе кнопка тоже пропадёт с панели */
-    bool        maximized;   /* развёрнуто на весь экран (кроме панели
-                               * задач); rest_* — геометрия для возврата */
+    bool        minimized;    
+
+
+    bool        maximized;    
+
     int32_t     rest_x, rest_y;
     uint32_t    rest_w, rest_h;
 
-    /* redraw_gen — счётчик "содержимое инвалидировано, перерисуйся".
-     * Растёт только там, где кернел меняет ГЕОМЕТРИЮ окна и поэтому не
-     * может честно перенести старые пиксели содержимого как есть (см.
-     * ui_win_toggle_maximize) — drag и minimize/restore сюда не входят,
-     * там геометрия не меняется (или кернел сам переносит content_bak
-     * как картинку, см. ui_win_capture/ui_win_blit_captured) — для
-     * userspace-приложений (calc.c и т.п.) это единственный способ
-     * узнать "меня развернули/свернули на весь экран, перерисуй себя
-     * под новый размер" — см. sys_win_get_rect (Syscall.c/Syscall.h). */
+     
+
+
+
+
+
+
+
+
     uint32_t    redraw_gen;
 } ui_window_t;
 
 static ui_window_t g_windows[UI_MAX_WINDOWS];
 
-/* ui_flip_userspace_windows — переносит в VRAM тело КАЖДОГО открытого
- * окна, которым владеет независимый userspace-процесс (owner_pid >= 0,
- * т.е. запущен через elf64_spawn + SYS_WIN_CREATE, как calc.c — см.
- * ui_win_create() ниже).
- *
- * ПОЧЕМУ ЭТО НУЖНО (баг "калькулятор открывается с белым фоном, кнопки
- * проявляются только под курсором"): такие окна рисуют пиксели прямо в
- * back-buffer САМИ, асинхронно, в СВОЁМ потоке — приложение получает
- * через SYS_GET_FRAMEBUFFER указатель на back-buffer и пишет пиксели
- * через put_px() (calc.c), но никакого "я перерисовался, перенеси меня
- * на экран" события ядро от него не получает (такого syscall'а просто
- * нет). До сих пор перенос back->front для таких окон происходил
- * СЛУЧАЙНО:
- *  - либо через частичный fb_flip_rect() под курсором (ui_tick) — тогда
- *    видна только та часть, по которой физически прошёл курсор,
- *  - либо через полный fb_flip() на "big change" (клик/drag), но только
- *    если он успевает произойти ПОСЛЕ того, как поток calc.c реально
- *    получил время на планировщике и дорисовал кнопки — иначе окно так
- *    и остаётся с пустым (белым, см. UI_WIN_BODY_BG) телом, нарисованным
- *    в ui_win_draw() при создании окна.
- *
- * Решение — не гадать, когда приложение перерисовалось, а на КАЖДОМ
- * таймерном тике безусловно копировать в VRAM ровно прямоугольник
- * каждого такого окна. Это дёшево даже под TCG QEMU (см. комментарий у
- * fb_flip_rect выше про полный fb_flip() ценой ~1с) — копируется
- * маленькая область размером с окно, а не весь экран, поэтому не
- * воспроизводит проблему "зависаний", ради которой когда-то убрали
- * безусловный fb_flip() каждый тик. */
+ 
+
+
+
+
+
+
+
+
+
+static int g_focus_win = -1;
+
+static void ui_focus_set(int id) {
+    if (id == g_focus_win) return;
+    DBG_VAL("FOCUS", "focus win id (0xFFFF.. = none)", (uint64_t)(int64_t)id);    
+    g_focus_win = id;
+    usb_hid_kbd_flush();    
+}
+
+ 
+
+static void ui_focus_release(int id) {
+    if (g_focus_win != id) return;
+    int next = -1;
+    for (int i = (int)UI_MAX_WINDOWS - 1; i >= 0; i--) {
+        if (i == id) continue;
+        const ui_window_t *w = &g_windows[i];
+        if (!w->used || !w->open || w->minimized) continue;
+        next = i; break;
+    }
+    g_focus_win = next;
+    usb_hid_kbd_flush();
+}
+
+ 
+int ui_kbd_dbg_focus(int32_t *owner, int *minimized) {
+    if (owner) *owner = -99;
+    if (minimized) *minimized = 0;
+    if (g_focus_win < 0 || g_focus_win >= (int)UI_MAX_WINDOWS) return -1;
+    const ui_window_t *w = &g_windows[g_focus_win];
+    if (owner) *owner = (w->used && w->open) ? w->owner_pid : -98;
+    if (minimized) *minimized = w->minimized;
+    return g_focus_win;
+}
+
+ 
+bool ui_kbd_focus_owned_by(int32_t pid) {
+    if (pid <= 0 || g_focus_win < 0 || g_focus_win >= (int)UI_MAX_WINDOWS) return false;
+    const ui_window_t *w = &g_windows[g_focus_win];
+    return w->used && w->open && !w->minimized && w->owner_pid == pid;
+}
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 void ui_flip_userspace_windows(void) {
     for (int i = 0; i < (int)UI_MAX_WINDOWS; i++) {
         ui_window_t *win = &g_windows[i];
         if (!win->used || !win->open || win->minimized) continue;
-        if (win->owner_pid < 0) continue; /* окна ядра сами делают fb_flip() при своих изменениях */
+        if (win->owner_pid < 0) continue;  
         fb_flip_rect(win->x, win->y, win->w, win->h);
     }
 }
@@ -1169,10 +1233,10 @@ static void ui_win_draw(int id);
 static void ui_win_save_bg(int id, int32_t wx, int32_t wy);
 static void ui_win_restore_bg(int id, int32_t wx, int32_t wy);
 
-/* Координаты трёх кнопок заголовка — close (крайняя справа), expand
- * (левее close), minimize (левее expand). Общая функция для отрисовки
- * (ui_win_draw) и обработки кликов (ui_desktop_handle_mouse), чтобы
- * геометрия не могла разъехаться между рисованием и хит-тестом. */
+ 
+
+
+
 static void ui_win_btn_rects(const ui_window_t *win,
                              int32_t *close_x, int32_t *close_y,
                              int32_t *expand_x, int32_t *expand_y,
@@ -1191,28 +1255,28 @@ static void ui_taskbar_draw_app_buttons(int32_t panel_y);
 static void ui_taskbar_app_btn_rect(int slot_idx, int32_t panel_y,
                                     int32_t *bx, int32_t *by, uint32_t *bw, uint32_t *bh);
 
-/* =========================================================================
- * VFS
- *
- * Файловый браузер окна "My Computer" (см. ниже) читает директории и
- * список смонтированных дисков, поэтому вместо точечных extern-объявлений
- * подключаем VFS.h целиком — там же vfs_dirent_t/VFS_TYPE_DIR/O_DIRECTORY
- * и новые vfs_mount_count()/vfs_mount_info().
- * ========================================================================= */
+ 
+
+
+
+
+
+
+
 #include "VFS.h"
 
-/* ELF64.c — нужен только для запуска калькулятора (elf64_spawn), см.
- * calc_icon_rect/g_calc_* блок выше. */
+ 
+
 extern int elf64_spawn(const char *path, const char *name, int prio);
 
-/* См. fm_reset()/fm_handle_click() ниже: блокирующая загрузка с диска
- * (иконки + перечисление дисков/директорий) должна быть неделима
- * относительно таймерного прерывания. Флага g_fm_busy одного
- * недостаточно — он лишь отбрасывает постфактум уже случившийся
- * вложенный вызов, но пока interrupts включены, такой вложенный вызов
- * всё равно происходит (и в лучшем случае просто игнорируется, а
- * fm_draw() после него всё равно рисует ещё не заполненное состояние).
- * cli()/sti() гарантируют, что таймер физически не прервёт весь блок. */
+ 
+
+
+
+
+
+
+
 static inline uint64_t fm_io_cli(void) {
     uint64_t flags;
     __asm__ volatile ("pushfq; pop %0; cli" : "=r"(flags) :: "memory");
@@ -1226,35 +1290,46 @@ static inline void fm_io_sti(uint64_t flags) {
 #  define UI_O_RDONLY O_RDONLY
 #endif
 
-/* =========================================================================
- * ui_load_wallpaper — загружает UI/FexosLightW.png через png_decode.
- *
- * PNG должен быть 8-bit RGB или RGBA, non-interlaced.
- * Если файл не найден или декодирование провалилось — возвращает false,
- * и вызывающий код нальёт fallback-цвет (#6C9FCE).
- * ========================================================================= */
-#define WALLPAPER_PNG_MAXSZ (16u * 1024u * 1024u)   /* 16 МБ */
+ 
+
+
+
+
+
+
+#define WALLPAPER_PNG_MAXSZ (16u * 1024u * 1024u)    
+
+ 
+
+
+
+
+volatile int32_t fexox_os_dbg_wp_reason  = 0;
+volatile int32_t fexox_os_dbg_wp_rc      = 0;
+volatile int32_t fexox_os_dbg_spawn_rc   = 0;
 
 static bool ui_load_wallpaper(uint32_t taskbar_y) {
     if (g_fb.mode != FB_MODE_LINEAR) return false;
 
-    /* Открываем файл — имя берём из текущей темы (g_themes[g_theme_idx]),
-     * тот же паттерн "UI/<n>" / "/UI/<n>", что и у fxapp_load_png_asset. */
+     
+
     char path_a[96] = "UI/";
     char path_b[96] = "/UI/";
     strncat(path_a, g_themes[g_theme_idx].wallpaper_file, sizeof(path_a) - 4);
     strncat(path_b, g_themes[g_theme_idx].wallpaper_file, sizeof(path_b) - 5);
 
+    fexox_os_dbg_wp_reason = 0; fexox_os_dbg_wp_rc = 0;
     int fd = vfs_open(path_a, UI_O_RDONLY);
     if (fd < 0) fd = vfs_open(path_b, UI_O_RDONLY);
     if (fd < 0) {
         DBG_MSG("UI", "wallpaper PNG not found");
+        fexox_os_dbg_wp_reason = 1; fexox_os_dbg_wp_rc = fd;
         return false;
     }
 
-    /* Читаем весь файл в буфер */
+     
     uint8_t *png_buf = (uint8_t *)kmalloc(WALLPAPER_PNG_MAXSZ);
-    if (!png_buf) { vfs_close(fd); return false; }
+    if (!png_buf) { vfs_close(fd); fexox_os_dbg_wp_reason = 2; return false; }
 
     size_t total = 0;
     for (;;) {
@@ -1269,35 +1344,37 @@ static bool ui_load_wallpaper(uint32_t taskbar_y) {
     if (total < 8) {
         DBG_MSG("UI", "wallpaper: file too small");
         kfree(png_buf);
+        fexox_os_dbg_wp_reason = 3; fexox_os_dbg_wp_rc = (int32_t)total;
         return false;
     }
 
-    /* Декодируем PNG */
+     
     png_image_t img;
     int rc = png_decode(png_buf, total, &img);
     kfree(png_buf);
 
     if (rc != PNG_OK) {
         DBG_VAL("UI", "wallpaper PNG decode failed rc", (uint64_t)(int64_t)rc);
+        fexox_os_dbg_wp_reason = 4; fexox_os_dbg_wp_rc = rc;
         return false;
     }
 
     DBG_VAL("UI", "wallpaper w", img.width);
     DBG_VAL("UI", "wallpaper h", img.height);
 
-    /* Масштабирование обоев под размер экрана (taskbar_y x g_fb.width).
-     * Используем целочисленный билинейный метод (nearest-neighbour достаточно
-     * для обоев и не требует умножения с плавающей точкой — freestanding).
-     *
-     * Для каждого пикселя экрана (dx, dy) вычисляем соответствующий пиксель
-     * источника через fixed-point: src_x = dx * img.width / fb_width,
-     * аналогично по Y. Это stretch-to-fill без сохранения пропорций.
-     * Если нужно сохранить пропорции — добавить letterbox/pillarbox. */
+     
+
+
+
+
+
+
+
     uint32_t dst_w = g_fb.width;
-    uint32_t dst_h = taskbar_y;   /* область выше taskbar */
+    uint32_t dst_h = taskbar_y;    
 
     for (uint32_t dy = 0; dy < dst_h; dy++) {
-        /* src_y: маппинг dy -> строка в img (fixed-point, избегаем деления в цикле x) */
+         
         uint32_t sy = (uint32_t)((uint64_t)dy * img.height / dst_h);
         if (sy >= img.height) sy = img.height - 1;
 
@@ -1320,8 +1397,8 @@ static bool ui_load_wallpaper(uint32_t taskbar_y) {
                 uint32_t native = rgb_to_native(fb_rgb(px[0], px[1], px[2]));
                 uint8_t *p = dst_row + (uint64_t)dx * g_fb.bytes_pp;
                 switch (g_fb.bytes_pp) {
-                    case 3: p[2] = (uint8_t)(native >> 16); /* fall */
-                    case 2: p[1] = (uint8_t)(native >>  8); /* fall */
+                    case 3: p[2] = (uint8_t)(native >> 16);  
+                    case 2: p[1] = (uint8_t)(native >>  8);  
                     case 1: p[0] = (uint8_t)(native      ); break;
                 }
             }
@@ -1332,9 +1409,9 @@ static bool ui_load_wallpaper(uint32_t taskbar_y) {
     return (dst_h > 0);
 }
 
-/* =========================================================================
- * ui_draw_taskbar_clock
- * ========================================================================= */
+ 
+
+
 static void ui_draw_taskbar_clock(int32_t panel_y) {
     int hh, mm, ss;
     rtc_get_msk(&hh, &mm, &ss);
@@ -1350,11 +1427,11 @@ static void ui_draw_taskbar_clock(int32_t panel_y) {
     fb_draw_digit2(cx + 16 + 8 + 24, cy, ss, CLOCK_FG, CLOCK_BG);
 }
 
-/* fb_flip_clock_area — переносит в VRAM только полосу часов на taskbar.
- * Вызывается из ui_tick() (ui_extra.c) когда ui_clock_tick() вернул 1
- * (секунда действительно сменилась). Геометрия (TASKBAR_H и т.п.)
- * приватна для этого файла, поэтому обёрнута в отдельную функцию, а не
- * задублирована в ui_extra.c. */
+ 
+
+
+
+
 void fb_flip_clock_area(void) {
     uint32_t panel_y = (g_fb.height >= TASKBAR_H) ? g_fb.height - TASKBAR_H : 0;
     fb_flip_rect(0, (int32_t)panel_y, g_fb.width, TASKBAR_H);
@@ -1373,17 +1450,17 @@ void ui_redraw_clock(void) {
     fb_flip();
 }
 
-/* ui_clock_tick — вызывать КАЖДЫЙ таймерный тик (не раз в UI_TICK_HZ
- * тиков, как раньше). Раньше часы перерисовывались по счётчику "прошло
- * 100 тиков" — но во время блокирующего чтения диска (см. fm_reset()/
- * fm_handle_click() в "My Computer", там теперь весь I/O под cli())
- * таймер физически не тикает, счётчик отстаёт от реального времени.
- * Когда cli() снимается, RTC уже показывает актуальное (ушедшее вперёд)
- * время — на экране это выглядело как "часы замерли, потом скакнули
- * на несколько секунд". Читаем реальное текущее значение RTC каждый
- * тик и перерисовываем ТОЛЬКО когда секунда действительно изменилась —
- * так экран всегда синхронен с настоящим временем независимо от того,
- * сколько тиков было физически потеряно. */
+ 
+
+
+
+
+
+
+
+
+
+
 int ui_clock_tick(void) {
     if (g_fb.mode != FB_MODE_LINEAR) return 0;
     if (!g_fb.width || !g_fb.height) return 0;
@@ -1401,13 +1478,13 @@ int ui_clock_tick(void) {
 
     fb_fill_rect(cx, (int32_t)panel_y, (uint32_t)cw + 8, TASKBAR_H, CLOCK_BG);
     ui_draw_taskbar_clock((int32_t)panel_y);
-    /* fb_flip()/fb_flip_rect() не нужен — вызывающий ui_tick() и так
-     * переносит область часов в VRAM сам, увидев, что мы вернули 1. */
+     
+
     return 1;
 }
 
-/* Целочисленный квадратный корень (метод Ньютона) — нет плавающей точки
- * во freestanding-ядре, а стандартный <math.h> недоступен. */
+ 
+
 static uint32_t isqrt32(uint32_t n) {
     if (n == 0) return 0;
     uint32_t x = n, y = (x + 1) / 2;
@@ -1415,44 +1492,44 @@ static uint32_t isqrt32(uint32_t n) {
     return x;
 }
 
-/* Закруглить два ПРАВЫХ угла прямоугольника (bx,by,bw,bh), "стирая"
- * уголки поверх уже нарисованной кнопки цветом фона панели задач bg_under.
- * Простой целочисленный approximation четверти окружности радиуса r —
- * для маленьких r (4-8px) на низком разрешении выглядит вполне гладко
- * и не требует плавающей точки (freestanding-ядро). Левые углы кнопки
- * остаются прямыми — она прижата к левому краю экрана, как в Windows XP. */
+ 
+
+
+
+
+
 static void fb_round_right_corners(int32_t bx, int32_t by, uint32_t bw, uint32_t bh,
                                    int32_t r, fb_color_t bg_under) {
     if (r <= 0) return;
-    int32_t rx = bx + (int32_t)bw - r;   /* левая граница закруглённой зоны */
+    int32_t rx = bx + (int32_t)bw - r;    
 
     for (int32_t row = 0; row < r; row++) {
-        /* сколько пикселей "срезать" в этой строке для четверти круга */
+         
         int32_t dy = r - 1 - row;
         int32_t cut = r - (int32_t)isqrt32((uint32_t)(r * r - dy * dy));
         if (cut < 0) cut = 0;
         if (cut > r) cut = r;
 
-        /* верхний угол */
+         
         fb_hline(rx + (r - cut), by + row, (uint32_t)cut, bg_under);
-        /* нижний угол (зеркально) */
+         
         fb_hline(rx + (r - cut), by + (int32_t)bh - 1 - row, (uint32_t)cut, bg_under);
     }
 }
 
-/* =========================================================================
- * ui_draw_menu_button
- * ========================================================================= */
+ 
+
+
 static void ui_draw_menu_button(int32_t panel_y) {
     int32_t bx = MENU_BTN_X;
-    int32_t by = panel_y;   /* кнопка во всю высоту панели задач */
+    int32_t by = panel_y;    
     uint32_t bw = MENU_BTN_W;
     uint32_t bh = MENU_BTN_H;
 
     fb_fill_rect(bx, by, bw, bh, MENU_BTN_BG);
 
-    /* Скругление правого торца (в цвет панели задач, под которой рисуется
-     * кнопка) — без тёмной рамки-бевела, плоский стиль. */
+     
+
     fb_round_right_corners(bx, by, bw, bh, MENU_BTN_RADIUS, TASKBAR_BG);
 
     int32_t tx = bx + (int32_t)(bw / 2u) - (int32_t)(4u * FB_FONT_W / 2u);
@@ -1460,9 +1537,9 @@ static void ui_draw_menu_button(int32_t panel_y) {
     fb_draw_string(tx, ty, "Menu", MENU_BTN_FG, MENU_BTN_BG);
 }
 
-/* =========================================================================
- * Всплывающее меню — геометрия, сохранение фона, отрисовка, клики
- * ========================================================================= */
+ 
+
+
 static void menu_popup_rect(int32_t panel_y, int32_t *mx, int32_t *my) {
     *mx = MENU_BTN_X;
     *my = panel_y - (int32_t)MENU_POPUP_H - MENU_POPUP_GAP;
@@ -1507,7 +1584,7 @@ static void ui_draw_start_menu(int32_t panel_y) {
     int32_t mx, my;
     menu_popup_rect(panel_y, &mx, &my);
 
-    /* Панель: белая с лёгким серо-жёлтым оттенком + серая рамка */
+     
     fb_fill_rect(mx, my, MENU_POPUP_W, MENU_POPUP_H, MENU_POPUP_BG);
     fb_draw_rect(mx, my, MENU_POPUP_W, MENU_POPUP_H, MENU_POPUP_BORDER, 1);
 
@@ -1530,24 +1607,24 @@ static void ui_draw_start_menu(int32_t panel_y) {
     fb_flip();
 }
 
-/* =========================================================================
- * fxapp: вспомогательные функции — позиция иконки, альфа-блендинг,
- * загрузка PNG-ассетов, сохранение/восстановление фона.
- * ========================================================================= */
+ 
+
+
+
 
 static inline uint8_t fxapp_blend_chan(uint8_t src, uint8_t dst, uint8_t a) {
     return (uint8_t)(((uint32_t)src * a + (uint32_t)dst * (255 - a)) / 255);
 }
 
-/* Позиция левого верхнего угла иконки — правый верхний угол экрана */
+ 
 static void icon_rect(int32_t *ix, int32_t *iy) {
     *ix = (int32_t)g_fb.width - FXAPP_ICON_MARGIN - (int32_t)FXAPP_ICON_W;
     *iy = FXAPP_ICON_MARGIN;
 }
 
-/* Калькулятор — иконка "рядом с MyPC": тот же X (правый край), но ниже —
- * под иконкой MyPC вместе с её halo и подписью (halo снизу занимает
- * FXAPP_ICON_HALO_PAD, подпись — ещё ~4+16px, берём запас в 40px). */
+ 
+
+
 static void calc_icon_rect(int32_t *ix, int32_t *iy) {
     int32_t mx, my;
     icon_rect(&mx, &my);
@@ -1555,8 +1632,8 @@ static void calc_icon_rect(int32_t *ix, int32_t *iy) {
     *iy = my + (int32_t)FXAPP_ICON_H + 40;
 }
 
-/* SysLogs — та же логика, ещё на один "слот" (иконка + halo + подпись,
- * 40px) ниже калькулятора. */
+ 
+
 static void syslogs_icon_rect(int32_t *ix, int32_t *iy) {
     int32_t cx, cy;
     calc_icon_rect(&cx, &cy);
@@ -1564,11 +1641,19 @@ static void syslogs_icon_rect(int32_t *ix, int32_t *iy) {
     *iy = cy + (int32_t)FXAPP_ICON_H + 40;
 }
 
-/* Проверка: находится ли точка (x,y) над одной из иконок рабочего стола
- * (My Computer/Calculator/SysLogs), включая область подсветки (halo).
- * Нужна, чтобы правый клик ПО ИКОНКЕ не открывал контекстное меню рабочего
- * стола ("Desktop settings" — см. ui_desktop_handle_mouse ниже): по
- * условию задачи меню должно всплывать только при клике мимо приложений. */
+ 
+static void browser_icon_rect(int32_t *ix, int32_t *iy) {
+    int32_t sx, sy;
+    syslogs_icon_rect(&sx, &sy);
+    *ix = sx;
+    *iy = sy + (int32_t)FXAPP_ICON_H + 40;
+}
+
+ 
+
+
+
+
 static bool ui_point_over_any_desktop_icon(int32_t x, int32_t y) {
     int32_t icx, icy;
 
@@ -1593,11 +1678,18 @@ static bool ui_point_over_any_desktop_icon(int32_t x, int32_t y) {
                        FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD))
         return true;
 
+    browser_icon_rect(&icx, &icy);
+    if (point_in_rect(x, y,
+                       icx - FXAPP_ICON_HALO_PAD, icy - FXAPP_ICON_HALO_PAD,
+                       FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD,
+                       FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD))
+        return true;
+
     return false;
 }
 
-/* Отрисовать декодированный PNG (RGBA) с альфа-блендингом по фону экрана.
- * Общая функция для иконки на рабочем столе и кнопки close.png. */
+ 
+
 static void fxapp_blit_png(int32_t x, int32_t y, const png_image_t *img) {
     uint32_t w = img->width, h = img->height;
     for (uint32_t row = 0; row < h; row++) {
@@ -1624,8 +1716,8 @@ static void fxapp_blit_png(int32_t x, int32_t y, const png_image_t *img) {
     }
 }
 
-/* Загрузить PNG размером не больше max_w×max_h из UI/<name> (или /UI/<name>).
- * Возвращает true и заполняет *out при успехе. */
+ 
+
 static bool fxapp_load_png_asset(const char *rel_name, uint32_t max_w, uint32_t max_h,
                                   png_image_t *out) {
     char path_a[FXAPP_PATH_MAX] = "UI/";
@@ -1636,7 +1728,7 @@ static bool fxapp_load_png_asset(const char *rel_name, uint32_t max_w, uint32_t 
     int fd = vfs_open(path_a, UI_O_RDONLY);
     if (fd < 0) fd = vfs_open(path_b, UI_O_RDONLY);
     if (fd < 0) {
-        DBG_MSG("FXA", "icon asset not found");
+        dbg_puts("[FXA] icon asset not found: "); dbg_puts(rel_name); dbg_puts("\n");
         return false;
     }
 
@@ -1653,7 +1745,7 @@ static bool fxapp_load_png_asset(const char *rel_name, uint32_t max_w, uint32_t 
     vfs_close(fd);
 
     if (total < 8 || buf[0] != 0x89 || buf[1] != 'P' || buf[2] != 'N' || buf[3] != 'G') {
-        DBG_MSG("FXA", "icon asset: not a PNG");
+        dbg_puts("[FXA] icon asset: not a PNG: "); dbg_puts(rel_name); dbg_puts("\n");
         kfree(buf);
         return false;
     }
@@ -1674,11 +1766,11 @@ static bool fxapp_load_png_asset(const char *rel_name, uint32_t max_w, uint32_t 
     return true;
 }
 
-/* Загрузить манифест APPS/MyComputer.fxapp (если он есть) — берём оттуда
- * имя окна и имя файла иконки; если манифеста нет, остаются значения
- * по умолчанию ("My Computer" / "MyPC.png"), заданные при инициализации
- * статических переменных. Сами PNG-ассеты (иконка + close.png)
- * загружаются один раз при первой отрисовке рабочего стола. */
+ 
+
+
+
+
 static void fxapp_ensure_assets_loaded(void) {
     static bool tried = false;
     if (tried) return;
@@ -1712,10 +1804,10 @@ static void fxapp_ensure_assets_loaded(void) {
     if (fxapp_load_png_asset("minimize.png", UI_WIN_MIN_SZ, UI_WIN_MIN_SZ, &g_fxapp_minimize_img))
         g_fxapp_minimize_loaded = 1;
 
-    /* Калькулятор — манифест необязателен (как и у My Computer): если
-     * APPS/Calculator.fxapp есть на диске, берём оттуда имя/иконку/путь
-     * к ELF; если нет — используются значения по умолчанию, заданные
-     * при инициализации g_calc_* выше. */
+     
+
+
+
     fxapp_t capp;
     if (fxapp_load("APPS/Calculator.fxapp", &capp) == 0 ||
         fxapp_load("/APPS/Calculator.fxapp", &capp) == 0) {
@@ -1734,9 +1826,9 @@ static void fxapp_ensure_assets_loaded(void) {
     if (fxapp_load_png_asset(g_calc_icon_rel, FXAPP_ICON_W, FXAPP_ICON_H, &g_calc_icon_img))
         g_calc_icon_loaded = 1;
 
-    /* SysLogs — та же схема: манифест необязателен, дефолты заданы у
-     * g_syslogs_* выше (имя "System Logs", иконка "SysLogs.png", ELF
-     * "/APPS/syslogs.elf"). */
+     
+
+
     fxapp_t lapp;
     if (fxapp_load("APPS/SysLogs.fxapp", &lapp) == 0 ||
         fxapp_load("/APPS/SysLogs.fxapp", &lapp) == 0) {
@@ -1754,14 +1846,35 @@ static void fxapp_ensure_assets_loaded(void) {
     g_syslogs_icon_img.pixels = NULL;
     if (fxapp_load_png_asset(g_syslogs_icon_rel, FXAPP_ICON_W, FXAPP_ICON_H, &g_syslogs_icon_img))
         g_syslogs_icon_loaded = 1;
+
+     
+
+
+    fxapp_t bapp;
+    if (fxapp_load("APPS/Browser.fxapp", &bapp) == 0 ||
+        fxapp_load("/APPS/Browser.fxapp", &bapp) == 0) {
+        if (bapp.header.name[0] != '\0')
+            strlcpy(g_browser_title, bapp.header.name, sizeof(g_browser_title));
+        if (bapp.header.icon[0] != '\0')
+            strlcpy(g_browser_icon_rel, bapp.header.icon, sizeof(g_browser_icon_rel));
+        if (bapp.header.elf_path[0] != '\0')
+            strlcpy(g_browser_elf_path, bapp.header.elf_path, sizeof(g_browser_elf_path));
+        DBG_MSG("FXA", "Browser.fxapp manifest loaded");
+    } else {
+        DBG_MSG("FXA", "Browser.fxapp manifest not found, using defaults");
+    }
+
+    g_browser_icon_img.pixels = NULL;
+    if (fxapp_load_png_asset(g_browser_icon_rel, FXAPP_ICON_W, FXAPP_ICON_H, &g_browser_icon_img))
+        g_browser_icon_loaded = 1;
 }
 
-/* Захватить "чистый" фон под иконкой+halo сразу после отрисовки обоев/
- * taskbar — используется, чтобы дёшево перерисовывать иконку при смене
- * hover-состояния, не трогая обои (без повторного декодирования PNG).
- * bg_slot — указатель на per-иконку статический буфер (свой у каждой
- * иконки рабочего стола — MyPC, калькулятор, ...), выделяется лениво
- * при первом вызове. */
+ 
+
+
+
+
+
 static void fxapp_capture_icon_bg_generic(int32_t icx, int32_t icy, fb_color_t **bg_slot) {
     int32_t  hx = icx - FXAPP_ICON_HALO_PAD;
     int32_t  hy = icy - FXAPP_ICON_HALO_PAD;
@@ -1778,11 +1891,11 @@ static void fxapp_capture_icon_bg_generic(int32_t icx, int32_t icy, fb_color_t *
             (*bg_slot)[row * hw + col] = fb_get_pixel(hx + (int32_t)col, hy + (int32_t)row);
 }
 
-/* Нарисовать одну иконку рабочего стола (и, если hovered, полупрозрачный
- * halo вокруг неё) + подпись под ней. Сначала восстанавливает чистый фон,
- * захваченный fxapp_capture_icon_bg_generic(), затем halo (если нужен) и
- * саму иконку (PNG, либо fallback-квадрат с fallback_text, если PNG не
- * загружен) поверх. Не делает fb_flip() — вызывающий код решает сам. */
+ 
+
+
+
+
 static void fxapp_draw_icon_generic(int32_t icx, int32_t icy, fb_color_t *clean_bg,
                                     bool hovered, bool loaded, const png_image_t *img,
                                     const char *fallback_text, const char *label) {
@@ -1821,7 +1934,7 @@ static void fxapp_draw_icon_generic(int32_t icx, int32_t icy, fb_color_t *clean_
     if (loaded && img && img->pixels) {
         fxapp_blit_png(icx, icy, img);
     } else {
-        /* fallback, если соответствующий .png не найден на диске */
+         
         fb_fill_rect(icx, icy, FXAPP_ICON_W, FXAPP_ICON_H, FB_LIGHT_GRAY);
         fb_draw_rect(icx, icy, FXAPP_ICON_W, FXAPP_ICON_H, FB_DARK_GRAY, 2);
         int32_t tw = (int32_t)fb_text_width(fallback_text);
@@ -1830,8 +1943,8 @@ static void fxapp_draw_icon_generic(int32_t icx, int32_t icy, fb_color_t *clean_
                        fallback_text, FB_BLACK, FB_LIGHT_GRAY);
     }
 
-    /* Подпись под иконкой — прозрачный фон (см. FB_TRANSPARENT_BG в
-     * fb_draw_char), чтобы не закрывать обои непрозрачным прямоугольником. */
+     
+
     {
         int32_t lw = (int32_t)fb_text_width(label);
         int32_t lx = icx + (int32_t)((FXAPP_ICON_W - (uint32_t)(lw > 0 ? lw : 0)) / 2);
@@ -1840,7 +1953,7 @@ static void fxapp_draw_icon_generic(int32_t icx, int32_t icy, fb_color_t *clean_
     }
 }
 
-/* ---- MyPC: тонкие обёртки над generic-версиями выше ---- */
+ 
 static void fxapp_capture_icon_bg(void) {
     int32_t icx, icy;
     icon_rect(&icx, &icy);
@@ -1854,7 +1967,7 @@ static void fxapp_draw_icon(bool hovered) {
                             g_fxapp_icon_loaded, &g_fxapp_icon_img, "PC", g_fxapp_title);
 }
 
-/* ---- Калькулятор: тонкие обёртки над generic-версиями выше ---- */
+ 
 static void calc_capture_icon_bg(void) {
     int32_t icx, icy;
     calc_icon_rect(&icx, &icy);
@@ -1868,7 +1981,7 @@ static void calc_draw_icon(bool hovered) {
                             g_calc_icon_loaded, &g_calc_icon_img, "+-", g_calc_title);
 }
 
-/* ---- SysLogs: тонкие обёртки над generic-версиями выше ---- */
+ 
 static void syslogs_capture_icon_bg(void) {
     int32_t icx, icy;
     syslogs_icon_rect(&icx, &icy);
@@ -1882,45 +1995,63 @@ static void syslogs_draw_icon(bool hovered) {
                             g_syslogs_icon_loaded, &g_syslogs_icon_img, "LG", g_syslogs_title);
 }
 
-/* =========================================================================
- * "My Computer" — содержимое окна: список дисков сверху (иконки disk.png,
- * одна на каждую точку монтирования VFS — то есть и на реальные разделы,
- * и на диск, с которого запущен QEMU: он для VFS ничем не отличается от
- * любого другого смонтированного blkdev), а по клику на диск — список
- * папок/файлов внутри (folder.png / file.png), с именем под каждой
- * иконкой. Клик по папке заходит в неё; пункт ".." поднимается наверх,
- * а с корня диска возвращает к списку дисков. Если смотреть не на что —
- * рисуется надпись (шрифт без кириллицы, поэтому по-английски).
- * ========================================================================= */
+ 
+static void browser_capture_icon_bg(void) {
+    int32_t icx, icy;
+    browser_icon_rect(&icx, &icy);
+    fxapp_capture_icon_bg_generic(icx, icy, &g_browser_icon_clean_bg);
+}
+
+static void browser_draw_icon(bool hovered) {
+    int32_t icx, icy;
+    browser_icon_rect(&icx, &icy);
+     
+
+
+
+    fxapp_draw_icon_generic(icx, icy, g_browser_icon_clean_bg, hovered,
+                            g_browser_icon_loaded, &g_browser_icon_img, "WWW", "");
+}
+
+ 
+
+
+
+
+
+
+
+
+
 #define FM_ICON_W        64u
 #define FM_ICON_H        64u
-#define FM_CELL_W          96   /* ширина ячейки сетки (иконка 64 + отступы) */
-#define FM_CELL_H          96   /* высота ячейки (иконка 64 + зазор + подпись) */
-#define FM_GRID_PAD          8  /* отступ сетки от краёв тела окна */
+#define FM_CELL_W          96    
+#define FM_CELL_H          96    
+#define FM_GRID_PAD          8   
 #define FM_PATH_MAX        256
-#define FM_MAX_ENTRIES      32  /* больше и не влезет в окно без скролла */
-#define FM_LABEL_MAX_CH     11  /* символов имени под иконкой (шрифт 8px/симв, ячейка 96px) */
+#define FM_MAX_ENTRIES      32   
+#define FM_LABEL_MAX_CH     11   
 
 typedef enum {
-    FM_KIND_DRIVE = 0,   /* точка монтирования — диск */
-    FM_KIND_DIR,         /* поддиректория */
-    FM_KIND_FILE,        /* обычный файл */
-    FM_KIND_UP,          /* синтетический пункт "выше на уровень" */
+    FM_KIND_DRIVE = 0,    
+    FM_KIND_DIR,          
+    FM_KIND_FILE,         
+    FM_KIND_UP,           
 } fm_kind_t;
 
 typedef struct {
     fm_kind_t kind;
-    char      label[VFS_MAX_NAME + 1];   /* имя файла/папки или диска для подписи */
-    char      drive_path[FM_PATH_MAX];   /* только для FM_KIND_DRIVE: путь монтирования */
+    char      label[VFS_MAX_NAME + 1];    
+    char      drive_path[FM_PATH_MAX];    
 } fm_entry_t;
 
 typedef enum { FM_VIEW_DRIVES, FM_VIEW_DIR } fm_view_t;
 
 static fm_view_t   g_fm_view       = FM_VIEW_DRIVES;
 static char        g_fm_cur_path[FM_PATH_MAX]   = "/";
-static char        g_fm_drive_root[FM_PATH_MAX] = "/";  /* корень текущего диска —
-                                                          * подниматься выше некуда,
-                                                          * дальше только к списку дисков */
+static char        g_fm_drive_root[FM_PATH_MAX] = "/";   
+
+
 static fm_entry_t  g_fm_entries[FM_MAX_ENTRIES];
 static int         g_fm_entry_count = 0;
 
@@ -1928,8 +2059,8 @@ static png_image_t g_fm_icon_disk;    static int g_fm_icon_disk_loaded   = 0;
 static png_image_t g_fm_icon_folder;  static int g_fm_icon_folder_loaded = 0;
 static png_image_t g_fm_icon_file;    static int g_fm_icon_file_loaded   = 0;
 
-/* Собрать child = base + "/" + name (без двойных слешей, если base уже
- * заканчивается на "/" — как корень "/"). */
+ 
+
 static void fm_path_join(const char *base, const char *name, char *out, size_t out_sz) {
     strlcpy(out, base, out_sz);
     size_t n = strlen(out);
@@ -1940,27 +2071,27 @@ static void fm_path_join(const char *base, const char *name, char *out, size_t o
     if (cur < out_sz) strncat(out, name, out_sz - cur - 1);
 }
 
-/* Подняться на один уровень выше по path (in-place). "/" остаётся "/". */
+ 
 static void fm_path_up(char *path) {
     size_t n = strlen(path);
     while (n > 1 && path[n - 1] == '/') path[--n] = '\0';
     char *slash = strrchr(path, '/');
     if (!slash) { path[0] = '/'; path[1] = '\0'; return; }
-    if (slash == path) { path[1] = '\0'; return; }   /* дошли до корня диска */
+    if (slash == path) { path[1] = '\0'; return; }    
     *slash = '\0';
 }
 
-/* Грузим disk.png/folder.png/file.png один раз (как MyPC.png/close.png —
- * см. fxapp_ensure_assets_loaded выше); используем тот же
- * fxapp_load_png_asset (UI/<name>).
- *
- * ВАЖНО: флаг "готово" (ok) выставляется ТОЛЬКО если ВСЕ три иконки
- * загрузились успешно. Раньше флаг "tried" выставлялся ДО попытки
- * загрузки и больше никогда не сбрасывался — если самая первая
- * попытка (например, во время гонки при первом открытии окна, см.
- * fm_reset/g_fm_busy) не успевала прочитать файл, соответствующая
- * иконка навсегда оставалась fallback'ом ("D"/"F"/"^") при всех
- * последующих открытиях "My Computer", хотя файл в UI/ реально есть. */
+ 
+
+
+
+
+
+
+
+
+
+
 static void fm_ensure_assets_loaded(void) {
     static bool ok = false;
     if (ok) return;
@@ -1991,12 +2122,13 @@ static void fm_ensure_assets_loaded(void) {
             all_ok = false;
     }
 
-    /* Повторим попытку при следующем открытии окна, если что-то
-     * не загрузилось — только полный успех "закрывает" повтор. */
+     
+
     if (all_ok) ok = true;
+    else DBG_MSG("FXA", "my computer: some icons (disk/folder/file.png) failed to load, will retry");
 }
 
-/* Список дисков — один пункт на каждую точку монтирования VFS. */
+ 
 static void fm_reload_drives(void) {
     g_fm_entry_count = 0;
 
@@ -2009,15 +2141,16 @@ static void fm_reload_drives(void) {
         fm_entry_t *e = &g_fm_entries[g_fm_entry_count++];
         e->kind = FM_KIND_DRIVE;
         strlcpy(e->drive_path, path, sizeof(e->drive_path));
-        /* Подпись — имя блочного устройства ("vda" и т.п.); если вдруг
-         * пусто, покажем хотя бы путь монтирования. */
+         
+
         strlcpy(e->label, dev[0] ? dev : path, sizeof(e->label));
     }
+    DBG_VAL("FXA", "my computer: vfs mounts", (uint64_t)n);
     DBG_VAL("FXA", "my computer: drives found", (uint64_t)g_fm_entry_count);
 }
 
-/* Содержимое директории path на текущем диске: сначала пункт "..",
- * затем все файлы/папки через vfs_readdir. */
+ 
+
 static void fm_reload_dir(const char *path) {
     g_fm_entry_count = 0;
 
@@ -2040,26 +2173,30 @@ static void fm_reload_dir(const char *path) {
         fm_entry_t *e = &g_fm_entries[g_fm_entry_count++];
         e->kind = (de.type == VFS_TYPE_DIR) ? FM_KIND_DIR : FM_KIND_FILE;
         strlcpy(e->label, de.name, sizeof(e->label));
+         
+        dbg_puts("[FXA]   entry '"); dbg_puts(de.name);
+        dbg_puts(de.type == VFS_TYPE_DIR ? "' DIR\n" : "' FILE\n");
     }
     vfs_close(fd);
+    dbg_puts("[FXA] my computer: dir '"); dbg_puts(path); dbg_puts("'\n");
     DBG_VAL("FXA", "my computer: dir entries", (uint64_t)g_fm_entry_count);
 }
 
-/* Общий guard от реентрантности для ВСЕГО модуля "My Computer" —
- * и для открытия иконки (fm_reset, ниже), и для клика внутри окна
- * (fm_handle_click). Раньше guard был только в fm_handle_click;
- * fm_reset() дергает ровно такой же блокирующий дисковый I/O
- * (fm_ensure_assets_loaded читает 3 PNG, fm_reload_drives читает
- * точки монтирования и пишет в g_fm_entries/g_fm_entry_count), но
- * был совершенно не защищён — таймерный тик, повторно вызванный
- * ДО завершения этого I/O (см. комментарий в fm_handle_click),
- * мог застать g_fm_entries на середине заполнения. Это и было
- * причиной "No Disks" при самом первом открытии окна. Один общий
- * флаг на оба пути гарантирует, что они не могут пересечься. */
+ 
+
+
+
+
+
+
+
+
+
+
 static volatile bool g_fm_busy = false;
 
-/* Вызывается при каждом открытии окна "My Computer" — сбрасывает
- * навигацию обратно на список дисков. */
+ 
+
 static void fm_reset(void) {
     if (g_fm_busy) {
         DBG_MSG("FXA", "my computer: reset ignored (reentrant, I/O in progress)");
@@ -2083,8 +2220,8 @@ static int fm_cols(uint32_t content_w) {
     return (c > 0) ? c : 1;
 }
 
-/* Верхний левый угол ЯЧЕЙКИ idx (не самой иконки), относительно тела
- * окна — (0,0) это левый верхний угол области ПОД заголовком. */
+ 
+
 static void fm_cell_origin(int idx, uint32_t content_w, int32_t *cx, int32_t *cy) {
     int cols = fm_cols(content_w);
     int col = idx % cols;
@@ -2111,17 +2248,17 @@ static void fm_draw_entry_icon(fm_kind_t kind, int32_t x, int32_t y) {
     if (loaded && img->pixels) {
         fxapp_blit_png(x, y, img);
     } else {
-        /* fallback, если соответствующий .png не найден на диске —
-         * разные цвета/подписи для disk/folder/file, чтобы смена вида
-         * (диск -> папка) была заметна визуально даже без иконок. */
+         
+
+
         fb_color_t bg;
         const char *hint;
         switch (kind) {
-            case FM_KIND_DRIVE: bg = 0xB0C4DEU; hint = "D"; break;  /* голубоватый — диск */
+            case FM_KIND_DRIVE: bg = 0xB0C4DEU; hint = "D"; break;   
             case FM_KIND_FILE:  bg = FB_LIGHT_GRAY; hint = "F"; break;
-            case FM_KIND_UP:    bg = 0xE8D080U; hint = "^"; break;  /* "вверх" — отдельный от папки */
+            case FM_KIND_UP:    bg = 0xE8D080U; hint = "^"; break;   
             case FM_KIND_DIR:
-            default:            bg = 0xE8D080U; hint = "/"; break; /* жёлтый — папка */
+            default:            bg = 0xE8D080U; hint = "/"; break;  
         }
         fb_fill_rect(x, y, FM_ICON_W, FM_ICON_H, bg);
         fb_draw_rect(x, y, FM_ICON_W, FM_ICON_H, FB_DARK_GRAY, 1);
@@ -2130,8 +2267,8 @@ static void fm_draw_entry_icon(fm_kind_t kind, int32_t x, int32_t y) {
     }
 }
 
-/* Обрезать подпись до FM_LABEL_MAX_CH символов — под 32px иконкой в
- * узкой сетке места на длинные имена нет. */
+ 
+
 static void fm_label_fit(const char *name, char *out, size_t out_sz) {
     size_t n = strlen(name);
     if (n >= out_sz) n = out_sz - 1;
@@ -2143,10 +2280,10 @@ static void fm_label_fit(const char *name, char *out, size_t out_sz) {
     }
 }
 
-/* Нарисовать содержимое окна "My Computer": сетку иконок дисков/папок/
- * файлов с подписями, либо "пусто", если смотреть не на что. Вызывается
- * ПОСЛЕ ui_win_draw() (которое красит тело окна белым) — см. хуки в
- * ui_win_create/ui_win_move_ex/ui_draw_desktop ниже. */
+ 
+
+
+
 static void fm_draw(int win_id) {
     ui_window_t *win = &g_windows[win_id];
     int32_t  base_x   = win->x;
@@ -2166,7 +2303,7 @@ static void fm_draw(int win_id) {
     for (int i = 0; i < g_fm_entry_count; i++) {
         int32_t ox, oy;
         fm_cell_origin(i, content_w, &ox, &oy);
-        if ((uint32_t)(oy + FM_CELL_H) > content_h) break;  /* дальше не влезает — без скролла */
+        if ((uint32_t)(oy + FM_CELL_H) > content_h) break;   
 
         int32_t icon_x = base_x + ox + (int32_t)((FM_CELL_W - (int32_t)FM_ICON_W) / 2);
         int32_t icon_y = base_y + oy;
@@ -2181,20 +2318,20 @@ static void fm_draw(int win_id) {
     }
 }
 
-/* Клик внутри тела окна "My Computer" (x,y — абсолютные экранные
- * координаты). Определяет по сетке, в какую ячейку попал клик, и
- * выполняет соответствующее действие (открыть диск/папку, подняться
- * на уровень выше). Файлы пока некуда открывать — клик по ним
- * ни на что не влияет, только просмотр списка. */
+ 
+
+
+
+
 static void fm_handle_click(int win_id, int32_t x, int32_t y) {
-    /* fm_reload_dir() делает блокирующий дисковый I/O (vfs_open/vfs_readdir
-     * читают сектора с virtio-blk). Пока он ждёт прерывания завершения,
-     * таймерный тик может повторно вызвать ui_desktop_handle_mouse() ДО
-     * того как первый вызов дописал/сбросил флаг "кнопка была нажата" —
-     * получится вложенный клик поверх ещё не завершённого fm_reload_dir,
-     * который затирает g_fm_entries на середине заполнения. g_fm_busy
-     * (общий на весь модуль, см. объявление у fm_reset) просто
-     * игнорирует такие вложенные клики. */
+     
+
+
+
+
+
+
+
     if (g_fm_busy) {
         DBG_MSG("FXA", "my computer: click ignored (reentrant, I/O in progress)");
         return;
@@ -2230,7 +2367,7 @@ static void fm_handle_click(int win_id, int32_t x, int32_t y) {
 
                     case FM_KIND_UP:
                         if (strcmp(g_fm_cur_path, g_fm_drive_root) == 0) {
-                            /* уже в корне диска — дальше только к списку дисков */
+                             
                             g_fm_view = FM_VIEW_DRIVES;
                             fm_reload_drives();
                         } else {
@@ -2251,7 +2388,7 @@ static void fm_handle_click(int win_id, int32_t x, int32_t y) {
 
                     case FM_KIND_FILE:
                     default:
-                        break;   /* нет реакции на клик по файлу */
+                        break;    
                 }
             }
         }
@@ -2267,22 +2404,438 @@ static void fm_handle_click(int win_id, int32_t x, int32_t y) {
     g_fm_busy = false;
 }
 
-/* =========================================================================
- * Генерический оконный менеджер — реализация.
- *
- * Один и тот же код обслуживает и встроенные окна ядра (My Computer —
- * см. обработку клика по иконке ниже), и системные вызовы
- * SYS_WIN_CREATE/SYS_WIN_CLOSE/SYS_WIN_MOVE из Syscall.c.
- * ========================================================================= */
+ 
 
-/* Сохранение/восстановление фона под окном — раньше шло попиксельно
- * через fb_get_pixel/fb_put_pixel (конвертация цвета на КАЖДЫЙ пиксель),
- * что при перетаскивании окна (вызывается на каждом тике мыши, из
- * таймерного прерывания!) давало ощутимые лаги на окнах покрупнее.
- * Теперь копируем "сырые" байты кадра строка за строкой через memcpy —
- * без конвертации цвета, окно всегда целиком в пределах экрана
- * (см. клэмпинг nx/ny в ui_desktop_handle_mouse), поэтому границы можно
- * не проверять на каждый пиксель. */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#define FMDLG_WIN_W          300u
+#define FMDLG_WIN_H          150u
+#define FMDLG_NAME_MAX       VFS_MAX_NAME    
+
+#define FMDLG_LABEL_X          16
+#define FMDLG_LABEL_Y           8
+
+#define FMDLG_INPUT_X          16
+#define FMDLG_INPUT_Y          30
+#define FMDLG_INPUT_H          28u
+#define FMDLG_INPUT_BG      FB_WHITE
+#define FMDLG_INPUT_BORDER  0x808080U
+#define FMDLG_INPUT_FG      FB_BLACK
+
+#define FMDLG_BTN_W             90u
+#define FMDLG_BTN_H             32u
+#define FMDLG_BTN_MARGIN        16
+#define FMDLG_BTN_BG        0x2266CCU    
+#define FMDLG_BTN_FG        FB_WHITE
+
+typedef enum { FMDLG_NONE = 0, FMDLG_FOLDER, FMDLG_FILE } fmdlg_kind_t;
+
+static int          g_fmdlg_win_id     = -1;
+static fmdlg_kind_t g_fmdlg_kind       = FMDLG_NONE;
+static char         g_fmdlg_target[FM_PATH_MAX] = "/";   
+static int          g_fmdlg_target_win = -1;              
+static char         g_fmdlg_text[VFS_MAX_NAME + 1] = "";
+static int          g_fmdlg_text_len   = 0;
+
+static void fmdlg_input_rect(int win_id, int32_t *ix, int32_t *iy, uint32_t *iw, uint32_t *ih) {
+    ui_window_t *win = &g_windows[win_id];
+    *ix = win->x + FMDLG_INPUT_X;
+    *iy = win->y + (int32_t)UI_WIN_TITLEBAR_H + FMDLG_INPUT_Y;
+    *iw = win->w - 2u * (uint32_t)FMDLG_INPUT_X;
+    *ih = FMDLG_INPUT_H;
+}
+
+static void fmdlg_btn_rect(int win_id, int32_t *bx, int32_t *by, uint32_t *bw, uint32_t *bh) {
+    ui_window_t *win = &g_windows[win_id];
+    *bw = FMDLG_BTN_W;
+    *bh = FMDLG_BTN_H;
+    *bx = win->x + (int32_t)win->w - (int32_t)FMDLG_BTN_W - FMDLG_BTN_MARGIN;
+    *by = win->y + (int32_t)win->h - (int32_t)FMDLG_BTN_H - FMDLG_BTN_MARGIN;
+}
+
+ 
+
+static void fmdlg_draw(int win_id) {
+    if (win_id < 0 || win_id >= (int)UI_MAX_WINDOWS) return;
+    ui_window_t *win = &g_windows[win_id];
+    if (!win->used) return;
+
+    int32_t  base_x    = win->x;
+    int32_t  base_y    = win->y + (int32_t)UI_WIN_TITLEBAR_H;
+    uint32_t content_h = (win->h > UI_WIN_TITLEBAR_H) ? win->h - UI_WIN_TITLEBAR_H : 0;
+    fb_fill_rect(base_x, base_y, win->w, content_h, UI_WIN_BODY_BG);
+
+    fb_draw_string(base_x + FMDLG_LABEL_X, base_y + FMDLG_LABEL_Y,
+                   "Name:", FB_BLACK, UI_WIN_BODY_BG);
+
+    int32_t ix, iy; uint32_t iw, ih;
+    fmdlg_input_rect(win_id, &ix, &iy, &iw, &ih);
+    fb_fill_rect(ix, iy, iw, ih, FMDLG_INPUT_BG);
+    fb_draw_rect(ix, iy, iw, ih, FMDLG_INPUT_BORDER, 1);
+
+     
+
+    int32_t tx = ix + 6;
+    int32_t ty = iy + (int32_t)((ih - FB_FONT_H) / 2u);
+    int max_chars = (int)((iw > 12u ? iw - 12u : 0) / FB_FONT_W);
+    if (max_chars < 1) max_chars = 1;
+    const char *show = g_fmdlg_text;
+    if (g_fmdlg_text_len > max_chars) show = g_fmdlg_text + (g_fmdlg_text_len - max_chars);
+    fb_draw_string(tx, ty, show, FMDLG_INPUT_FG, FMDLG_INPUT_BG);
+
+    int32_t bx, by; uint32_t bw, bh;
+    fmdlg_btn_rect(win_id, &bx, &by, &bw, &bh);
+    fb_fill_rect(bx, by, bw, bh, FMDLG_BTN_BG);
+    const char *label = "Create";
+    int32_t lw = (int32_t)fb_text_width(label);
+    fb_draw_string(bx + (int32_t)((bw - (uint32_t)(lw > 0 ? lw : 0)) / 2u),
+                   by + (int32_t)((bh - FB_FONT_H) / 2u), label, FMDLG_BTN_FG, FMDLG_BTN_BG);
+}
+
+ 
+
+
+static void fmdlg_open(fmdlg_kind_t kind, int target_win_id) {
+    if (g_fmdlg_win_id >= 0 && g_windows[g_fmdlg_win_id].used) {
+        ui_win_close(g_fmdlg_win_id);
+        g_fmdlg_win_id = -1;
+    }
+
+    g_fmdlg_kind       = kind;
+    g_fmdlg_target_win = target_win_id;
+    strlcpy(g_fmdlg_target, g_fm_cur_path, sizeof(g_fmdlg_target));
+    g_fmdlg_text[0]    = '\0';
+    g_fmdlg_text_len   = 0;
+
+    const char *title = (kind == FMDLG_FOLDER) ? "Create Folder" : "Create File";
+    g_fmdlg_win_id = ui_win_create(title, FMDLG_WIN_W, FMDLG_WIN_H, -1);
+    if (g_fmdlg_win_id >= 0) {
+        fmdlg_draw(g_fmdlg_win_id);
+        fb_flip();
+    }
+}
+
+ 
+
+
+static void fmdlg_do_create(void) {
+    if (g_fmdlg_win_id < 0 || g_fmdlg_kind == FMDLG_NONE) return;
+    if (g_fmdlg_text_len == 0) return;    
+
+    char path[FM_PATH_MAX];
+    fm_path_join(g_fmdlg_target, g_fmdlg_text, path, sizeof(path));
+
+    if (g_fmdlg_kind == FMDLG_FOLDER) {
+         
+
+
+
+        int mr = vfs_mkdir(path);
+        if (mr < 0) {
+            DBG_RC("FXA", "vfs_mkdir failed, rc", mr);
+            return;    
+        }
+    } else {
+        int fd = vfs_open(path, O_WRONLY | O_CREAT | O_TRUNC);
+        if (fd < 0) {
+            DBG_RC("FXA", "create file failed, rc", fd);
+            return;
+        }
+        vfs_close(fd);
+    }
+    dbg_puts("[FXA] created '"); dbg_puts(path);
+    dbg_puts(g_fmdlg_kind == FMDLG_FOLDER ? "' (folder)\n" : "' (file)\n");
+
+    int target_win = g_fmdlg_target_win;
+    int win_id     = g_fmdlg_win_id;
+    g_fmdlg_win_id  = -1;
+    g_fmdlg_kind    = FMDLG_NONE;
+    ui_win_close(win_id);
+    if (target_win >= 0 && g_windows[target_win].used && g_windows[target_win].open)
+        ui_focus_set(target_win);
+
+    if (target_win >= 0 && target_win == g_fxapp_win_id &&
+        g_windows[target_win].used && g_windows[target_win].open &&
+        g_fm_view == FM_VIEW_DIR && strcmp(g_fm_cur_path, g_fmdlg_target) == 0) {
+        fm_reload_dir(g_fm_cur_path);
+        ui_win_draw(target_win);
+        fm_draw(target_win);
+    }
+    fb_flip();
+}
+
+ 
+
+
+static void fmdlg_handle_click(int win_id, int32_t x, int32_t y) {
+    int32_t bx, by; uint32_t bw, bh;
+    fmdlg_btn_rect(win_id, &bx, &by, &bw, &bh);
+    if (point_in_rect(x, y, bx, by, bw, bh)) fmdlg_do_create();
+}
+
+ 
+
+
+
+
+static void ui_kbd_drain_unclaimed(void) {
+    if (g_focus_win >= 0 && g_focus_win < (int)UI_MAX_WINDOWS) {
+        const ui_window_t *w = &g_windows[g_focus_win];
+        if (w->used && w->open && !w->minimized) {
+            if (w->owner_pid > 0) return;
+            if (g_focus_win == g_fmdlg_win_id) return;
+        }
+    }
+    char ch;
+    while (usb_hid_kbd_read_char(&ch)) { }
+}
+
+ 
+
+
+
+static void fmdlg_poll_keyboard(void) {
+    if (g_fmdlg_win_id < 0 || !g_windows[g_fmdlg_win_id].used || !g_windows[g_fmdlg_win_id].open)
+        return;
+    if (g_focus_win != g_fmdlg_win_id) return;    
+
+    char ch;
+    bool changed = false;
+    while (usb_hid_kbd_read_char(&ch)) {
+        if (ch == '\n') {
+            fmdlg_do_create();
+            return;    
+        } else if (ch == '\b') {
+            if (g_fmdlg_text_len > 0) {
+                g_fmdlg_text[--g_fmdlg_text_len] = '\0';
+                changed = true;
+            }
+        } else if (ch == '\t') {
+             
+        } else if (g_fmdlg_text_len < (int)FMDLG_NAME_MAX) {
+            g_fmdlg_text[g_fmdlg_text_len++] = ch;
+            g_fmdlg_text[g_fmdlg_text_len] = '\0';
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        fmdlg_draw(g_fmdlg_win_id);
+        fb_flip();
+    }
+}
+
+ 
+
+
+
+
+
+
+
+#define FMCTX_W               170u
+#define FMCTX_ITEM_H           28u
+#define FMCTX_PAD               6
+#define FMCTX_H        (2u * FMCTX_PAD + 2u * FMCTX_ITEM_H)    
+#define FMCTX_BG            0x2B2B2BU
+#define FMCTX_BORDER        0x000000U
+#define FMCTX_ITEM_BG_HOVER 0x454545U
+#define FMCTX_ITEM_FG       0xE8E8E8U
+
+static bool        g_fmctx_open   = false;
+static int         g_fmctx_hover  = -1;    
+ 
+
+static int         g_fmctx_mode   = 0;
+static int         g_fmctx_n      = 2;     
+static char        g_fmctx_dir[FM_PATH_MAX];             
+static char        g_fmctx_name[VFS_MAX_NAME + 1];       
+static bool        g_fmctx_is_dir = false;
+static int32_t     g_fmctx_x = 0, g_fmctx_y = 0;
+static int         g_fmctx_win_id = -1;    
+static fb_color_t *g_fmctx_saved_bg = NULL;
+
+static uint32_t fmctx_h(void) {
+    return 2u * (uint32_t)FMCTX_PAD + (uint32_t)g_fmctx_n * FMCTX_ITEM_H;
+}
+
+static void fmctx_item_rect(int idx, int32_t mx, int32_t my,
+                            int32_t *ix, int32_t *iy, uint32_t *iw, uint32_t *ih) {
+    *ix = mx + FMCTX_PAD;
+    *iy = my + FMCTX_PAD + idx * (int32_t)FMCTX_ITEM_H;
+    *iw = FMCTX_W - 2u * FMCTX_PAD;
+    *ih = FMCTX_ITEM_H;
+}
+
+static void fmctx_save_bg(int32_t mx, int32_t my) {
+    if (!g_fmctx_saved_bg) {
+        g_fmctx_saved_bg = (fb_color_t *)kmalloc(
+            (uint64_t)FMCTX_W * FMCTX_H * sizeof(fb_color_t));
+    }
+    if (!g_fmctx_saved_bg) return;
+    for (uint32_t row = 0; row < fmctx_h(); row++)
+        for (uint32_t col = 0; col < FMCTX_W; col++)
+            g_fmctx_saved_bg[row * FMCTX_W + col] =
+                fb_get_pixel(mx + (int32_t)col, my + (int32_t)row);
+}
+
+static void fmctx_restore_bg(int32_t mx, int32_t my) {
+    if (!g_fmctx_saved_bg) return;
+    for (uint32_t row = 0; row < fmctx_h(); row++)
+        for (uint32_t col = 0; col < FMCTX_W; col++)
+            fb_put_pixel(mx + (int32_t)col, my + (int32_t)row,
+                        g_fmctx_saved_bg[row * FMCTX_W + col]);
+    fb_flip();
+}
+
+static void fmctx_draw(void) {
+    int32_t mx = g_fmctx_x, my = g_fmctx_y;
+    fb_fill_rect(mx, my, FMCTX_W, fmctx_h(), FMCTX_BG);
+    fb_draw_rect(mx, my, FMCTX_W, fmctx_h(), FMCTX_BORDER, 1);
+
+    static const char *labels_create[2] = { "Create Folder", "Create File" };
+    static const char *labels_entry[1]  = { "Delete" };
+    const char **labels = (g_fmctx_mode == 1) ? labels_entry : labels_create;
+    for (int i = 0; i < g_fmctx_n; i++) {
+        int32_t ix, iy; uint32_t iw, ih;
+        fmctx_item_rect(i, mx, my, &ix, &iy, &iw, &ih);
+        fb_color_t bg = (g_fmctx_hover == i) ? FMCTX_ITEM_BG_HOVER : FMCTX_BG;
+        fb_fill_rect(ix, iy, iw, ih, bg);
+        int32_t tx = ix + 8;
+        int32_t ty = iy + (int32_t)((ih - FB_FONT_H) / 2u);
+        fb_draw_string(tx, ty, labels[i], FMCTX_ITEM_FG, bg);
+    }
+    fb_flip();
+}
+
+ 
+
+
+static int fm_hit_test(int win_id, int32_t x, int32_t y) {
+    ui_window_t *win = &g_windows[win_id];
+    int32_t lx = x - win->x - FM_GRID_PAD;
+    int32_t ly = y - win->y - (int32_t)UI_WIN_TITLEBAR_H - FM_GRID_PAD;
+    if (lx < 0 || ly < 0) return -1;
+
+    int cols = fm_cols(win->w);
+    int col = lx / FM_CELL_W;
+    int row = ly / FM_CELL_H;
+    if (col >= cols) return -1;
+
+    int idx = row * cols + col;
+    if (idx < 0 || idx >= g_fm_entry_count) return -1;
+
+    int32_t ox, oy;
+    fm_cell_origin(idx, win->w, &ox, &oy);
+    if ((uint32_t)(oy + FM_CELL_H) > win->h - UI_WIN_TITLEBAR_H) return -1;
+    return idx;
+}
+
+ 
+
+
+
+
+
+
+
+
+
+#define FM_DEL_MAX_DEPTH 8
+static int fm_delete_path(const char *path, bool is_dir, int depth) {
+    if (!is_dir) return vfs_unlink(path);
+    if (depth >= FM_DEL_MAX_DEPTH) return VFS_ERR_BUSY;
+
+    uint32_t skip = 0;
+    for (uint32_t guard = 0; guard < 4096; guard++) {
+        int fd = vfs_open(path, O_DIRECTORY);
+        if (fd < 0) return fd;
+
+        vfs_dirent_t de;
+        int rr = vfs_readdir(fd, skip, &de);
+        vfs_close(fd);
+        if (rr != VFS_OK) break;
+
+        char child[FM_PATH_MAX];
+        fm_path_join(path, de.name, child, sizeof(child));
+        int cr = fm_delete_path(child, de.type == VFS_TYPE_DIR, depth + 1);
+        if (cr < 0) {
+            DBG_RC("FXA", "delete child failed, rc", cr);
+            skip++;
+        }
+    }
+    return vfs_rmdir(path);
+}
+
+ 
+
+static void fmctx_do_delete(void) {
+    int win_id = g_fmctx_win_id;
+    if (win_id < 0 || win_id >= (int)UI_MAX_WINDOWS) return;
+    if (!g_windows[win_id].used || !g_windows[win_id].open) return;
+    if (g_fm_busy) {
+        DBG_MSG("FXA", "my computer: delete ignored (reentrant, I/O in progress)");
+        return;
+    }
+    g_fm_busy = true;
+    uint64_t fm_flags = fm_io_cli();
+
+    char path[FM_PATH_MAX];
+    fm_path_join(g_fmctx_dir, g_fmctx_name, path, sizeof(path));
+
+    int r = fm_delete_path(path, g_fmctx_is_dir, 0);
+    if (r < 0) {
+        DBG_RC("FXA", "delete failed, rc", r);
+    } else {
+        dbg_puts("[FXA] deleted '"); dbg_puts(path);
+        dbg_puts(g_fmctx_is_dir ? "' (folder)\n" : "' (file)\n");
+    }
+
+     
+
+    if (g_fm_view == FM_VIEW_DIR && strcmp(g_fm_cur_path, g_fmctx_dir) == 0)
+        fm_reload_dir(g_fm_cur_path);
+
+    ui_win_draw(win_id);
+    fm_draw(win_id);
+    fb_flip();
+
+    fm_io_sti(fm_flags);
+    g_fm_busy = false;
+}
+
+ 
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
 static void ui_win_save_bg(int id, int32_t wx, int32_t wy) {
     ui_window_t *win = &g_windows[id];
     if (g_fb.mode != FB_MODE_LINEAR) return;
@@ -2315,18 +2868,18 @@ static void ui_win_restore_bg(int id, int32_t wx, int32_t wy) {
     }
 }
 
-/* ui_win_capture / ui_win_blit_captured — вместо стирания окна в белый
- * цвет при каждом тике перетаскивания (ui_win_draw()) и ожидания, пока
- * приложение САМО (кооперативно, когда планировщик даст ему время)
- * перерисует своё содержимое, просто запоминаем ТЕКУЩИЕ пиксели окна
- * (рамку+тело как есть на экране, включая всё, что нарисовало
- * приложение) и переносим их как обычную картинку на новое место.
- * Раньше окно на весь drag становилось пустым (или "проявлялось"
- * только маленькими частичными flip'ами вслед за курсором) — теперь
- * оно просто едет вместе со своим содержимым, как в любой обычной ОС.
- * Приложение при этом всё равно может перерисоваться поверх (оно уже
- * само следит за g_rect и делает это) — так оно и должно быть, просто
- * теперь это не единственный способ увидеть содержимое. */
+ 
+
+
+
+
+
+
+
+
+
+
+
 static void ui_win_capture(int id, int32_t wx, int32_t wy) {
     ui_window_t *win = &g_windows[id];
     if (g_fb.mode != FB_MODE_LINEAR) return;
@@ -2348,7 +2901,7 @@ static void ui_win_capture(int id, int32_t wx, int32_t wy) {
 static void ui_win_blit_captured(int id, int32_t wx, int32_t wy) {
     ui_window_t *win = &g_windows[id];
     if (g_fb.mode != FB_MODE_LINEAR) return;
-    if (!win->content_bak) { ui_win_draw(id); return; } /* первый раз — нечего переносить */
+    if (!win->content_bak) { ui_win_draw(id); return; }  
 
     uint64_t row_bytes = (uint64_t)win->w * g_fb.bytes_pp;
     uint8_t *buf = draw_buf();
@@ -2359,11 +2912,11 @@ static void ui_win_blit_captured(int id, int32_t wx, int32_t wy) {
     }
 }
 
-/* Нарисовать "раму" окна: белое тело, синий заголовок слева с именем,
- * кнопка close.png (или fallback 'X') справа в заголовке. Содержимое
- * окна (тело приложения) сюда не входит — сегодня тело всегда просто
- * белое; будущие userspace-приложения смогут рисовать внутрь через
- * общий framebuffer (см. sys_get_framebuffer в Syscall.c). */
+ 
+
+
+
+
 static void ui_win_draw(int id) {
     ui_window_t *win = &g_windows[id];
     int32_t wx = win->x, wy = win->y;
@@ -2396,7 +2949,7 @@ static void ui_win_draw(int id) {
     } else {
         fb_fill_rect(ex, ey, UI_WIN_EXPAND_SZ, UI_WIN_EXPAND_SZ, 0x606060U);
         fb_draw_rect(ex, ey, UI_WIN_EXPAND_SZ, UI_WIN_EXPAND_SZ, UI_WIN_BORDER, 1);
-        /* развернуть/восстановить — квадратик побольше/поменьше */
+         
         const char *glyph = win->maximized ? "><" : "[]";
         fb_draw_string(ex + (int32_t)((UI_WIN_EXPAND_SZ - 2u * FB_FONT_W) / 2u),
                        ey + (int32_t)((UI_WIN_EXPAND_SZ - FB_FONT_H) / 2u),
@@ -2418,22 +2971,22 @@ static void ui_taskbar_app_btn_rect(int slot_idx, int32_t panel_y,
                                     int32_t *bx, int32_t *by, uint32_t *bw, uint32_t *bh) {
     int32_t base_x = MENU_BTN_X + (int32_t)MENU_BTN_W + (int32_t)TASKBAR_APP_BTN_GAP;
     *bx = base_x + slot_idx * (int32_t)(TASKBAR_APP_BTN_W + TASKBAR_APP_BTN_GAP);
-    *by = panel_y;   /* вкладка во всю высоту панели задач */
+    *by = panel_y;    
     *bw = TASKBAR_APP_BTN_W;
     *bh = TASKBAR_APP_BTN_H;
 }
 
-/* Обрезать заголовок под ширину кнопки, добавляя "..." если не помещается. */
+ 
 static void ui_taskbar_btn_label(const char *title, uint32_t max_px, char *out, size_t out_sz) {
     size_t n = strlen(title);
     if (n >= out_sz) n = out_sz - 1;
-    /* memcpy вручную — strncpy не гарантирует \0, а strlcpy не всегда доступен здесь */
+     
     for (size_t i = 0; i < n; i++) out[i] = title[i];
     out[n] = '\0';
 
     if (fb_text_width(out) <= max_px) return;
 
-    /* Урезаем посимвольно, пока "текст..." не влезет */
+     
     while (n > 0) {
         n--;
         out[n] = '\0';
@@ -2448,8 +3001,8 @@ static void ui_taskbar_btn_label(const char *title, uint32_t max_px, char *out, 
     }
 }
 
-/* Нарисовать кнопку окна на панели задач — Win98-style рамка + название,
- * с обрезкой "..." если не помещается. */
+ 
+
 static void ui_taskbar_draw_one_app_button(int id, int slot_idx, int32_t panel_y) {
     int32_t bx, by; uint32_t bw, bh;
     ui_taskbar_app_btn_rect(slot_idx, panel_y, &bx, &by, &bw, &bh);
@@ -2464,12 +3017,12 @@ static void ui_taskbar_draw_one_app_button(int id, int slot_idx, int32_t panel_y
     fb_draw_string(tx, ty, label, TASKBAR_APP_BTN_FG, TASKBAR_APP_BTN_BG);
 }
 
-/* Перерисовать всю область кнопок панели задач "с нуля" (используется,
- * когда список открытых окон меняется — иначе после закрытия окна в
- * середине списка соседние кнопки не сдвинутся). */
+ 
+
+
 static void ui_taskbar_draw_app_buttons(int32_t panel_y) {
-    /* Сначала стираем всю полосу под кнопками цветом панели задач,
-     * от начала первой возможной кнопки и до края часов. */
+     
+
     int32_t area_x = MENU_BTN_X + (int32_t)MENU_BTN_W + (int32_t)TASKBAR_APP_BTN_GAP;
     int32_t clock_x = (int32_t)g_fb.width - (8 * FB_FONT_W) - 16;
     int32_t area_w = clock_x - area_x;
@@ -2497,7 +3050,7 @@ int ui_win_create(const char *title, uint32_t w, uint32_t h, int32_t owner_pid) 
         if (!g_windows[i].used) { id = i; break; }
     }
     if (id < 0) {
-        DBG_MSG("WIN", "ui_win_create: нет свободных слотов");
+        DBG_MSG("WIN", "ui_win_create: no free window slots");
         return UI_WIN_INVALID;
     }
 
@@ -2507,10 +3060,10 @@ int ui_win_create(const char *title, uint32_t w, uint32_t h, int32_t owner_pid) 
     win->owner_pid = owner_pid;
     win->w = w;
     win->h = h;
-    win->redraw_gen = 1;   /* стартовое значение — приложение и так рисует
-                             * первый кадр сразу после sys_win_create, само
-                             * число не важно, лишь бы было ненулевым/
-                             * определённым для последующих сравнений */
+    win->redraw_gen = 1;    
+
+
+
 
     size_t n = strlen(title);
     if (n >= UI_WIN_TITLE_MAX) n = UI_WIN_TITLE_MAX - 1;
@@ -2518,12 +3071,52 @@ int ui_win_create(const char *title, uint32_t w, uint32_t h, int32_t owner_pid) 
     win->title[n] = '\0';
 
     int32_t panel_y = ui_taskbar_panel_y();
-    /* Каждое следующее окно чуть смещено (каскад), чтобы новые окна
-     * не открывались строго друг на друге. */
-    static int32_t cascade = 0;
-    int32_t base_x = ((int32_t)g_fb.width - (int32_t)w) / 2 + (cascade % 5) * 24;
-    int32_t base_y = (panel_y - (int32_t)h) / 2 + (cascade % 5) * 24;
-    cascade++;
+     
+
+
+
+
+
+    int32_t base_x = 0, base_y = 0;
+    bool placed = false;
+    {
+        const int32_t gap = 12;
+        int32_t max_y = panel_y;
+         
+
+
+        int32_t max_x = (int32_t)g_fb.width - FXAPP_ICON_MARGIN - (int32_t)FXAPP_ICON_W
+                        - FXAPP_ICON_HALO_PAD - 12;
+        int32_t cx[2 * UI_MAX_WINDOWS + 1], cy[2 * UI_MAX_WINDOWS + 1];
+        int nc = 0;
+        cx[nc] = gap; cy[nc] = gap; nc++;
+        for (int i = 0; i < (int)UI_MAX_WINDOWS; i++) {
+            const ui_window_t *o = &g_windows[i];
+            if (i == id || !o->used || !o->open || o->minimized) continue;
+            cx[nc] = o->x + (int32_t)o->w + gap; cy[nc] = o->y; nc++;       
+            cx[nc] = o->x; cy[nc] = o->y + (int32_t)o->h + gap; nc++;       
+        }
+        for (int k = 0; k < nc && !placed; k++) {
+            int32_t px = cx[k], py = cy[k];
+            if (px < 0 || py < 0) continue;
+            if (px + (int32_t)w > max_x || py + (int32_t)h > max_y) continue;
+            bool clash = false;
+            for (int i = 0; i < (int)UI_MAX_WINDOWS && !clash; i++) {
+                const ui_window_t *o = &g_windows[i];
+                if (i == id || !o->used || !o->open || o->minimized) continue;
+                if (px < o->x + (int32_t)o->w + 4 && px + (int32_t)w + 4 > o->x &&
+                    py < o->y + (int32_t)o->h + 4 && py + (int32_t)h + 4 > o->y)
+                    clash = true;
+            }
+            if (!clash) { base_x = px; base_y = py; placed = true; }
+        }
+    }
+    if (!placed) {
+        static int32_t cascade = 0;
+        base_x = ((int32_t)g_fb.width - (int32_t)w) / 2 + (cascade % 5) * 24;
+        base_y = (panel_y - (int32_t)h) / 2 + (cascade % 5) * 24;
+        cascade++;
+    }
     if (base_x < 0) base_x = 0;
     if (base_y < 0) base_y = 0;
     if (base_x + (int32_t)w > (int32_t)g_fb.width) base_x = (int32_t)g_fb.width - (int32_t)w;
@@ -2537,31 +3130,86 @@ int ui_win_create(const char *title, uint32_t w, uint32_t h, int32_t owner_pid) 
     ui_win_save_bg(id, win->x, win->y);
     ui_win_draw(id);
     ui_taskbar_draw_app_buttons(panel_y);
+    ui_focus_set(id);    
     fb_flip();
 
     DBG_VAL("WIN", "ui_win_create: id", (uint64_t)id);
     return id;
 }
 
-/* ui_win_get_rect — отдаёт ОБЛАСТЬ СОДЕРЖИМОГО окна (то, что НИЖЕ
- * заголовка — там, где userspace-приложению можно рисовать пиксели
- * напрямую через framebuffer, полученный SYS_GET_FRAMEBUFFER), а не
- * полный прямоугольник окна с заголовком. Так вызывающему (syscall'у,
- * см. sc_win_get_rect в Syscall.c) не нужно знать о UI_WIN_TITLEBAR_H —
- * это внутренняя деталь оконного менеджера. Координаты — АБСОЛЮТНЫЕ
- * (в системе координат всего экрана/framebuffer), не относительные
- * окну — ровно то, что нужно, чтобы писать пиксели по нужным индексам
- * в framebuffer, который у процесса один общий на весь экран.
- *
- * out_redraw_gen — счётчик "перерисуйся" (см. ui_window_t.redraw_gen):
- * растёт при изменениях геометрии, которые кернел не может честно
- * перенести как картинку (сейчас — только ui_win_toggle_maximize).
- * Приложение сравнивает его с последним увиденным значением и, если он
- * изменился, обязано перерисовать своё содержимое под новый размер
- * (см. calc.c: g_last_redraw_gen). NULL — если вызывающему не нужно
- * (сейчас все вызывающие его передают).
- *
- * Возвращает false, если win_id невалиден/окно не открыто. */
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+ 
+
+
+
+
+
+#define UI_EXIT_REQ_MAX 256
+static volatile uint8_t g_exit_req[UI_EXIT_REQ_MAX];
+
+static volatile uint16_t g_exit_age[UI_EXIT_REQ_MAX];    
+extern int sched_kill(uint32_t tid);
+
+void ui_request_exit(int32_t tid) {
+    if (tid > 0 && tid < UI_EXIT_REQ_MAX) { g_exit_req[tid] = 1; g_exit_age[tid] = 0; }
+}
+
+ 
+
+
+#define UI_EXIT_GRACE_TICKS 20
+void ui_exit_watchdog(void) {
+    for (int tid = 1; tid < UI_EXIT_REQ_MAX; tid++) {
+        if (!g_exit_req[tid]) continue;
+        if (++g_exit_age[tid] < UI_EXIT_GRACE_TICKS) continue;
+        g_exit_req[tid] = 0;
+        g_exit_age[tid] = 0;
+        ui_win_close_all_owned_by((int32_t)tid);
+        int rc = sched_kill((uint32_t)tid);
+        dbg_puts("[WIN] exit watchdog: process "); dbg_dec64((uint64_t)tid);
+        dbg_puts(rc == 1 ? " did not exit by itself -> killed\n"
+               : rc == 0 ? " already gone\n" : " cannot be killed\n");
+    }
+}
+bool ui_exit_requested(int32_t tid) {
+    return tid > 0 && tid < UI_EXIT_REQ_MAX && g_exit_req[tid] != 0;
+}
+void ui_exit_request_clear(int32_t tid) {
+    if (tid > 0 && tid < UI_EXIT_REQ_MAX) g_exit_req[tid] = 0;
+}
+
+int32_t ui_win_owner_pid(int win_id) {
+    if (win_id < 0 || win_id >= (int)UI_MAX_WINDOWS) return -1;
+    const ui_window_t *win = &g_windows[win_id];
+    if (!win->used || !win->open) return -1;
+    return win->owner_pid;
+}
+
 bool ui_win_get_rect(int win_id, int32_t *out_x, int32_t *out_y,
                      uint32_t *out_w, uint32_t *out_h, uint32_t *out_redraw_gen) {
     if (win_id < 0 || win_id >= (int)UI_MAX_WINDOWS) return false;
@@ -2582,7 +3230,10 @@ int ui_win_close(int win_id) {
     ui_window_t *win = &g_windows[win_id];
     if (!win->used || !win->open) return -1;
 
+    DBG_VAL("WIN", "ui_win_close: id", (uint64_t)win_id);
+    DBG_RC("WIN", "ui_win_close: owner_pid", win->owner_pid);
     ui_win_restore_bg(win_id, win->x, win->y);
+    ui_focus_release(win_id);
     win->open = false;
     win->dragging = false;
     if (win->saved_bg) { kfree(win->saved_bg); win->saved_bg = NULL; }
@@ -2594,27 +3245,28 @@ int ui_win_close(int win_id) {
     return 0;
 }
 
-/* do_flip=false — используется из drag-луп в ui_desktop_handle_mouse
- * (вызывается на каждом тике мыши, а fb_flip() и так будет вызван один
- * раз в конце ui_tick()). До этого ui_win_move() всегда делал fb_flip()
- * сам — при перетаскивании это означало ДВА полных копирования кадра
- * за один тик (внутри таймерного прерывания!), что и давало заметные
- * лаги при движении окна. do_flip=true — обычный путь для вызовов из
- * Syscall.c (SYS_WIN_MOVE) и прочего кода вне ui_tick, где никто больше
- * кадр не перевернёт. */
+ 
+
+
+
+
+
+
+
 static int ui_win_move_ex(int win_id, int32_t x, int32_t y, bool do_flip) {
     if (win_id < 0 || win_id >= (int)UI_MAX_WINDOWS) return -1;
     ui_window_t *win = &g_windows[win_id];
     if (!win->used || !win->open) return -1;
 
-    ui_win_capture(win_id, win->x, win->y);   /* запомнить пиксели окна, ПОКА оно ещё на старом месте */
+    ui_win_capture(win_id, win->x, win->y);    
     ui_win_restore_bg(win_id, win->x, win->y);
     win->x = x;
     win->y = y;
     ui_win_save_bg(win_id, win->x, win->y);
-    ui_win_blit_captured(win_id, win->x, win->y);  /* переносим как картинку — вместо ui_win_draw()+белое тело */
-    if (win_id == g_fxapp_win_id) fm_draw(win_id);   /* "Мой компьютер" всё равно перерисовывает сетку иконок сам */
+    ui_win_blit_captured(win_id, win->x, win->y);   
+    if (win_id == g_fxapp_win_id) fm_draw(win_id);    
     if (win_id == g_theme_win_id) theme_win_draw(win_id);
+    if (win_id == g_fmdlg_win_id) fmdlg_draw(win_id);
     if (do_flip) fb_flip();
     return 0;
 }
@@ -2623,39 +3275,40 @@ int ui_win_move(int win_id, int32_t x, int32_t y) {
     return ui_win_move_ex(win_id, x, y, true);
 }
 
-/* ui_win_minimize — прячет окно с экрана, но НЕ трогает used/open:
- * кнопка на панели задач должна остаться (см. условие в
- * ui_taskbar_draw_app_buttons — оно смотрит только used && open), иначе
- * восстановить окно кликом по панели будет неоткуда. saved_bg остаётся
- * тем же самым буфером (геометрия окна не меняется), поэтому просто
- * восстанавливаем фон под ним и помечаем minimized. */
+ 
+
+
+
+
+
 static void ui_win_minimize(int id) {
     if (id < 0 || id >= (int)UI_MAX_WINDOWS) return;
     ui_window_t *win = &g_windows[id];
     if (!win->used || !win->open || win->minimized) return;
 
-    /* Запоминаем пиксели окна (рамка+тело+всё, что нарисовало
-     * приложение) ДО того, как сотрём его фоном — геометрия при
-     * сворачивании не меняется, поэтому на восстановлении (см.
-     * ui_win_restore_from_taskbar) можно перенести их обратно 1-в-1,
-     * тем же приёмом, что уже работает при перетаскивании окна (см.
-     * ui_win_capture/ui_win_blit_captured выше). Раньше это не
-     * делалось — после restore userspace-окна (calc.c и т.п.) оставались
-     * с пустым белым телом, пока сами не перерисуются (а зачастую вообще
-     * не перерисовывались, т.к. x/y/w/h после restore не менялись и
-     * приложение не видело повода для редрава). */
+     
+
+
+
+
+
+
+
+
+
     ui_win_capture(id, win->x, win->y);
     ui_win_restore_bg(id, win->x, win->y);
     win->minimized = true;
     win->dragging = false;
+    ui_focus_release(id);
     fb_flip();
 }
 
-/* ui_win_restore_from_taskbar — показать ранее свёрнутое окно обратно.
- * saved_bg пересохраняем заново (ui_win_save_bg сам не перевыделяет
- * буфер, раз он уже есть — просто перезаписывает содержимым текущего
- * фона под окном), потому что за время, пока окно было свёрнуто, стол
- * под его старыми координатами мог измениться (курсор, другие окна). */
+ 
+
+
+
+
 static void ui_win_restore_from_taskbar(int id) {
     if (id < 0 || id >= (int)UI_MAX_WINDOWS) return;
     ui_window_t *win = &g_windows[id];
@@ -2663,28 +3316,29 @@ static void ui_win_restore_from_taskbar(int id) {
 
     win->minimized = false;
     ui_win_save_bg(id, win->x, win->y);
-    /* Переносим РОВНО те пиксели, что были на экране в момент сворачивания
-     * (см. ui_win_capture в ui_win_minimize выше) — вместо ui_win_draw()
-     * (рамка + пустое белое тело), из-за которого содержимое userspace-
-     * окон "исчезало" (становилось белой заливкой) после restore. Тот же
-     * приём, что уже используется при перетаскивании окна. */
+     
+
+
+
+
     ui_win_blit_captured(id, win->x, win->y);
     if (id == g_fxapp_win_id) fm_draw(id);
     if (id == g_theme_win_id) theme_win_draw(id);
+    if (id == g_fmdlg_win_id) fmdlg_draw(id);
     fb_flip();
 }
 
-/* ui_win_toggle_maximize — развернуть окно на весь экран (кроме панели
- * задач) или вернуть в предыдущий размер/позицию (rest_*).
- *
- * ВАЖНО: saved_bg выделяется ОДИН РАЗ лениво в ui_win_save_bg и больше
- * никогда не перевыделяется сам — он рассчитан на размер win->w*win->h
- * НА МОМЕНТ первого сохранения. Если просто поменять win->w/win->h и
- * вызвать ui_win_save_bg/ui_win_restore_bg заново, буфер останется
- * старого (меньшего) размера — переполнение при копировании кадра под
- * новую (большую) геометрию. Поэтому здесь буфер явно освобождается
- * ПЕРЕД каждым изменением размера, чтобы ui_win_save_bg честно
- * перевыделил его заново под актуальные win->w/win->h. */
+ 
+
+
+
+
+
+
+
+
+
+
 static void ui_win_toggle_maximize(int id) {
     if (id < 0 || id >= (int)UI_MAX_WINDOWS) return;
     ui_window_t *win = &g_windows[id];
@@ -2695,13 +3349,13 @@ static void ui_win_toggle_maximize(int id) {
     ui_win_restore_bg(id, win->x, win->y);
     if (win->saved_bg) { kfree(win->saved_bg); win->saved_bg = NULL; }
     if (win->content_bak) { kfree(win->content_bak); win->content_bak = NULL; }
-    /* Геометрия сейчас изменится (маленькое <-> во весь экран) — старые
-     * пиксели содержимого переносить некуда (другой размер), поэтому, в
-     * отличие от minimize/restore и drag, здесь НЕТ переноса content_bak
-     * как картинки — тело просто перерисовывается пустым (ui_win_draw
-     * ниже), а userspace-приложение обязано перерисовать себя САМО под
-     * новый размер. redraw_gen — это и есть тот сигнал "перерисуйся",
-     * который приложение видит через sys_win_get_rect (см. Syscall.c). */
+     
+
+
+
+
+
+
     win->redraw_gen++;
 
     if (!win->maximized) {
@@ -2725,6 +3379,7 @@ static void ui_win_toggle_maximize(int id) {
     ui_win_draw(id);
     if (id == g_fxapp_win_id) fm_draw(id);
     if (id == g_theme_win_id) theme_win_draw(id);
+    if (id == g_fmdlg_win_id) fmdlg_draw(id);
     fb_flip();
 }
 
@@ -2735,91 +3390,169 @@ void ui_win_close_all_owned_by(int32_t owner_pid) {
     }
 }
 
-/* Список разрешений для Display — фиксированный, поэтому подписи хранятся
- * готовыми строками (в freestanding-окружении нет sprintf/itoa под рукой,
- * а конвертировать 4 числа в текст ради этого не имеет смысла). Индекс 0
- * (1280x800) — значение по умолчанию, показанное в квадратике при старте. */
+ 
+
+
+
+
+
+
+#define UI_RES_MAX 24
 typedef struct {
-    uint32_t    w, h;
-    const char *label;
+    uint32_t w, h;
+    char     label[14];
 } ui_resolution_t;
 
-#define UI_RES_COUNT 4
-static const ui_resolution_t g_resolutions[UI_RES_COUNT] = {
+static ui_resolution_t g_resolutions[UI_RES_MAX] = {
     { 1280, 800,  "1280x800"  },
     { 1366, 768,  "1366x768"  },
     { 1680, 1050, "1680x1050" },
     { 1920, 1080, "1920x1080" },
 };
+static int g_res_count = 4;
 
-static int g_res_idx = 0;   /* 1280x800 — значение по умолчанию в квадратике Display,
-                              * перезаписывается ui_load_persisted_resolution() ниже,
-                              * если на диске уже есть "/display.cfg" от прошлой сессии. */
+static int g_res_idx     = 0;    
+static int g_res_cur_idx = 0;    
 
-/* =========================================================================
- * Персистентность выбора Display — "/display.cfg" в корне VFS-диска.
- *
- * Настоящее переключение физического видеорежима (GOP SetMode) может
- * сделать ТОЛЬКО загрузчик (bootloader.c), пока живы UEFI Boot Services —
- * у уже запущенного ядра их нет (ExitBootServices давно вызван). Поэтому
- * схема в два шага:
- *   1. Здесь, в apply_resolution() — сразу применяем "виртуальное"
- *      разрешение (fb_apply_virtual_resolution, см. начало файла) для
- *      мгновенной обратной связи в текущей сессии, И сохраняем выбор в
- *      "/display.cfg" (простой текст вида "1920x1080\n").
- *   2. При СЛЕДУЮЩЕЙ загрузке bootloader.c: bl_read_display_cfg() читает
- *      этот файл ДО ExitBootServices, находит подходящий GOP-режим через
- *      QueryMode и реально переключает экран через SetMode — это уже
- *      настоящая, физическая смена разрешения монитора/панели.
- * ui_load_persisted_resolution() — обратная операция: при первом
- * ui_draw_desktop() подтягивает g_res_idx из "/display.cfg", чтобы
- * квадратик Display в "Desktop settings" показывал то же значение, что
- * реально применил загрузчик на этом старте (просто синхронизация UI,
- * fb_apply_virtual_resolution() тут НЕ вызывается — разрешение уже и так
- * физически то, что нужно).
- * ========================================================================= */
-static void ui_persist_display_cfg(const char *label) {
+static int res_find(uint32_t w, uint32_t h) {
+    for (int i = 0; i < g_res_count; i++)
+        if (g_resolutions[i].w == w && g_resolutions[i].h == h) return i;
+    return -1;
+}
+
+static void res_make_label(char *dst, uint32_t w, uint32_t h) {
+    char t[12]; int n = 0, o = 0;
+    uint32_t v = w;
+    if (v == 0) t[n++] = '0';
+    while (v > 0 && n < 6) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n > 0) dst[o++] = t[--n];
+    dst[o++] = 'x';
+    v = h;
+    if (v == 0) t[n++] = '0';
+    while (v > 0 && n < 6) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n > 0) dst[o++] = t[--n];
+    dst[o] = '\0';
+}
+
+static int res_add(uint32_t w, uint32_t h) {
+    int i = res_find(w, h);
+    if (i >= 0) return i;
+    if (g_res_count >= UI_RES_MAX) return -1;
+    g_resolutions[g_res_count].w = w;
+    g_resolutions[g_res_count].h = h;
+    res_make_label(g_resolutions[g_res_count].label, w, h);
+    return g_res_count++;
+}
+
+ 
+
+static void res_sort(void) {
+    for (int i = 1; i < g_res_count; i++) {
+        ui_resolution_t key = g_resolutions[i];
+        uint64_t ka = (uint64_t)key.w * key.h;
+        int j = i - 1;
+        while (j >= 0 && (uint64_t)g_resolutions[j].w * g_resolutions[j].h > ka) {
+            g_resolutions[j + 1] = g_resolutions[j];
+            j--;
+        }
+        g_resolutions[j + 1] = key;
+    }
+}
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+static bool ui_persist_display_cfg(const char *label) {
     int fd = vfs_open("/display.cfg", O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) {
         DBG_MSG("UI", "display.cfg: vfs_open(write) failed");
-        return;
+        return false;
     }
-    vfs_write(fd, label, strlen(label));
-    vfs_write(fd, "\n", 1);
+    size_t len = strlen(label);
+    int64_t w1 = vfs_write(fd, label, len);
+    int64_t w2 = vfs_write(fd, "\n", 1);
     vfs_close(fd);
+    return (w1 == (int64_t)len && w2 == 1);
 }
 
-static void ui_load_persisted_resolution(void) {
-    int fd = vfs_open("/display.cfg", O_RDONLY);
-    if (fd < 0) return;   /* файла нет — первая загрузка, оставляем g_res_idx = 0 */
+ 
 
-    char buf[32];
+static void ui_load_mode_list(void) {
+    int fd = vfs_open("/modes.txt", O_RDONLY);
+    if (fd < 0) return;    
+
+    char buf[768];
     int64_t got = vfs_read(fd, buf, sizeof(buf) - 1);
     vfs_close(fd);
     if (got <= 0) return;
-
     buf[got] = '\0';
-    for (int64_t i = 0; i < got; i++) {
-        if (buf[i] == '\n' || buf[i] == '\r') { buf[i] = '\0'; break; }
-    }
 
-    for (int i = 0; i < UI_RES_COUNT; i++) {
-        if (strcmp(buf, g_resolutions[i].label) == 0) {
-            g_res_idx = i;
-            break;
+    ui_resolution_t tmp[UI_RES_MAX];
+    int tn = 0;
+    int64_t i = 0;
+    while (i < got && tn < UI_RES_MAX) {
+        uint32_t a = 0, b = 0; bool ha = false, hb = false;
+        while (i < got && buf[i] >= '0' && buf[i] <= '9') { a = a * 10 + (uint32_t)(buf[i] - '0'); i++; ha = true; }
+        if (i < got && (buf[i] == 'x' || buf[i] == 'X')) {
+            i++;
+            while (i < got && buf[i] >= '0' && buf[i] <= '9') { b = b * 10 + (uint32_t)(buf[i] - '0'); i++; hb = true; }
         }
+        if (ha && hb && a >= 640 && b >= 480 && a <= 16384 && b <= 16384) {
+            bool dup = false;
+            for (int k = 0; k < tn; k++) if (tmp[k].w == a && tmp[k].h == b) dup = true;
+            if (!dup) { tmp[tn].w = a; tmp[tn].h = b; tn++; }
+        }
+        while (i < got && buf[i] != '\n') i++;    
+        i++;
     }
+    if (tn == 0) return;
+
+    g_res_count = 0;
+    for (int k = 0; k < tn; k++) res_add(tmp[k].w, tmp[k].h);
+}
+
+ 
+
+
+
+static void ui_load_persisted_resolution(void) {
+    ui_load_mode_list();
+    (void)res_add(g_fb.native_width, g_fb.native_height);    
+    res_sort();
+    int cur = res_find(g_fb.native_width, g_fb.native_height);
+    g_res_cur_idx = (cur >= 0) ? cur : 0;
+    g_res_idx     = g_res_cur_idx;
 }
 
 
-/* =========================================================================
- * apply_theme — применить тему g_themes[idx]: перекрасить панель задач,
- * кнопку Menu, кнопки приложений на панели задач и заголовок ("верхнюю
- * рамку") всех окон, и перезагрузить обои под новую тему. ui_draw_desktop()
- * делает полный редрав — этого достаточно, чтобы обновилось вообще всё
- * (включая уже открытые окна, см. хуки theme_win_draw/fm_draw в его цикле
- * выше по файлу).
- * ========================================================================= */
+ 
+
+
+
+
+
+
+
 static void apply_theme(int idx) {
     if (idx < 0 || idx >= UI_THEME_COUNT) return;
     g_theme_idx = idx;
@@ -2834,46 +3567,92 @@ static void apply_theme(int idx) {
     ui_draw_desktop();
 }
 
-/* =========================================================================
- * apply_resolution — применить g_resolutions[idx]: "смена разрешения"
- * рабочего стола (см. подробный комментарий у fb_apply_virtual_resolution
- * в начале файла — это не переключение физического видеорежима, а смена
- * логической рабочей области внутри уже промапленного GOP-буфера).
- * ========================================================================= */
-static void apply_resolution(int idx) {
-    if (idx < 0 || idx >= UI_RES_COUNT) return;
-    g_res_idx = idx;
+ 
 
-    fb_apply_virtual_resolution(g_resolutions[idx].w, g_resolutions[idx].h);
-    ui_persist_display_cfg(g_resolutions[idx].label);
-    DBG_VAL("UI", "resolution changed to idx", (uint64_t)idx);
+
+
+
+
+
+
+
+
+
+
+
+extern void usb_delay_ms(uint32_t ms);
+
+static void res_show_message(const char *msg) {
+    uint32_t sw = g_fb.width, sh = g_fb.height;
+    uint32_t tw = (uint32_t)fb_text_width(msg);
+    uint32_t bw = tw + 40, bh = 60;
+    if (bw > sw || bh > sh) return;
+    int32_t bx = (int32_t)((sw - bw) / 2u), by = (int32_t)((sh - bh) / 2u);
+    fb_fill_rect(bx, by, bw, bh, FB_BLACK);
+    fb_draw_rect(bx, by, bw, bh, 0xFFFFFFU, 2);
+    fb_draw_string(bx + 20, by + (int32_t)((bh - FB_FONT_H) / 2u), msg, FB_WHITE, FB_BLACK);
+    fb_flip();
+}
+
+static void apply_resolution(int idx) {
+    if (idx < 0 || idx >= g_res_count) return;
+    const ui_resolution_t *r = &g_resolutions[idx];
+
+     
+
+    if (r->w == g_fb.native_width && r->h == g_fb.native_height) {
+        g_res_idx = g_res_cur_idx = idx;
+        fb_apply_virtual_resolution(r->w, r->h);
+        ui_draw_desktop();
+        return;
+    }
+
+    char msg[64] = "Applying ";
+    size_t n = strlen(msg);
+    for (const char *q = r->label; *q && n < 40; q++) msg[n++] = *q;
+    const char *tail = " - restarting...";
+    for (const char *q = tail; *q && n < 62; q++) msg[n++] = *q;
+    msg[n] = '\0';
+
+    if (ui_persist_display_cfg(r->label)) {
+        DBG_VAL("UI", "resolution saved, rebooting, idx", (uint64_t)idx);
+        res_show_message(msg);
+        usb_delay_ms(800);           
+        ui_system_reboot();          
+        return;
+    }
+
+     
+    DBG_MSG("UI", "display.cfg write failed - virtual resolution fallback");
+    g_res_idx = g_res_cur_idx = idx;
+    fb_apply_virtual_resolution(r->w, r->h);
     ui_draw_desktop();
 }
 
-/* =========================================================================
- * Окно "Desktop settings" — две строки-настройки:
- *   Theme   — квадратик с именем темы + стрелка ">", листает темы по кругу
- *             (Desert -> Space -> Lines -> Desert), см. apply_theme() выше.
- *   Display — квадратик с текущим разрешением + такая же стрелка, листает
- *             g_resolutions по кругу и сразу применяет (apply_resolution).
- * Окно создаётся тем же генерическим ui_win_create(), что и "My Computer"
- * (owner_pid = -1 — окно ядра), поэтому перетаскивание/закрытие/сворачи-
- * вание/разворачивание уже работают "бесплатно" через общий код ниже
- * (см. ui_desktop_handle_mouse) — специфично для этого окна только само
- * содержимое (theme_win_draw) и клик по стрелкам (theme_win_handle_click).
- * ========================================================================= */
+ 
+
+
+
+
+
+
+
+
+
+
+
 #define THEME_WIN_W          300u
-#define THEME_WIN_H          150u
+#define THEME_WIN_H          196u
 
 #define THEME_ROW_THEME          0
 #define THEME_ROW_DISPLAY        1
 #define THEME_ROW_COUNT           2
 
 #define THEME_LABEL_X          16
-#define THEME_ROW_Y             16   /* Y первой строки внутри тела окна */
+#define THEME_ROW_Y             16    
 #define THEME_BOX_W             90u
 #define THEME_BOX_H             30u
-#define THEME_BOX_GAP           14   /* и горизонтальный отступ, и вертикальный между строками */
+#define THEME_BOX_GAP           14    
 #define THEME_ARROW_W           30u
 #define THEME_ARROW_H           30u
 #define THEME_BOX_BG        FB_BLACK
@@ -2882,16 +3661,16 @@ static void apply_resolution(int idx) {
 #define THEME_ARROW_BG      0x303030U
 #define THEME_ARROW_FG      FB_WHITE
 
-/* Подпись строки ("Theme"/"Display") — используется и при отрисовке, и
- * при расчёте геометрии (чтобы обе колонки квадратиков были выровнены по
- * более длинной подписи, "Display"). */
+ 
+
+
 static const char *theme_row_label(int row) {
     return (row == THEME_ROW_DISPLAY) ? "Display" : "Theme";
 }
 
-/* Общая геометрия строки: label_x/box_x/box_y. box_x одинаков для обеих
- * строк (считается от самой длинной подписи, "Display"), чтобы квадратики
- * Theme и Display стояли ровно друг под другом. */
+ 
+
+
 static void theme_row_positions(int win_id, int row,
                                 int32_t *label_x, int32_t *box_x, int32_t *box_y) {
     ui_window_t *win = &g_windows[win_id];
@@ -2903,8 +3682,8 @@ static void theme_row_positions(int win_id, int row,
     *box_y   = base_y + THEME_ROW_Y + row * (int32_t)(THEME_BOX_H + THEME_BOX_GAP);
 }
 
-/* Геометрия кнопки-стрелки — общая функция для рисования и хит-теста,
- * чтобы они не могли разъехаться (тот же паттерн, что ui_win_btn_rects). */
+ 
+
 static void theme_arrow_rect(int win_id, int row, int32_t *ax, int32_t *ay,
                              uint32_t *aw, uint32_t *ah) {
     int32_t label_x, box_x, box_y;
@@ -2915,8 +3694,18 @@ static void theme_arrow_rect(int win_id, int row, int32_t *ax, int32_t *ay,
     *ah = THEME_ARROW_H;
 }
 
-/* Нарисовать одну строку-настройку: подпись, тёмный квадратик со значением
- * и кнопку-стрелку ">". value — то, что показывается в квадратике. */
+ 
+static void theme_apply_rect(int win_id, int32_t *bx, int32_t *by, uint32_t *bw, uint32_t *bh) {
+    int32_t label_x, box_x, box_y;
+    theme_row_positions(win_id, THEME_ROW_DISPLAY, &label_x, &box_x, &box_y);
+    *bx = box_x;
+    *by = box_y + (int32_t)THEME_BOX_H + THEME_BOX_GAP;
+    *bw = THEME_BOX_W + (uint32_t)THEME_BOX_GAP + THEME_ARROW_W;
+    *bh = THEME_BOX_H;
+}
+
+ 
+
 static void theme_row_draw(int win_id, int row, const char *value) {
     int32_t label_x, box_x, box_y;
     theme_row_positions(win_id, row, &label_x, &box_x, &box_y);
@@ -2950,16 +3739,30 @@ static void theme_win_draw(int win_id) {
     int32_t  base_y    = win->y + (int32_t)UI_WIN_TITLEBAR_H;
     uint32_t content_h = (win->h > UI_WIN_TITLEBAR_H) ? win->h - UI_WIN_TITLEBAR_H : 0;
 
-    /* Стираем тело — на случай смены названия темы (Desert -> Space) или
-     * значения разрешения (1280x800 -> 1366x768 и т.п.). */
+     
+
     fb_fill_rect(base_x, base_y, win->w, content_h, UI_WIN_BODY_BG);
 
     theme_row_draw(win_id, THEME_ROW_THEME,   g_themes[g_theme_idx].name);
     theme_row_draw(win_id, THEME_ROW_DISPLAY, g_resolutions[g_res_idx].label);
+
+     
+
+    int32_t bx, by; uint32_t bw, bh;
+    theme_apply_rect(win_id, &bx, &by, &bw, &bh);
+    bool pending = (g_res_idx != g_res_cur_idx);
+    fb_color_t bg = pending ? 0x2266CCU : 0xB0B0B0U;
+    const char *txt = pending ? "Apply & restart" : "Current mode";
+    fb_fill_rect(bx, by, bw, bh, bg);
+    fb_draw_rect(bx, by, bw, bh, THEME_BOX_BORDER, 1);
+    int32_t ttw = (int32_t)fb_text_width(txt);
+    fb_draw_string(bx + (int32_t)((bw - (uint32_t)(ttw > 0 ? ttw : 0)) / 2u),
+                   by + (int32_t)((bh - FB_FONT_H) / 2u), txt,
+                   pending ? FB_WHITE : 0x505050U, bg);
 }
 
-/* Клик внутри тела окна "Desktop settings" — реагируем только на попадание
- * в одну из двух кнопок-стрелок; остальная область окна не интерактивна. */
+ 
+
 static void theme_win_handle_click(int win_id, int32_t x, int32_t y) {
     int32_t ax, ay; uint32_t aw, ah;
 
@@ -2971,12 +3774,22 @@ static void theme_win_handle_click(int win_id, int32_t x, int32_t y) {
 
     theme_arrow_rect(win_id, THEME_ROW_DISPLAY, &ax, &ay, &aw, &ah);
     if (point_in_rect(x, y, ax, ay, aw, ah)) {
-        apply_resolution((g_res_idx + 1) % UI_RES_COUNT);
+         
+        g_res_idx = (g_res_idx + 1) % (g_res_count > 0 ? g_res_count : 1);
+        theme_win_draw(win_id);
+        fb_flip();
+        return;
+    }
+
+    int32_t bx, by; uint32_t bw, bh;
+    theme_apply_rect(win_id, &bx, &by, &bw, &bh);
+    if (point_in_rect(x, y, bx, by, bw, bh) && g_res_idx != g_res_cur_idx) {
+        apply_resolution(g_res_idx);
     }
 }
 
-/* Открыть окно "Desktop settings" (или показать обратно, если было
- * свёрнуто) — вызывается по клику на пункт контекстного меню ниже. */
+ 
+
 static void ui_open_theme_window(void) {
     if (g_theme_win_id < 0 || !g_windows[g_theme_win_id].used || !g_windows[g_theme_win_id].open) {
         g_theme_win_id = ui_win_create("Desktop settings", THEME_WIN_W, THEME_WIN_H, -1);
@@ -2989,15 +3802,15 @@ static void ui_open_theme_window(void) {
     }
 }
 
-/* =========================================================================
- * Контекстное меню рабочего стола — тёмное всплывающее меню по правому
- * клику на ПУСТОМ месте рабочего стола (не по иконке, не по окну, не по
- * панели задач — см. ui_point_over_any_desktop_icon() и проверки в
- * ui_desktop_handle_mouse). Сейчас один пункт — "Desktop settings".
- * Тот же паттерн save/restore фона под собой, что и у меню "Menu" (см.
- * menu_save_bg/menu_restore_bg выше), но с другой (тёмной) палитрой и
- * позицией "под курсором" вместо фиксированной у кнопки Menu.
- * ========================================================================= */
+ 
+
+
+
+
+
+
+
+
 #define CTXMENU_W               180u
 #define CTXMENU_PAD               8
 #define CTXMENU_ITEM_H           32u
@@ -3058,42 +3871,48 @@ static void ui_draw_ctxmenu(void) {
     fb_flip();
 }
 
-/*
- * ui_desktop_handle_mouse — вызывать на каждом тике (из ui_tick, ДО
- * перерисовки курсора) с текущей позицией мыши и состоянием кнопок.
- * Открывает/закрывает Menu-меню по клику на кнопку Menu, подсвечивает
- * пункты меню под курсором и обрабатывает клики по "Shutdown"/"Reboot".
- */
-/* =========================================================================
- * ВРЕМЕННАЯ диагностика лага при перетаскивании окна — убрать после
- * отладки. Тот же приём, что уже помог найти проблему с
- * ui_flip_userspace_windows (см. Scheduler.c/ui_extra.c, история этого
- * файла) — меряем именно ui_win_move_ex() (единственное, что реально
- * выполняется на КАЖДЫЙ тик мыши во время drag'а) и печатаем только
- * "медленные" вызовы (>= 0.5мс), чтобы не утопить лог.
- * ========================================================================= */
+ 
+
+
+
+
+
+ 
+
+
+
+
+
+
+
 static inline uint64_t dbg_win_rdtsc(void) {
     uint32_t lo, hi;
     __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
 }
 static inline uint64_t dbg_win_tsc_to_ns(uint64_t tsc) {
-    return tsc / 3ULL;   /* ~3 ГГц, то же приближение, что в Scheduler.c/USB.c */
+    return tsc / 3ULL;    
 }
 
 void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
     if (g_fb.mode != FB_MODE_LINEAR) return;
     if (!g_fb.width || !g_fb.height) return;
 
+     
+
+
+    fmdlg_poll_keyboard();
+    ui_kbd_drain_unclaimed();
+
     int32_t panel_y = (int32_t)((g_fb.height >= TASKBAR_H) ? g_fb.height - TASKBAR_H : 0);
 
     bool left_now  = (buttons & 0x01) != 0;
     bool left_was  = (g_prev_buttons & 0x01) != 0;
-    bool left_click = left_now && !left_was;   /* фронт нажатия */
+    bool left_click = left_now && !left_was;    
 
-    /* Клик по кнопке Menu — открыть/закрыть меню */
+     
     int32_t mbx = MENU_BTN_X;
-    int32_t mby = panel_y;   /* кнопка во всю высоту панели задач */
+    int32_t mby = panel_y;    
     if (left_click && point_in_rect(x, y, mbx, mby, MENU_BTN_W, MENU_BTN_H)) {
         if (g_ctxmenu_open) {
             ctxmenu_restore_bg(g_ctxmenu_x, g_ctxmenu_y);
@@ -3132,25 +3951,82 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
         if (left_click && new_hover >= 0) {
             if (new_hover == 0) ui_system_shutdown();
             else                ui_system_reboot();
-            /* не возвращаемся — на случай если shutdown/reboot не сработали
-             * (реальное железо без ACPI/8042), меню остаётся открытым */
+             
+
         } else if (left_click && new_hover < 0 &&
                    !point_in_rect(x, y, mx, my, MENU_POPUP_W, MENU_POPUP_H)) {
-            /* клик мимо меню и мимо кнопки Menu — закрыть */
+             
             menu_restore_bg(mx, my);
             g_menu_open = false;
         }
     }
 
-    /* ---- ПКМ по пустому месту рабочего стола — тёмное контекстное меню
-     * с пунктом "Desktop settings" (см. блок выше, перед этой функцией).
-     * НЕ открывается: над иконками (My Computer/Calculator/SysLogs),
-     * над открытым окном, над панелью задач и пока открыто меню "Menu". */
+     
+
+
+
     bool right_now   = (buttons & 0x02) != 0;
     bool right_was   = (g_prev_buttons & 0x02) != 0;
     bool right_click = right_now && !right_was;
 
     if (right_click) {
+         
+
+
+
+
+        if (g_fxapp_win_id >= 0 && g_windows[g_fxapp_win_id].used &&
+            g_windows[g_fxapp_win_id].open && !g_windows[g_fxapp_win_id].minimized) {
+            ui_window_t *fmw = &g_windows[g_fxapp_win_id];
+            bool in_fm_body = y >= fmw->y + (int32_t)UI_WIN_TITLEBAR_H &&
+                              point_in_rect(x, y, fmw->x, fmw->y, fmw->w, fmw->h);
+
+            if (in_fm_body && g_fm_view == FM_VIEW_DIR) {
+                if (g_ctxmenu_open) { ctxmenu_restore_bg(g_ctxmenu_x, g_ctxmenu_y); g_ctxmenu_open = false; }
+                if (g_fmctx_open)   { fmctx_restore_bg(g_fmctx_x, g_fmctx_y);       g_fmctx_open = false; }
+
+                 
+
+                int hit = fm_hit_test(g_fxapp_win_id, x, y);
+                if (hit >= 0 && (g_fm_entries[hit].kind == FM_KIND_DIR ||
+                                 g_fm_entries[hit].kind == FM_KIND_FILE)) {
+                    g_fmctx_mode   = 1;
+                    g_fmctx_n      = 1;
+                    g_fmctx_is_dir = (g_fm_entries[hit].kind == FM_KIND_DIR);
+                    strlcpy(g_fmctx_name, g_fm_entries[hit].label, sizeof(g_fmctx_name));
+                    strlcpy(g_fmctx_dir,  g_fm_cur_path,           sizeof(g_fmctx_dir));
+                } else if (hit >= 0) {
+                     
+                    g_prev_buttons = buttons;
+                    return;
+                } else {
+                    g_fmctx_mode = 0;
+                    g_fmctx_n    = 2;
+                }
+
+                int32_t mx = x, my = y;
+                if (mx + (int32_t)FMCTX_W > (int32_t)g_fb.width) mx = (int32_t)g_fb.width - (int32_t)FMCTX_W;
+                if (my + (int32_t)fmctx_h() > panel_y) my = panel_y - (int32_t)fmctx_h();
+                if (mx < 0) mx = 0;
+                if (my < 0) my = 0;
+
+                g_fmctx_x = mx; g_fmctx_y = my;
+                g_fmctx_win_id = g_fxapp_win_id;
+                g_fmctx_hover = -1;
+                fmctx_save_bg(mx, my);
+                fmctx_draw();
+                g_fmctx_open = true;
+
+                g_prev_buttons = buttons;
+                return;
+            } else if (in_fm_body) {
+                 
+
+                g_prev_buttons = buttons;
+                return;
+            }
+        }
+
         bool over_taskbar = (y >= panel_y);
         bool over_icon = ui_point_over_any_desktop_icon(x, y);
         bool over_window = false;
@@ -3199,16 +4075,44 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
             ui_open_theme_window();
         } else if (left_click && !now_hover &&
                    !point_in_rect(x, y, g_ctxmenu_x, g_ctxmenu_y, CTXMENU_W, CTXMENU_H)) {
-            /* клик мимо меню — закрыть без действия */
+             
             ctxmenu_restore_bg(g_ctxmenu_x, g_ctxmenu_y);
             g_ctxmenu_open = false;
         }
     }
 
-    /* ---- Панель задач: клик по вкладке открытого окна — если оно
-     * свёрнуто (minimized), показать его обратно. Обычный (не
-     * свёрнутый) клик по своей же вкладке пока просто ни на что не
-     * влияет — z-order/фокус здесь не реализован. */
+     
+
+    if (g_fmctx_open) {
+        int new_hover = -1;
+        for (int i = 0; i < g_fmctx_n; i++) {
+            int32_t ix, iy; uint32_t iw, ih;
+            fmctx_item_rect(i, g_fmctx_x, g_fmctx_y, &ix, &iy, &iw, &ih);
+            if (point_in_rect(x, y, ix, iy, iw, ih)) { new_hover = i; break; }
+        }
+        if (new_hover != g_fmctx_hover) {
+            g_fmctx_hover = new_hover;
+            fmctx_draw();
+        }
+
+        if (left_click && new_hover >= 0) {
+            fmctx_restore_bg(g_fmctx_x, g_fmctx_y);
+            g_fmctx_open = false;
+            if (g_fmctx_mode == 1)
+                fmctx_do_delete();
+            else
+                fmdlg_open(new_hover == 0 ? FMDLG_FOLDER : FMDLG_FILE, g_fmctx_win_id);
+        } else if (left_click && new_hover < 0 &&
+                   !point_in_rect(x, y, g_fmctx_x, g_fmctx_y, FMCTX_W, fmctx_h())) {
+            fmctx_restore_bg(g_fmctx_x, g_fmctx_y);
+            g_fmctx_open = false;
+        }
+    }
+
+     
+
+
+
     if (left_click) {
         int slot = 0;
         for (int i = 0; i < (int)UI_MAX_WINDOWS; i++) {
@@ -3217,28 +4121,29 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
             ui_taskbar_app_btn_rect(slot, panel_y, &bx, &by, &bw, &bh);
             if (point_in_rect(x, y, bx, by, bw, bh)) {
                 if (g_windows[i].minimized) ui_win_restore_from_taskbar(i);
+                ui_focus_set(i);
                 break;
             }
             slot++;
         }
     }
 
-    /* ---- fxapp: иконка "My Computer" на рабочем столе — hover + клик ----
-     * Клик по иконке вызывает ui_win_create() — ТОТ ЖЕ САМЫЙ вызов,
-     * которым пользуются syscall'ы SYS_WIN_CREATE из Syscall.c, то есть
-     * "запуск" My Computer идёт по общему для всех приложений пути.
-     *
-     * ВАЖНО: icon_rect() — фиксированная позиция на экране, но сама
-     * иконка физически может быть сейчас ПОД открытым окном (обычное
-     * окно перетащили поверх; развёрнутое (maximize) окно — почти
-     * всегда, у него титульная плашка с кнопками close/expand/minimize
-     * занимает как раз тот же верхний правый угол). Раньше hover-логика
-     * этого не проверяла и просто перерисовывала MyPC.png поверх
-     * содержимого окна каждый раз, когда курсор оказывался над этой
-     * областью — визуально выглядело как "иконка вылезает поверх
-     * кнопки expand". Пропускаем весь блок, если курсор сейчас находится
-     * внутри любого открытого (не свёрнутого) окна — тогда клик там
-     * принадлежит окну, а не рабочему столу. */
+     
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     bool cursor_over_window = false;
     for (int wi = 0; wi < (int)UI_MAX_WINDOWS; wi++) {
         ui_window_t *w = &g_windows[wi];
@@ -3264,8 +4169,8 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
             if (g_fxapp_win_id < 0 || !g_windows[g_fxapp_win_id].used) {
                 g_fxapp_win_id = ui_win_create(g_fxapp_title, FXAPP_WIN_W, FXAPP_WIN_H, -1);
                 if (g_fxapp_win_id >= 0) {
-                    /* Каждое открытие — заново с списка дисков (см. блок
-                     * "My Computer" — содержимое окна выше). */
+                     
+
                     fm_reset();
                     fm_draw(g_fxapp_win_id);
                     fb_flip();
@@ -3273,20 +4178,20 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
             }
         }
     } else if (g_fxapp_icon_hover) {
-        /* Курсор ушёл под окно, пока иконка была в hover-состоянии —
-         * снимаем флаг без перерисовки (рисовать сейчас нечего, иконка
-         * физически закрыта окном; когда окно уйдёт/закроется, следующий
-         * тик пересчитает hover заново по текущей позиции курсора). */
+         
+
+
+
         g_fxapp_icon_hover = false;
     }
 
-    /* ---- Калькулятор: hover + клик — В ОТЛИЧИЕ от My Computer, клик
-     * НЕ создаёт окно напрямую (ui_win_create), а запускает НАСТОЯЩИЙ
-     * userspace-процесс через elf64_spawn(g_calc_elf_path, ...). Само
-     * окно/содержимое калькулятор создаёт и рисует уже ИЗНУТРИ себя,
-     * через SYS_WIN_CREATE/SYS_WIN_GET_RECT/SYS_GET_FRAMEBUFFER —
-     * ядро тут ничего не знает про арифметику/кнопки калькулятора,
-     * это именно вынесенное в userspace приложение (fxapp с elf_path). */
+     
+
+
+
+
+
+
     if (!cursor_over_window) {
         int32_t icx, icy;
         calc_icon_rect(&icx, &icy);
@@ -3302,40 +4207,32 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
         }
 
         if (left_click && now_hover) {
-            /* НЕ запускаем второй экземпляр, если предыдущий ещё жив —
-             * несколько одновременных ring3-процессов обнажают гонки
-             * при спавне/переключении контекста (общий стек SYSCALL уже
-             * чинили; вскрылись и другие). Проще и надёжнее не пускать
-             * пользователя в эту ситуацию вообще, чем гоняться за каждой
-             * гонкой по отдельности — так же ведут себя и обычные ОС
-             * (повторный клик по иконке уже запущенного приложения
-             * обычно не создаёт второй процесс). */
-            if (g_calc_running_tid >= 0 && sched_task_alive((uint32_t)g_calc_running_tid)) {
-                DBG_MSG("FXA", "calc: уже запущен, повторный спавн пропущен");
-                return;
-            }
+             
 
-            /* elf64_spawn() читает calc.elf с диска (блокирующий VFS/FAT32
-             * I/O) — та же причина реентрантности, что чинили для
-             * fm_reset()/fm_handle_click() в "My Computer" (см.
-             * fm_io_cli/fm_io_sti выше): без cli() таймерный тик может
-             * повторно войти в этот же обработчик ДО того как g_prev_buttons
-             * обновится, читая g_calc_icon_hover/клик в неконсистентном
-             * состоянии. */
-            uint64_t spawn_flags = fm_io_cli();
-            int tid = elf64_spawn(g_calc_elf_path, g_calc_title, 0 /* SCHED_PRIO_NORMAL */);
-            fm_io_sti(spawn_flags);
-            g_calc_running_tid = tid;
-            if (tid < 0) {
-                DBG_VAL("FXA", "calc: elf64_spawn failed, rc", (uint64_t)(int64_t)tid);
+
+
+
+
+
+
+            if (g_calc_running_tid >= 0 && sched_task_alive((uint32_t)g_calc_running_tid)) {
+                DBG_MSG("FXA", "calc: already running, repeated spawn skipped");
+            } else {
+                dbg_puts("[FXA] click on icon 'calc' -> spawn\n");
+                uint64_t spawn_flags = fm_io_cli();
+                int tid = elf64_spawn(g_calc_elf_path, g_calc_title, 0  );
+                fm_io_sti(spawn_flags);
+                g_calc_running_tid = tid;
+                fexox_os_dbg_spawn_rc = tid;
+                DBG_RC("FXA", "calc: elf64_spawn rc", tid);
             }
         }
     } else if (g_calc_icon_hover) {
         g_calc_icon_hover = false;
     }
 
-    /* ---- SysLogs: тот же паттерн, что и калькулятор — реальный
-     * userspace-процесс через elf64_spawn(g_syslogs_elf_path, ...). */
+     
+
     if (!cursor_over_window) {
         int32_t icx, icy;
         syslogs_icon_rect(&icx, &icy);
@@ -3351,40 +4248,81 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
         }
 
         if (left_click && now_hover) {
-            /* Не запускаем второй экземпляр, пока первый ещё жив — та же
-             * причина, что и у калькулятора (см. комментарий выше). */
-            if (g_syslogs_running_tid >= 0 && sched_task_alive((uint32_t)g_syslogs_running_tid)) {
-                DBG_MSG("FXA", "syslogs: уже запущен, повторный спавн пропущен");
-                return;
-            }
+             
 
-            uint64_t spawn_flags = fm_io_cli();
-            int tid = elf64_spawn(g_syslogs_elf_path, g_syslogs_title, 0 /* SCHED_PRIO_NORMAL */);
-            fm_io_sti(spawn_flags);
-            g_syslogs_running_tid = tid;
-            if (tid < 0) {
-                DBG_VAL("FXA", "syslogs: elf64_spawn failed, rc", (uint64_t)(int64_t)tid);
+            if (g_syslogs_running_tid >= 0 && sched_task_alive((uint32_t)g_syslogs_running_tid)) {
+                DBG_MSG("FXA", "syslogs: already running, repeated spawn skipped");
+            } else {
+                dbg_puts("[FXA] click on icon 'syslogs' -> spawn\n");
+                uint64_t spawn_flags = fm_io_cli();
+                int tid = elf64_spawn(g_syslogs_elf_path, g_syslogs_title, 0  );
+                fm_io_sti(spawn_flags);
+                g_syslogs_running_tid = tid;
+                fexox_os_dbg_spawn_rc = tid;
+                DBG_RC("FXA", "syslogs: elf64_spawn rc", tid);
             }
         }
     } else if (g_syslogs_icon_hover) {
         g_syslogs_icon_hover = false;
     }
 
-    /* ---- Окна — перетаскивание за заголовок, закрытие крестиком.
-     * Обрабатываем ВСЕ открытые окна одинаково (My Computer и любые
-     * будущие окна, созданные через SYS_WIN_CREATE). ---- */
+     
+
+    if (!cursor_over_window) {
+        int32_t icx, icy;
+        browser_icon_rect(&icx, &icy);
+        int32_t  hx = icx - FXAPP_ICON_HALO_PAD;
+        int32_t  hy = icy - FXAPP_ICON_HALO_PAD;
+        uint32_t hw = FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD;
+        uint32_t hh = FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD;
+
+        bool now_hover = point_in_rect(x, y, hx, hy, hw, hh);
+        if (now_hover != g_browser_icon_hover) {
+            g_browser_icon_hover = now_hover;
+            browser_draw_icon(g_browser_icon_hover);
+        }
+
+        if (left_click && now_hover) {
+             
+
+            if (g_browser_running_tid >= 0 && sched_task_alive((uint32_t)g_browser_running_tid)) {
+                DBG_MSG("FXA", "browser: already running, repeated spawn skipped");
+            } else {
+                dbg_puts("[FXA] click on icon 'browser' -> spawn\n");
+                uint64_t spawn_flags = fm_io_cli();
+                int tid = elf64_spawn(g_browser_elf_path, g_browser_title, 0  );
+                fm_io_sti(spawn_flags);
+                g_browser_running_tid = tid;
+                fexox_os_dbg_spawn_rc = tid;
+                DBG_RC("FXA", "browser: elf64_spawn rc", tid);
+            }
+        }
+    } else if (g_browser_icon_hover) {
+        g_browser_icon_hover = false;
+    }
+
+     
+
+
     for (int i = 0; i < (int)UI_MAX_WINDOWS; i++) {
         ui_window_t *win = &g_windows[i];
         if (!win->used || !win->open) continue;
-        if (win->minimized) continue;   /* невидимо — некликабельно, кроме вкладки на панели задач (см. выше) */
+        if (win->minimized) continue;    
 
         int32_t cx, cy, ex, ey, mnx, mny;
         ui_win_btn_rects(win, &cx, &cy, &ex, &ey, &mnx, &mny);
 
         if (left_click && point_in_rect(x, y, cx, cy, UI_WIN_CLOSE_SZ, UI_WIN_CLOSE_SZ)) {
+            int32_t closed_owner = win->owner_pid;
             ui_win_close(i);
+            if (closed_owner > 0) {
+                ui_request_exit(closed_owner);    
+                dbg_puts("[WIN] close button: exit requested for pid ");
+                dbg_dec64((uint64_t)closed_owner); dbg_puts("\n");
+            }
             if (i == g_fxapp_win_id) g_fxapp_win_id = -1;
             if (i == g_theme_win_id) g_theme_win_id = -1;
+            if (i == g_fmdlg_win_id) { g_fmdlg_win_id = -1; g_fmdlg_kind = FMDLG_NONE; }
             continue;
         }
 
@@ -3398,8 +4336,13 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
             continue;
         }
 
-        /* Клик по телу окна "My Computer" (не по заголовку/крестику) —
-         * навигация по дискам/папкам, см. fm_handle_click выше. */
+         
+
+        if (left_click && point_in_rect(x, y, win->x, win->y, win->w, win->h))
+            ui_focus_set(i);
+
+         
+
         if (i == g_fxapp_win_id && left_click &&
             y >= win->y + (int32_t)UI_WIN_TITLEBAR_H &&
             point_in_rect(x, y, win->x, win->y, win->w, win->h)) {
@@ -3407,16 +4350,24 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
             fm_handle_click(i, x, y);
         }
 
-        /* Клик по телу окна "Desktop settings" — реагирует только кнопка
-         * со стрелкой ">" (см. theme_win_handle_click выше). */
+         
+
         if (i == g_theme_win_id && left_click &&
             y >= win->y + (int32_t)UI_WIN_TITLEBAR_H &&
             point_in_rect(x, y, win->x, win->y, win->w, win->h)) {
             theme_win_handle_click(i, x, y);
         }
 
+         
+
+        if (i == g_fmdlg_win_id && left_click &&
+            y >= win->y + (int32_t)UI_WIN_TITLEBAR_H &&
+            point_in_rect(x, y, win->x, win->y, win->w, win->h)) {
+            fmdlg_handle_click(i, x, y);
+        }
+
         if (left_click && point_in_rect(x, y, win->x, win->y, win->w, UI_WIN_TITLEBAR_H)) {
-            /* захват за заголовок — не за саму кнопку close */
+             
             win->dragging = true;
             win->drag_off_x = x - win->x;
             win->drag_off_y = y - win->y;
@@ -3439,7 +4390,7 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
                 uint64_t t0 = dbg_win_rdtsc();
                 ui_win_move_ex(i, nx, ny, false);
                 uint64_t ns = dbg_win_tsc_to_ns(dbg_win_rdtsc() - t0);
-                if (ns >= 500000ULL) {   /* >= 0.5мс */
+                if (ns >= 500000ULL) {    
                     DBG_VAL("DRAG", "ui_win_move_ex SLOW, ns", ns);
                     DBG_VAL("DRAG", "  win w", win->w);
                     DBG_VAL("DRAG", "  win h", win->h);
@@ -3451,49 +4402,49 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
     g_prev_buttons = buttons;
 }
 
-/*
- * ui_system_shutdown — выключение питания.
- *
- * Порядок попыток (каждая следующая — фолбэк, если предыдущая не сработала):
- *   1. Настоящий ACPI S5 (AcpiControl.c: RSDP->FADT->\_S5, запись
- *      SLP_TYP|SLP_EN в PM1_CNT) — работает и на реальном ПК, и в QEMU.
- *   2. QEMU/Bochs debug shutdown-порт (0x604/0xB004) — на реальном железе
- *      это просто запись в никуда, безвредно, но и бесполезно; оставлено
- *      на случай сборки без ACPI-таблиц (например урезанный QEMU-профиль).
- *   3. hlt-цикл — если вообще ничего не сработало, машина зависает,
- *      а не продолжает работать с открытым меню.
- */
+ 
+
+
+
+
+
+
+
+
+
+
+
 static void ui_system_shutdown(void) {
     DBG_MSG("UI", "shutdown requested");
 
-    acpi_power_off();   /* при успехе сюда управление не возвращается */
+    acpi_power_off();    
 
-    DBG_MSG("UI", "shutdown: ACPI недоступен/не сработал, QEMU-фолбэк");
+    DBG_MSG("UI", "shutdown: ACPI unavailable/failed, QEMU fallback");
     __asm__ volatile ("outw %0, %1" : : "a"((uint16_t)0x2000), "Nd"((uint16_t)0x604));
     __asm__ volatile ("outw %0, %1" : : "a"((uint16_t)0x2000), "Nd"((uint16_t)0xB004));
 
     for (;;) __asm__ volatile ("hlt");
 }
 
-/*
- * ui_system_reboot — программная перезагрузка.
- *
- * Порядок попыток:
- *   1. ACPI Reset Register (FADT, ACPI 2.0+) — самый надёжный способ на
- *      современном реальном железе, официально документирован в ACPI spec.
- *   2. Импульс RESET через контроллер клавиатуры 8042 (команда 0xFE в
- *      порт 0x64) — классика, работает почти на всём железе с i8042
- *      (и в QEMU), но на некоторых чипсетах без i8042 (USB-only,
- *      "legacy-free") не срабатывает.
- *   3. Triple fault (lidt с limit=0 + программное исключение) — работает
- *      абсолютно всегда на x86, это последний гарантированный фолбэк.
- */
+ 
+
+
+
+
+
+
+
+
+
+
+
+
 static void ui_system_reboot(void) {
     DBG_MSG("UI", "reboot requested");
 
-    acpi_reset();        /* при успехе сюда управление не возвращается */
+    acpi_reset();         
 
-    DBG_MSG("UI", "reboot: ACPI reset недоступен, 8042-фолбэк");
+    DBG_MSG("UI", "reboot: ACPI reset unavailable, 8042 fallback");
     for (int i = 0; i < 100; i++) {
         uint8_t status;
         __asm__ volatile ("inb %1, %0" : "=a"(status) : "Nd"((uint16_t)0x64));
@@ -3501,23 +4452,23 @@ static void ui_system_reboot(void) {
     }
     __asm__ volatile ("outb %0, %1" : : "a"((uint8_t)0xFE), "Nd"((uint16_t)0x64));
 
-    /* Даём 8042 немного времени сработать, прежде чем идти на triple fault */
+     
     for (volatile uint32_t i = 0; i < 10000000u; i++) { }
 
-    DBG_MSG("UI", "reboot: 8042 не сработал, triple fault");
-    cpu_triple_fault_reset();   /* никогда не возвращается */
+    DBG_MSG("UI", "reboot: 8042 failed, triple fault");
+    cpu_triple_fault_reset();    
 }
 
-/* =========================================================================
- * ui_draw_desktop
- * ========================================================================= */
+ 
+
+
 void ui_draw_desktop(void) {
     if (g_fb.mode != FB_MODE_LINEAR) return;
 
-    /* Один раз за сессию — синхронизируем g_res_idx с "/display.cfg" (если
-     * он есть), чтобы квадратик Display в "Desktop settings" показывал
-     * то же разрешение, что реально применил загрузчик на этом старте
-     * (см. большой комментарий у ui_load_persisted_resolution выше). */
+     
+
+
+
     static bool persisted_res_loaded = false;
     if (!persisted_res_loaded) {
         persisted_res_loaded = true;
@@ -3546,29 +4497,33 @@ void ui_draw_desktop(void) {
     ui_draw_taskbar_clock((int32_t)panel_y);
     ui_taskbar_draw_app_buttons((int32_t)panel_y);
 
-    /* Подпись рабочего стола в левом верхнем углу — поверх обоев,
-     * прозрачный фон (см. FB_TRANSPARENT_BG в fb_draw_char), чтобы не
-     * закрывать обои непрозрачным прямоугольником. */
-    fb_draw_string(FXAPP_ICON_MARGIN, FXAPP_ICON_MARGIN,
-                   "FEXOX OS Desktop", FB_WHITE, FB_TRANSPARENT_BG);
+     
 
-    /* fxapp: иконка "My Computer" — грузим ассеты один раз, захватываем
-     * чистый фон под ней (для дешёвой перерисовки при hover) и рисуем. */
+
+    fb_draw_string(FXAPP_ICON_MARGIN, FXAPP_ICON_MARGIN,
+                   "Fexox OS Desktop", FB_WHITE, FB_TRANSPARENT_BG);
+
+     
+
     fxapp_ensure_assets_loaded();
     fxapp_capture_icon_bg();
     fxapp_draw_icon(g_fxapp_icon_hover);
 
-    /* Калькулятор — вторая иконка, сразу под MyPC (см. calc_icon_rect). */
+     
     calc_capture_icon_bg();
     calc_draw_icon(g_calc_icon_hover);
 
-    /* SysLogs — третья иконка, сразу под калькулятором. */
+     
     syslogs_capture_icon_bg();
     syslogs_draw_icon(g_syslogs_icon_hover);
 
-    /* Если какие-то окна уже были открыты (например полный редрав вызван
-     * не при старте) — перерисуем их поверх рабочего стола. Общий цикл
-     * для ВСЕХ окон, не только My Computer. */
+     
+    browser_capture_icon_bg();
+    browser_draw_icon(g_browser_icon_hover);
+
+     
+
+
     for (int i = 0; i < (int)UI_MAX_WINDOWS; i++) {
         if (g_windows[i].used && g_windows[i].open) {
             ui_win_save_bg(i, g_windows[i].x, g_windows[i].y);

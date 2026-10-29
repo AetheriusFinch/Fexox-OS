@@ -1,45 +1,6 @@
-/*
- * EHCI.c — драйвер EHCI (Enhanced Host Controller Interface), USB 2.0
- * High-Speed (480 Мбит/с).
- *
- * Область покрытия этой версии (сознательно, см. также USB.h):
- *   - Регистры: Capability + Operational (MMIO, BAR0).
- *   - BIOS->OS handoff через Extended Capabilities (USB Legacy Support,
- *     EECP) — без этого некоторые прошивки продолжают дёргать
- *     контроллер через SMI параллельно с нами.
- *   - Полный сброс контроллера, запуск ТОЛЬКО асинхронного расписания
- *     (Async Schedule) — периодическое (Periodic Schedule/Frame List)
- *     не поднимается вообще: оно нужно для isochronous/interrupt
- *     эндпоинтов, а этот драйвер (как и UHCI.c рядом) пока умеет только
- *     control-передачи, которые идут через Async Schedule.
- *   - Один постоянный async QH (по тому же принципу, что постоянная QH
- *     в UHCI.c) — зациклен сам на себя (horiz_link -> сам QH), на его
- *     next_qtd подвешивается свежепостроенная цепочка qTD на каждый
- *     control_transfer().
- *   - Порты: сброс, определение High-Speed (PORTSC.PE встаёт сама после
- *     аппаратного сброса, если устройство HS) — если PE не встал, но
- *     устройство подключено, порт считается full/low-speed и НЕ наш:
- *     отдаём владение companion-контроллеру через PORTSC.PortOwner
- *     (см. EHCI.h про порядок вызова относительно uhci_pci_scan()).
- *
- * НЕ реализовано (сознательная граница первой версии):
- *   - Split-транзакции (S-mask/C-mask/Hub Addr/Port Num в Endpoint
- *     Capabilities) — то есть full/low-speed устройства ЗА USB-хабом,
- *     висящим на high-speed порту EHCI, эта версия не потянет; такое
- *     устройство просто не ответит на control_transfer (таймаут). Прямо
- *     подключенные full/low-speed устройства работают нормально — они
- *     передаются companion-контроллеру ДО того, как до них доходит
- *     очередь через EHCI.
- *   - Periodic Schedule (interrupt/isochronous эндпоинты) — не нужен
- *     для перечисления устройств (control-transfer-only), появится
- *     вместе с классовыми драйверами (HID и т.п.), см. USB.h.
- *   - 64-битный DMA (CTRLDSSEGMENT всегда 0) — не требуется, вся память
- *     этого ядра при желании прекрасно достаётся из первых 4 ГБ
- *     (см. pmm_alloc_frames_range в MemoryControl.c).
- *
- * Источник: Intel "Enhanced Host Controller Interface Specification for
- * Universal Serial Bus" rev 1.0 — регистры, форматы QH/qTD, EECP.
- */
+/* Fexox OS Project, EULA GPLv2 */
+ 
+
 #include "EHCI.h"
 #include "USB.h"
 #include "debug_out.h"
@@ -47,9 +8,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 
-/* =========================================================================
- * Внешние зависимости ядра — тот же паттерн, что в AHCI.c/UHCI.c рядом.
- * ========================================================================= */
+
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 extern void *memset(void *dst, int c, size_t n);
@@ -64,7 +23,7 @@ extern void        pmm_free_frames(phys_addr_t pa, size_t count);
 #define DIRECT_MAP_OFFSET 0xFFFF880000000000ULL
 #endif
 #define DMA32_MIN_PHYS 0x100000ULL
-#define DMA32_MAX_PHYS 0x100000000ULL   /* CTRLDSSEGMENT=0 -> все указатели 32-битные, см. шапку файла */
+#define DMA32_MAX_PHYS 0x100000000ULL    
 
 static void *dma32_alloc(uint64_t size, uint64_t *out_phys) {
     uint64_t pages = (size + 4095) / 4096;
@@ -88,11 +47,11 @@ static inline void pci_write32(uint8_t bus, uint8_t dev, uint8_t fn, uint8_t reg
     __asm__ volatile ("outl %0,%1" :: "a"(v), "Nd"((uint16_t)0xCFC));
 }
 
-/* MMIO — тот же приём, что в AHCI.c: DIRECT_MAP уже покрывает всю
- * физическую память 1:1 со сдвигом DIRECT_MAP_OFFSET, поэтому регистры
- * читаются/пишутся напрямую по va = phys + DIRECT_MAP_OFFSET, без
- * отдельного vmm_map. mfence — чтобы компилятор/CPU не переупорядочили
- * запись относительно последующего опроса статуса. */
+ 
+
+
+
+
 static inline uint32_t mmio_r32(uint64_t va) {
     return *(volatile uint32_t *)(uintptr_t)va;
 }
@@ -106,19 +65,17 @@ static inline uint64_t ehci_rdtsc(void) {
     __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
     return ((uint64_t)hi << 32) | lo;
 }
-static void ehci_delay_ms(uint32_t ms) {
-    const uint64_t tsc_per_ms = 3000000ULL;
-    uint64_t target = ehci_rdtsc() + tsc_per_ms * ms;
-    while (ehci_rdtsc() < target) __asm__ volatile ("pause" ::: "memory");
-}
+ 
 
-/* =========================================================================
- * Регистры (EHCI spec §2)
- * ========================================================================= */
-#define EHCI_CAP_CAPLENGTH   0x00   /* 8-bit  */
-#define EHCI_CAP_HCIVERSION  0x02   /* 16-bit */
-#define EHCI_CAP_HCSPARAMS   0x04   /* 32-bit */
-#define EHCI_CAP_HCCPARAMS   0x08   /* 32-bit */
+static void ehci_delay_ms(uint32_t ms) { usb_delay_ms(ms); }
+
+ 
+
+
+#define EHCI_CAP_CAPLENGTH   0x00    
+#define EHCI_CAP_HCIVERSION  0x02    
+#define EHCI_CAP_HCSPARAMS   0x04    
+#define EHCI_CAP_HCCPARAMS   0x08    
 
 #define EHCI_OP_USBCMD           0x00
 #define EHCI_OP_USBSTS           0x04
@@ -130,51 +87,83 @@ static void ehci_delay_ms(uint32_t ms) {
 #define EHCI_OP_CONFIGFLAG       0x40
 #define EHCI_OP_PORTSC_BASE      0x44
 
-#define EHCI_CMD_RS         0x00000001u   /* Run/Stop */
+#define EHCI_CMD_RS         0x00000001u    
 #define EHCI_CMD_HCRESET    0x00000002u
-#define EHCI_CMD_PSE        0x00000010u   /* Periodic Schedule Enable — НЕ используем */
-#define EHCI_CMD_ASE        0x00000020u   /* Async Schedule Enable */
+#define EHCI_CMD_PSE        0x00000010u    
+#define EHCI_CMD_ASE        0x00000020u    
 
 #define EHCI_STS_HALTED     0x00001000u
+#define EHCI_STS_ASS        0x00008000u    
+#define EHCI_STS_PSS        0x00004000u    
 
-#define EHCI_PORTSC_CCS     0x00000001u   /* Current Connect Status (RO) */
-#define EHCI_PORTSC_CSC     0x00000002u   /* Connect Status Change (R/WC) */
-#define EHCI_PORTSC_PE      0x00000004u   /* Port Enable (R/W) */
-#define EHCI_PORTSC_PEC     0x00000008u   /* Port Enable Change (R/WC) */
-#define EHCI_PORTSC_OCC     0x00000020u   /* Over-current Change (R/WC) */
-#define EHCI_PORTSC_PR      0x00000100u   /* Port Reset (R/W) */
-#define EHCI_PORTSC_OWNER   0x00002000u   /* Port Owner: 1 = отдать companion-контроллеру */
-/* RWC-биты — обнулять при read-modify-write, если не хотим их явно подтвердить */
+#define EHCI_PORTSC_CCS     0x00000001u    
+#define EHCI_PORTSC_CSC     0x00000002u    
+#define EHCI_PORTSC_PE      0x00000004u    
+#define EHCI_PORTSC_PEC     0x00000008u    
+#define EHCI_PORTSC_OCC     0x00000020u    
+#define EHCI_PORTSC_PR      0x00000100u    
+#define EHCI_PORTSC_PP      0x00001000u    
+#define EHCI_PORTSC_OWNER   0x00002000u    
+ 
 #define EHCI_PORTSC_RWC_MASK (EHCI_PORTSC_CSC | EHCI_PORTSC_PEC | EHCI_PORTSC_OCC)
 
-/* =========================================================================
- * Queue Head / qTD (EHCI spec §3.5/§3.6)
- * ========================================================================= */
+ 
+
+
 #define EHCI_PTR_TERMINATE 0x00000001u
-#define EHCI_PTR_TYPE_QH   0x00000002u   /* Typ, биты 2:1 = 01 для QH */
+#define EHCI_PTR_TYPE_QH   0x00000002u    
 
 #define EHCI_EPS_FULL 0u
 #define EHCI_EPS_LOW  1u
 #define EHCI_EPS_HIGH 2u
+
+ 
+
+
+
+
+
+
+#define EHCI_QH_ADDR(a)   ((uint32_t)(a) & 0x7Fu)
+#define EHCI_QH_EPNUM(n)  (((uint32_t)(n) & 0x0Fu) << 8)
+#define EHCI_QH_EPS(s)    (((uint32_t)(s) & 0x03u) << 12)
+#define EHCI_QH_DTC       (1u << 14)
+#define EHCI_QH_H         (1u << 15)
+#define EHCI_QH_C         (1u << 27)    
+#define EHCI_QH_MAXP(m)   (((uint32_t)(m) & 0x7FFu) << 16)
+
+ 
+
+
+
+
+
+
+
+
+
 
 typedef struct {
     volatile uint32_t next_qtd;
     volatile uint32_t alt_next_qtd;
     volatile uint32_t token;
     volatile uint32_t buf[5];
-} ehci_qtd_t;   /* 32 байта — естественное выравнивание совпадает с требуемым */
+    volatile uint32_t buf_hi[5];      
+    uint32_t          pad[3];         
+} ehci_qtd_t;
 
 typedef struct {
     volatile uint32_t horiz_link;
     volatile uint32_t ep_char;
     volatile uint32_t ep_cap;
     volatile uint32_t cur_qtd;
-    /* qTD overlay — сюда HW сам копирует поля исполняемого сейчас qTD */
+     
     volatile uint32_t next_qtd;
     volatile uint32_t alt_next_qtd;
     volatile uint32_t token;
     volatile uint32_t buf[5];
-    uint32_t reserved[3];   /* добивка — не аппаратные поля */
+    volatile uint32_t buf_hi[5];    
+    uint32_t reserved[3];           
 } ehci_qh_t;
 
 #define EHCI_QTD_STATUS_XACTERR  (1u << 3)
@@ -187,19 +176,40 @@ typedef struct {
 #define EHCI_QTD_PID_IN    1u
 #define EHCI_QTD_PID_SETUP 2u
 
-#define EHCI_TD_POOL_COUNT 128   /* ровно одна страница, см. UHCI.c — те же соображения по размеру */
-#define EHCI_BULK_BUF_SIZE (64u * 1024u)   /* см. UHCI_BULK_BUF_SIZE — тот же приём */
+#define EHCI_TD_POOL_COUNT 128    
+#define EHCI_BULK_BUF_SIZE (64u * 1024u)    
 
-/* =========================================================================
- * Контекст контроллера
- * ========================================================================= */
-#define EHCI_MAX_CONTROLLERS 4
-#define EHCI_MAX_PORTS 15   /* HCSPARAMS.N_PORTS — максимум по спеке */
+ 
+
+
+ 
+
+
+
+
+#define EHCI_INT_SLOTS         4
+#define EHCI_INT_FRAME_STRIDE  8
+#define EHCI_INT_SMASK         0x01u     
+#define EHCI_INT_CMASK         0x1Cu     
 
 typedef struct {
-    uint64_t   mmio_va;      /* виртуальный адрес начала capability-регистров */
-    uint64_t   op_va;        /* mmio_va + CAPLENGTH — начало operational-регистров */
+    bool     used;
+    uint8_t  dev_addr, ep_addr, tt_hub, tt_port, toggle;
+    uint16_t maxp;
+    uint32_t len;      
+} ehci_int_slot_t;
+
+#define EHCI_MAX_CONTROLLERS 4
+#define EHCI_MAX_PORTS 15    
+
+typedef struct {
+    uint64_t   mmio_va;       
+    uint64_t   op_va;         
     uint8_t    num_ports;
+     
+
+    uint8_t    tt_hub[128], tt_port[128];
+    uint32_t   pci_id, hcsparams, hccparams;    
 
     ehci_qh_t   *ctrl_qh;
     uint64_t     ctrl_qh_phys;
@@ -208,8 +218,15 @@ typedef struct {
     uint8_t     *scratch;
     uint64_t     scratch_phys;
 
-    uint8_t     *bulk_buf;      /* см. UHCI.c — отдельный DMA-буфер под bulk_transfer */
+    uint8_t     *bulk_buf;       
     uint64_t     bulk_buf_phys;
+
+     
+    uint32_t        *frame_list;        
+    uint64_t         frame_list_phys;
+    uint8_t         *int_mem;           
+    uint64_t         int_mem_phys;
+    ehci_int_slot_t  islot[EHCI_INT_SLOTS];
 
     usb_hcd_t  hcd;
 } ehci_ctrl_t;
@@ -220,18 +237,158 @@ static int         g_ehci_count = 0;
 static inline uint32_t op_r32(ehci_ctrl_t *c, uint32_t off) { return mmio_r32(c->op_va + off); }
 static inline void     op_w32(ehci_ctrl_t *c, uint32_t off, uint32_t v) { mmio_w32(c->op_va + off, v); }
 
-/* =========================================================================
- * port_reset — см. подробности в шапке файла про companion-хендофф
- * ========================================================================= */
+ 
+
+
+
+static bool ehci_async_set(ehci_ctrl_t *c, bool on) {
+    uint32_t cmd = op_r32(c, EHCI_OP_USBCMD);
+    uint32_t want = on ? (cmd | EHCI_CMD_ASE) : (cmd & ~EHCI_CMD_ASE);
+    if (want != cmd) op_w32(c, EHCI_OP_USBCMD, want);
+     
+
+
+
+
+    uint64_t deadline = ehci_rdtsc() + usb_tsc_per_ms() * 40ULL;
+    for (;;) {
+        bool running = (op_r32(c, EHCI_OP_USBSTS) & EHCI_STS_ASS) != 0;
+        if (running == on) return true;
+        if (ehci_rdtsc() > deadline) break;
+        __asm__ volatile ("pause" ::: "memory");
+    }
+    DBG_MSG("EHCI", "async schedule state change timed out");
+    return false;
+}
+
+ 
+
+
+static bool ehci_ensure_running(ehci_ctrl_t *c) {
+    uint32_t sts = op_r32(c, EHCI_OP_USBSTS);
+    if (!(sts & EHCI_STS_HALTED)) return true;
+    DBG_VAL("EHCI", "controller halted (HSE?), restarting, USBSTS", sts);
+    op_w32(c, EHCI_OP_USBSTS, 0x3Fu);
+    op_w32(c, EHCI_OP_USBCMD, (op_r32(c, EHCI_OP_USBCMD) & ~EHCI_CMD_ASE) | EHCI_CMD_RS);
+    for (int i = 0; i < 50; i++) {
+        if (!(op_r32(c, EHCI_OP_USBSTS) & EHCI_STS_HALTED)) return true;
+        ehci_delay_ms(1);
+    }
+    return false;
+}
+
+ 
+
+
+
+
+
+
+typedef struct {
+    bool     valid;
+    int      rc;
+    uint8_t  ctrl_idx, dev_addr, maxp0, n_qtd;
+    uint32_t usbcmd, usbsts, qh_epchar, qh_next, qh_token, qtd_tok[3], qtd_last;
+} ehci_err_snap_t;
+static ehci_err_snap_t g_err;
+
+static void ehci_snapshot_err(ehci_ctrl_t *c, int rc, uint8_t dev_addr, uint8_t maxp0, uint32_t n) {
+    if (g_err.valid) return;
+    g_err.valid     = true;
+    g_err.rc        = rc;
+    g_err.ctrl_idx  = (uint8_t)(c - g_ehci);
+    g_err.dev_addr  = dev_addr;
+    g_err.maxp0     = maxp0;
+    g_err.n_qtd     = (uint8_t)n;
+    g_err.usbcmd    = op_r32(c, EHCI_OP_USBCMD);
+    g_err.usbsts    = op_r32(c, EHCI_OP_USBSTS);
+    g_err.qh_epchar = c->ctrl_qh->ep_char;
+    g_err.qh_next   = c->ctrl_qh->next_qtd;
+    g_err.qh_token  = c->ctrl_qh->token;
+    for (int i = 0; i < 3; i++) g_err.qtd_tok[i] = (n > (uint32_t)i) ? c->td_pool[i].token : 0;
+    g_err.qtd_last  = (n > 0) ? c->td_pool[n - 1].token : 0;
+}
+
+static char *dp_str(char *d, const char *s) { while (*s) *d++ = *s++; return d; }
+static char *dp_hex(char *d, uint32_t v) {
+    static const char hx[] = "0123456789ABCDEF";
+    for (int i = 7; i >= 0; i--) *d++ = hx[(v >> (i * 4)) & 0xF];
+    return d;
+}
+
+void ehci_diag_dump(void (*out)(const char *)) {
+    char line[100];
+    for (int i = 0; i < g_ehci_count; i++) {
+        ehci_ctrl_t *c = &g_ehci[i];
+        char *d = line;
+        d = dp_str(d, "  EHCI"); *d++ = (char)('0' + i);
+        d = dp_str(d, " pci="); d = dp_hex(d, c->pci_id);
+        d = dp_str(d, " ports="); *d++ = (char)('0' + (c->num_ports % 10));
+        *d++ = '\n'; *d = 0; out(line);
+
+        d = line;
+        d = dp_str(d, "   cmd="); d = dp_hex(d, op_r32(c, EHCI_OP_USBCMD));
+        d = dp_str(d, " sts="); d = dp_hex(d, op_r32(c, EHCI_OP_USBSTS));
+        d = dp_str(d, " cf="); d = dp_hex(d, op_r32(c, EHCI_OP_CONFIGFLAG));
+        *d++ = '\n'; *d = 0; out(line);
+
+        d = line;
+        d = dp_str(d, "   portsc:");
+        for (uint8_t p = 0; p < c->num_ports && p < 4; p++) {
+            *d++ = ' '; d = dp_hex(d, op_r32(c, EHCI_OP_PORTSC_BASE + (uint32_t)p * 4));
+        }
+        *d++ = '\n'; *d = 0; out(line);
+    }
+    if (g_err.valid) {
+        char *d = line;
+        d = dp_str(d, "  1st xfer error: ehci"); *d++ = (char)('0' + g_err.ctrl_idx);
+        d = dp_str(d, " rc="); *d++ = '-'; *d++ = (char)('0' + (-g_err.rc) % 10);
+        d = dp_str(d, " addr="); d = dp_hex(d, g_err.dev_addr);
+        d = dp_str(d, " n="); *d++ = (char)('0' + g_err.n_qtd % 10);
+        *d++ = '\n'; *d = 0; out(line);
+
+        d = line;
+        d = dp_str(d, "   cmd="); d = dp_hex(d, g_err.usbcmd);
+        d = dp_str(d, " sts="); d = dp_hex(d, g_err.usbsts);
+        d = dp_str(d, " qh.ep="); d = dp_hex(d, g_err.qh_epchar);
+        *d++ = '\n'; *d = 0; out(line);
+
+        d = line;
+        d = dp_str(d, "   qh.next="); d = dp_hex(d, g_err.qh_next);
+        d = dp_str(d, " qh.tok="); d = dp_hex(d, g_err.qh_token);
+        *d++ = '\n'; *d = 0; out(line);
+
+        d = line;
+        d = dp_str(d, "   qtd0="); d = dp_hex(d, g_err.qtd_tok[0]);
+        d = dp_str(d, " qtd1="); d = dp_hex(d, g_err.qtd_tok[1]);
+        d = dp_str(d, " qtd2="); d = dp_hex(d, g_err.qtd_tok[2]);
+        *d++ = '\n'; *d = 0; out(line);
+    } else {
+        out("  no failed EHCI transfer recorded\n");
+    }
+}
+
+ 
+
+
 static bool ehci_port_reset(usb_hcd_t *hcd, uint8_t port, uint8_t *out_speed) {
     ehci_ctrl_t *c = (ehci_ctrl_t *)hcd->priv;
     if (port >= c->num_ports) return false;
     uint32_t reg = EHCI_OP_PORTSC_BASE + (uint32_t)port * 4;
 
     uint32_t val = op_r32(c, reg);
-    if (!(val & EHCI_PORTSC_CCS)) return false;   /* порт пуст */
+    if (!(val & EHCI_PORTSC_CCS)) return false;    
 
-    /* USB2.0 spec §7.1.7.5: держим Port Reset минимум 50мс. */
+     
+
+
+    if (((val >> 10) & 0x3u) == 0x1u) {
+        op_w32(c, reg, (val & ~EHCI_PORTSC_RWC_MASK) | EHCI_PORTSC_OWNER);
+        DBG_VAL("EHCI", "low-speed device, handed off to companion, port", port);
+        return false;
+    }
+
+     
     val &= ~EHCI_PORTSC_RWC_MASK;
     val &= ~EHCI_PORTSC_PE;
     op_w32(c, reg, val | EHCI_PORTSC_PR);
@@ -240,60 +397,106 @@ static bool ehci_port_reset(usb_hcd_t *hcd, uint8_t port, uint8_t *out_speed) {
     val = op_r32(c, reg) & ~EHCI_PORTSC_RWC_MASK;
     op_w32(c, reg, val & ~EHCI_PORTSC_PR);
 
-    /* Аппаратура обязана сама снять PR в течение ~2мс после того, как мы
-     * его сняли программно (EHCI spec §2.3.9) — ждём с запасом. */
+     
+
     bool cleared = false;
     for (int i = 0; i < 20; i++) {
         if (!(op_r32(c, reg) & EHCI_PORTSC_PR)) { cleared = true; break; }
         ehci_delay_ms(1);
     }
     if (!cleared) {
-        DBG_VAL("EHCI", "port reset didn't clear (аппаратура зависла?), port", port);
+        DBG_VAL("EHCI", "port reset did not clear (hardware hung?), port", port);
         return false;
     }
 
     ehci_delay_ms(10);
     val = op_r32(c, reg);
-    if (!(val & EHCI_PORTSC_CCS)) return false;   /* отключили прямо во время reset */
+    if (!(val & EHCI_PORTSC_CCS)) return false;    
 
     if (val & EHCI_PORTSC_PE) {
         *out_speed = USB_SPEED_HIGH;
         return true;
     }
 
-    /* Не high-speed — эта версия драйвера такие устройства не обслуживает
-     * (нет split-транзакций), отдаём порт companion-контроллеру. Он
-     * подхватит его на своём сканировании портов (см. порядок вызовов в
-     * usb_init(): ehci_pci_scan() строго до uhci_pci_scan()). */
+     
+
+
+
     val = op_r32(c, reg) & ~EHCI_PORTSC_RWC_MASK;
     op_w32(c, reg, val | EHCI_PORTSC_OWNER);
     DBG_VAL("EHCI", "port not high-speed, handed off to companion, port", port);
     return false;
 }
 
-/* =========================================================================
- * control_transfer — только High Speed (см. шапку файла)
- * ========================================================================= */
+ 
+
+
+
+
+static bool ehci_qh_target(ehci_ctrl_t *c, uint8_t dev_addr, uint8_t speed, bool is_control,
+                           uint32_t *out_eps_bits, uint32_t *out_cap) {
+    if (speed == USB_SPEED_HIGH) {
+        *out_eps_bits = EHCI_QH_EPS(EHCI_EPS_HIGH);
+        *out_cap      = (1u << 30);
+        return true;
+    }
+    uint8_t hub  = c->tt_hub[dev_addr & 0x7F];
+    uint8_t port = c->tt_port[dev_addr & 0x7F];
+    if (!hub) return false;    
+    *out_eps_bits = EHCI_QH_EPS(speed == USB_SPEED_LOW ? EHCI_EPS_LOW : EHCI_EPS_FULL) |
+                    (is_control ? EHCI_QH_C : 0u);
+    *out_cap      = (1u << 30) | (((uint32_t)port & 0x7Fu) << 23) | (((uint32_t)hub & 0x7Fu) << 16);
+    return true;
+}
+
+static void ehci_set_route(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t tt_hub_addr, uint8_t tt_port) {
+    ehci_ctrl_t *c = (ehci_ctrl_t *)hcd->priv;
+    c->tt_hub[dev_addr & 0x7F]  = tt_hub_addr;
+    c->tt_port[dev_addr & 0x7F] = tt_port;
+}
+
+ 
+
+
 static void ehci_qtd_fill(ehci_qtd_t *td, uint8_t pid, uint16_t len,
                           uint64_t buf_phys, uint8_t toggle) {
     td->token = EHCI_QTD_STATUS_ACTIVE |
                ((uint32_t)pid << 8) |
-               (3u << 10)          /* CERR = 3 */ |
-               (0u << 12)          /* Current Page = 0 — буфер не пересекает границу страницы */ |
+               (3u << 10)            |
+               (0u << 12)            |
                ((uint32_t)len << 16) |
                ((uint32_t)toggle << 31);
     td->buf[0] = (uint32_t)buf_phys;
     td->buf[1] = 0; td->buf[2] = 0; td->buf[3] = 0; td->buf[4] = 0;
+    for (int i = 0; i < 5; i++) td->buf_hi[i] = 0;
     td->next_qtd     = EHCI_PTR_TERMINATE;
     td->alt_next_qtd = EHCI_PTR_TERMINATE;
 }
 
-static int ehci_control_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
-                                 uint8_t maxp0, const usb_setup_pkt_t *setup,
-                                 void *data, uint16_t len) {
-    if (speed != USB_SPEED_HIGH) return -1;   /* full/low speed — через UHCI-компаньон */
+ 
+
+
+
+
+
+
+
+static inline uint64_t usb_irq_save(void) {
+    uint64_t f;
+    __asm__ volatile ("pushfq; pop %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void usb_irq_restore(uint64_t f) {
+    if (f & 0x200u) __asm__ volatile ("sti" ::: "memory");
+}
+
+static int ehci_control_transfer_impl(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                                      uint8_t maxp0, const usb_setup_pkt_t *setup,
+                                      void *data, uint16_t len) {
     ehci_ctrl_t *c = (ehci_ctrl_t *)hcd->priv;
-    if (maxp0 == 0) maxp0 = 64;
+    uint32_t eps_bits, qh_cap;
+    if (!ehci_qh_target(c, dev_addr, speed, true, &eps_bits, &qh_cap)) return -1;    
+    if (maxp0 == 0) maxp0 = (speed == USB_SPEED_HIGH) ? 64 : 8;
     if (len > 512) return -1;
 
     usb_setup_pkt_t *setup_dma = (usb_setup_pkt_t *)c->scratch;
@@ -327,35 +530,47 @@ static int ehci_control_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed
     else          status_pid = dir_in ? EHCI_QTD_PID_OUT : EHCI_QTD_PID_IN;
     ehci_qtd_fill(&tds[n++], status_pid, 0, 0, 1);
 
-    /* Линкуем цепочку через next_qtd (Typ-биты для qTD.next_qtd не имеют
-     * смысла — только адрес + T-бит). */
+     
+
     for (uint32_t i = 0; i < n - 1; i++)
         tds[i].next_qtd = (uint32_t)(c->td_pool_phys + (i + 1) * sizeof(ehci_qtd_t));
     tds[n - 1].next_qtd = EHCI_PTR_TERMINATE;
+     
 
-    /* Обновляем Endpoint Characteristics под текущее устройство/maxpacket
-     * (постоянная QH используется для ВСЕХ устройств по очереди, не
-     * только для одного — переписываем перед каждой транзакцией). */
-    c->ctrl_qh->ep_char = ((uint32_t)dev_addr & 0x7Fu) |
-                          ((uint32_t)EHCI_EPS_HIGH << 11) |
-                          (1u << 13)   /* DTC */ |
-                          (1u << 14)   /* H — голова, единственная QH */ |
-                          (((uint32_t)maxp0 & 0x7FFu) << 16);
-    c->ctrl_qh->ep_cap = (1u << 30);   /* Mult = 1 */
 
-    /* Подвешиваем цепочку на QH — оборвём текущий overlay (Active=0),
-     * next_qtd укажет на первый qTD; аппаратура сама "зафетчит" его на
-     * следующем проходе async-расписания (см. подробности в шапке файла). */
+    for (uint32_t i = 1; i + 1 < n; i++)
+        tds[i].alt_next_qtd = (uint32_t)(c->td_pool_phys + (uint64_t)(n - 1) * sizeof(ehci_qtd_t));
+
+     
+
+
+     
+
+
+
+
+    if (!ehci_ensure_running(c)) return -4;
+    ehci_async_set(c, false);
+    c->ctrl_qh->ep_char = EHCI_QH_ADDR(dev_addr) | EHCI_QH_EPNUM(0) |
+                          eps_bits | EHCI_QH_DTC | EHCI_QH_H |
+                          EHCI_QH_MAXP(maxp0);
+    c->ctrl_qh->ep_cap = qh_cap;    
+
+     
+
+
     c->ctrl_qh->token        = 0;
     c->ctrl_qh->alt_next_qtd = EHCI_PTR_TERMINATE;
     c->ctrl_qh->next_qtd     = (uint32_t)c->td_pool_phys;
+    op_w32(c, EHCI_OP_USBSTS, 0x3Fu);    
+    ehci_async_set(c, true);
 
-    /* См. подробный комментарий у того же места в UHCI.c: 500мс тут было
-     * слишком много специально для периодического HID-опроса (см.
-     * Resources/USBHID.c) — неотвечающее устройство блокировало систему
-     * на полсекунды каждые ~30мс. 50мс с запасом хватает рабочему
-     * устройству, ограничивает ущерб от неотвечающего. */
-    uint64_t deadline = ehci_rdtsc() + 3000000ULL * 50;   /* ~50мс */
+     
+
+
+
+
+    uint64_t deadline = ehci_rdtsc() + usb_tsc_per_ms() * 50ULL;    
     int result = -3;
     for (;;) {
         uint32_t next = c->ctrl_qh->next_qtd;
@@ -366,6 +581,8 @@ static int ehci_control_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed
         __asm__ volatile ("pause" ::: "memory");
     }
 
+    if (result != 0) ehci_snapshot_err(c, result, dev_addr, maxp0, n);
+    ehci_async_set(c, false);
     c->ctrl_qh->next_qtd     = EHCI_PTR_TERMINATE;
     c->ctrl_qh->alt_next_qtd = EHCI_PTR_TERMINATE;
 
@@ -373,18 +590,19 @@ static int ehci_control_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed
     return result;
 }
 
-/* =========================================================================
- * bulk_transfer — см. подробный комментарий у uhci_bulk_transfer в
- * UHCI.c, тот же приём (батчи по td_pool, персистентный bulk_buf,
- * Data Toggle между вызовами) — только структуры EHCI (qTD/QH-overlay)
- * вместо UHCI TD/QH.
- * ========================================================================= */
-static int ehci_bulk_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
-                              uint8_t ep_addr, uint16_t max_packet,
-                              void *data, uint32_t len, uint8_t *toggle_inout) {
-    if (speed != USB_SPEED_HIGH) return -1;   /* full/low speed — через UHCI-компаньон */
+ 
+
+
+
+
+
+static int ehci_bulk_transfer_impl(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                                   uint8_t ep_addr, uint16_t max_packet,
+                                   void *data, uint32_t len, uint8_t *toggle_inout) {
     ehci_ctrl_t *c = (ehci_ctrl_t *)hcd->priv;
-    if (max_packet == 0) max_packet = 512;
+    uint32_t eps_bits, qh_cap;
+    if (!ehci_qh_target(c, dev_addr, speed, false, &eps_bits, &qh_cap)) return -1;
+    if (max_packet == 0) max_packet = (speed == USB_SPEED_HIGH) ? 512 : 64;
     if (len > EHCI_BULK_BUF_SIZE) return -1;
 
     bool    dir_in = (ep_addr & 0x80u) != 0;
@@ -392,12 +610,12 @@ static int ehci_bulk_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
     uint8_t toggle = toggle_inout ? *toggle_inout : 0;
     uint8_t pid    = dir_in ? EHCI_QTD_PID_IN : EHCI_QTD_PID_OUT;
 
-    c->ctrl_qh->ep_char = ((uint32_t)dev_addr & 0x7Fu) |
-                          ((uint32_t)ep_num << 8) |
-                          ((uint32_t)EHCI_EPS_HIGH << 11) |
-                          (1u << 13) | (1u << 14) |
-                          (((uint32_t)max_packet & 0x7FFu) << 16);
-    c->ctrl_qh->ep_cap = (1u << 30);
+    if (!ehci_ensure_running(c)) return -4;
+    ehci_async_set(c, false);
+    c->ctrl_qh->ep_char = EHCI_QH_ADDR(dev_addr) | EHCI_QH_EPNUM(ep_num) |
+                          eps_bits | EHCI_QH_DTC | EHCI_QH_H |
+                          EHCI_QH_MAXP(max_packet);
+    c->ctrl_qh->ep_cap = qh_cap;
 
     if (!dir_in && data && len > 0) memcpy(c->bulk_buf, data, len);
 
@@ -432,8 +650,10 @@ static int ehci_bulk_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
         c->ctrl_qh->token        = 0;
         c->ctrl_qh->alt_next_qtd = EHCI_PTR_TERMINATE;
         c->ctrl_qh->next_qtd     = (uint32_t)c->td_pool_phys;
+        op_w32(c, EHCI_OP_USBSTS, 0x3Fu);
+        ehci_async_set(c, true);
 
-        uint64_t deadline = ehci_rdtsc() + 3000000ULL * 2000;   /* ~2с на батч */
+        uint64_t deadline = ehci_rdtsc() + usb_tsc_per_ms() * 2000ULL;    
         int result = -3;
         for (;;) {
             uint32_t next = c->ctrl_qh->next_qtd;
@@ -443,6 +663,8 @@ static int ehci_bulk_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
             if (ehci_rdtsc() > deadline) { result = -3; break; }
             __asm__ volatile ("pause" ::: "memory");
         }
+        if (result != 0) ehci_snapshot_err(c, result, dev_addr, (uint8_t)max_packet, n);
+        ehci_async_set(c, false);
         c->ctrl_qh->next_qtd     = EHCI_PTR_TERMINATE;
         c->ctrl_qh->alt_next_qtd = EHCI_PTR_TERMINATE;
 
@@ -455,18 +677,391 @@ static int ehci_bulk_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
     return 0;
 }
 
+static int ehci_control_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                                 uint8_t maxp0, const usb_setup_pkt_t *setup,
+                                 void *data, uint16_t len) {
+    uint64_t fl = usb_irq_save();
+    int rc = ehci_control_transfer_impl(hcd, dev_addr, speed, maxp0, setup, data, len);
+    usb_irq_restore(fl);
+    return rc;
+}
+
+static int ehci_bulk_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                              uint8_t ep_addr, uint16_t max_packet,
+                              void *data, uint32_t len, uint8_t *toggle_inout) {
+    uint64_t fl = usb_irq_save();
+    int rc = ehci_bulk_transfer_impl(hcd, dev_addr, speed, ep_addr, max_packet, data, len, toggle_inout);
+    usb_irq_restore(fl);
+    return rc;
+}
+
+ 
+
+
+
+
+
+
+
+
+static int ehci_bulk_in_poll_impl(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                                  uint8_t ep_addr, uint16_t max_packet,
+                                  void *data, uint32_t len, uint8_t *toggle_inout,
+                                  uint32_t timeout_us) {
+    ehci_ctrl_t *c = (ehci_ctrl_t *)hcd->priv;
+    uint32_t eps_bits, qh_cap;
+    if (!(ep_addr & 0x80u) || !data || len == 0) return -1;
+    if (!ehci_qh_target(c, dev_addr, speed, false, &eps_bits, &qh_cap)) return -1;
+    if (max_packet == 0) max_packet = (speed == USB_SPEED_HIGH) ? 512 : 64;
+    if (len > EHCI_BULK_BUF_SIZE) len = EHCI_BULK_BUF_SIZE;
+    if (len > (uint32_t)max_packet * EHCI_TD_POOL_COUNT) len = (uint32_t)max_packet * EHCI_TD_POOL_COUNT;
+
+    uint8_t ep_num  = ep_addr & 0x0Fu;
+    uint8_t toggle0 = toggle_inout ? (uint8_t)(*toggle_inout & 1u) : 0;
+
+    ehci_qtd_t *tds = c->td_pool;
+    uint16_t    chunks[EHCI_TD_POOL_COUNT];
+    uint32_t    n = 0, off = 0, remaining = len;
+    while (remaining > 0 && n < EHCI_TD_POOL_COUNT) {
+        uint16_t chunk = remaining > max_packet ? max_packet : (uint16_t)remaining;
+        ehci_qtd_fill(&tds[n], EHCI_QTD_PID_IN, chunk, c->bulk_buf_phys + off,
+                      (uint8_t)(toggle0 ^ (n & 1u)));
+        chunks[n] = chunk;
+        n++; off += chunk; remaining -= chunk;
+    }
+    for (uint32_t i = 0; i + 1 < n; i++)
+        tds[i].next_qtd = (uint32_t)(c->td_pool_phys + (uint64_t)(i + 1) * sizeof(ehci_qtd_t));
+    tds[n - 1].next_qtd = EHCI_PTR_TERMINATE;
+
+    if (!ehci_ensure_running(c)) return -4;
+    ehci_async_set(c, false);
+    c->ctrl_qh->ep_char = EHCI_QH_ADDR(dev_addr) | EHCI_QH_EPNUM(ep_num) |
+                          eps_bits | EHCI_QH_DTC | EHCI_QH_H |
+                          EHCI_QH_MAXP(max_packet);
+    c->ctrl_qh->ep_cap       = qh_cap;
+    c->ctrl_qh->token        = 0;
+    c->ctrl_qh->alt_next_qtd = EHCI_PTR_TERMINATE;
+    c->ctrl_qh->next_qtd     = (uint32_t)c->td_pool_phys;
+    op_w32(c, EHCI_OP_USBSTS, 0x3Fu);
+    ehci_async_set(c, true);
+
+    uint64_t deadline = ehci_rdtsc() + (usb_tsc_per_ms() * (uint64_t)timeout_us) / 1000ULL;
+    for (;;) {
+        uint32_t next = c->ctrl_qh->next_qtd;
+        uint32_t tok  = c->ctrl_qh->token;
+        if ((next & EHCI_PTR_TERMINATE) && !(tok & EHCI_QTD_STATUS_ACTIVE)) break;    
+        if (tok & EHCI_QTD_STATUS_HALTED) break;
+        if (ehci_rdtsc() > deadline) break;
+        __asm__ volatile ("pause" ::: "memory");
+    }
+    ehci_async_set(c, false);         
+    c->ctrl_qh->next_qtd     = EHCI_PTR_TERMINATE;
+    c->ctrl_qh->alt_next_qtd = EHCI_PTR_TERMINATE;
+
+    uint32_t got = 0, flips = 0;
+    bool     halted = false;
+    for (uint32_t k = 0; k < n; k++) {
+        uint32_t tok = tds[k].token;
+        if (tok & EHCI_QTD_STATUS_ACTIVE) break;             
+        if (tok & EHCI_QTD_STATUS_HALTED) { halted = true; break; }
+        uint32_t rem = (tok >> 16) & 0x7FFFu;
+        if (rem > chunks[k]) rem = chunks[k];
+        got += (uint32_t)chunks[k] - rem;
+        flips++;
+        if (rem) break;                                       
+    }
+    if (toggle_inout) *toggle_inout = (uint8_t)(toggle0 ^ (flips & 1u));
+    if (got) memcpy(data, c->bulk_buf, got);
+    if (halted && got == 0) { ehci_snapshot_err(c, -2, dev_addr, (uint8_t)max_packet, n); return -2; }
+    if (got == 0 && flips > 0) return -1000;           
+    return (int)got;
+}
+
+static int ehci_bulk_in_poll(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                             uint8_t ep_addr, uint16_t max_packet,
+                             void *data, uint32_t len, uint8_t *toggle_inout,
+                             uint32_t timeout_us) {
+    uint64_t fl = usb_irq_save();
+    int rc = ehci_bulk_in_poll_impl(hcd, dev_addr, speed, ep_addr, max_packet, data, len,
+                                    toggle_inout, timeout_us);
+    usb_irq_restore(fl);
+    return rc;
+}
+
+ 
+
+
+
+
+
+
+static int ehci_int_in_poll_impl(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                                 uint8_t ep_addr, uint16_t max_packet,
+                                 void *data, uint32_t len, uint8_t *toggle_inout,
+                                 uint32_t timeout_us) {
+    ehci_ctrl_t *c = (ehci_ctrl_t *)hcd->priv;
+    uint32_t eps_bits, qh_cap;
+    if (!(ep_addr & 0x80u) || !data) return -1;
+    if (!ehci_qh_target(c, dev_addr, speed, false, &eps_bits, &qh_cap)) return -1;
+    if (max_packet == 0) max_packet = 8;
+    if (len == 0 || len > max_packet || len > EHCI_BULK_BUF_SIZE) return -1;
+
+    uint8_t ep_num = ep_addr & 0x0Fu;
+    uint8_t toggle = toggle_inout ? (uint8_t)(*toggle_inout & 1u) : 0;
+
+    if (!ehci_ensure_running(c)) return -4;
+    ehci_async_set(c, false);
+    c->ctrl_qh->ep_char = EHCI_QH_ADDR(dev_addr) | EHCI_QH_EPNUM(ep_num) |
+                          eps_bits | EHCI_QH_DTC | EHCI_QH_H |
+                          EHCI_QH_MAXP(max_packet);
+    c->ctrl_qh->ep_cap = qh_cap;
+
+    ehci_qtd_t *td = &c->td_pool[0];
+    ehci_qtd_fill(td, EHCI_QTD_PID_IN, (uint16_t)len, c->bulk_buf_phys, toggle);
+    td->next_qtd = EHCI_PTR_TERMINATE;
+
+    c->ctrl_qh->token        = 0;
+    c->ctrl_qh->alt_next_qtd = EHCI_PTR_TERMINATE;
+    c->ctrl_qh->next_qtd     = (uint32_t)c->td_pool_phys;
+    op_w32(c, EHCI_OP_USBSTS, 0x3Fu);
+    ehci_async_set(c, true);
+
+    uint64_t deadline = ehci_rdtsc() + (usb_tsc_per_ms() * (uint64_t)timeout_us) / 1000ULL;
+    int      result   = 0;      
+    uint32_t tok      = 0;
+    for (;;) {
+        uint32_t next = c->ctrl_qh->next_qtd;
+        tok = c->ctrl_qh->token;
+        if ((next & EHCI_PTR_TERMINATE) && !(tok & EHCI_QTD_STATUS_ACTIVE)) { result = 1; break; }
+        if (tok & EHCI_QTD_STATUS_HALTED) { result = -2; break; }
+        if (ehci_rdtsc() > deadline) { result = 0; break; }
+        __asm__ volatile ("pause" ::: "memory");
+    }
+    ehci_async_set(c, false);
+    c->ctrl_qh->next_qtd     = EHCI_PTR_TERMINATE;
+    c->ctrl_qh->alt_next_qtd = EHCI_PTR_TERMINATE;
+
+    if (result == 0) {
+         
+
+        tok = c->ctrl_qh->token;
+        if (!(tok & EHCI_QTD_STATUS_ACTIVE) && !(tok & EHCI_QTD_STATUS_HALTED) &&
+            (c->ctrl_qh->next_qtd & EHCI_PTR_TERMINATE) &&
+            (((tok >> 16) & 0x7FFFu) < len))
+            result = 1;
+    }
+    if (result < 0) return result;
+    if (result == 0) return 0;
+
+    uint32_t remaining = (tok >> 16) & 0x7FFFu;
+    uint32_t got = (remaining <= len) ? (len - remaining) : 0;
+    if (got == 0) return 0;
+    memcpy(data, c->bulk_buf, got);
+    if (toggle_inout) *toggle_inout = (uint8_t)(toggle ^ 1u);
+    return (int)got;
+}
+
+ 
+static uint32_t g_int_cfg, g_int_polls, g_int_done, g_int_halt, g_int_qhtok;
+
+ 
+
+
+
+
+void ehci_int_dbg(uint32_t out[5]) {
+    out[0] = g_int_cfg; out[1] = g_int_polls; out[2] = g_int_done;
+    out[3] = g_int_halt; out[4] = g_int_qhtok;
+}
+
+static inline ehci_qh_t  *int_qh(ehci_ctrl_t *c, int i)       { return (ehci_qh_t *)(c->int_mem + (uint32_t)i * 128u); }
+static inline uint64_t    int_qh_phys(ehci_ctrl_t *c, int i)  { return c->int_mem_phys + (uint64_t)i * 128u; }
+static inline ehci_qtd_t *int_qtd(ehci_ctrl_t *c, int i)      { return (ehci_qtd_t *)(c->int_mem + 512u + (uint32_t)i * 64u); }
+static inline uint64_t    int_qtd_phys(ehci_ctrl_t *c, int i) { return c->int_mem_phys + 512u + (uint64_t)i * 64u; }
+static inline uint8_t    *int_buf(ehci_ctrl_t *c, int i)      { return c->int_mem + 1024u + (uint32_t)i * 64u; }
+static inline uint64_t    int_buf_phys(ehci_ctrl_t *c, int i) { return c->int_mem_phys + 1024u + (uint64_t)i * 64u; }
+
+static bool ehci_periodic_set(ehci_ctrl_t *c, bool on) {
+    uint32_t cmd  = op_r32(c, EHCI_OP_USBCMD);
+    uint32_t want = on ? (cmd | EHCI_CMD_PSE) : (cmd & ~EHCI_CMD_PSE);
+    if (want != cmd) op_w32(c, EHCI_OP_USBCMD, want);
+    for (int i = 0; i < 40; i++) {
+        bool running = (op_r32(c, EHCI_OP_USBSTS) & EHCI_STS_PSS) != 0;
+        if (running == on) return true;
+        ehci_delay_ms(1);
+    }
+    DBG_MSG("EHCI", "periodic schedule state change timed out");
+    return false;
+}
+
+ 
+static void ehci_periodic_init(ehci_ctrl_t *c) {
+    c->frame_list = (uint32_t *)dma32_alloc(4096, &c->frame_list_phys);
+    c->int_mem    = (uint8_t  *)dma32_alloc(4096, &c->int_mem_phys);
+    if (!c->frame_list || !c->int_mem) {
+        c->frame_list = NULL; c->int_mem = NULL;
+        DBG_MSG("EHCI", "periodic schedule: DMA alloc failed (interrupt-split disabled)");
+        return;
+    }
+    for (int i = 0; i < EHCI_INT_SLOTS; i++) {
+        ehci_qh_t *qh = int_qh(c, i);
+        qh->horiz_link   = (i + 1 < EHCI_INT_SLOTS) ? ((uint32_t)int_qh_phys(c, i + 1) | EHCI_PTR_TYPE_QH)
+                                                    : EHCI_PTR_TERMINATE;
+        qh->ep_char      = 0;
+        qh->ep_cap       = (1u << 30);           
+        qh->cur_qtd      = 0;
+        qh->next_qtd     = EHCI_PTR_TERMINATE;
+        qh->alt_next_qtd = EHCI_PTR_TERMINATE;
+        qh->token        = 0;
+    }
+    for (uint32_t e = 0; e < 1024; e++)
+        c->frame_list[e] = (e % EHCI_INT_FRAME_STRIDE == 0)
+                           ? ((uint32_t)int_qh_phys(c, 0) | EHCI_PTR_TYPE_QH)
+                           : EHCI_PTR_TERMINATE;
+    op_w32(c, EHCI_OP_PERIODICLISTBASE, (uint32_t)c->frame_list_phys);
+    if (!ehci_periodic_set(c, true)) {
+        c->frame_list = NULL; c->int_mem = NULL;    
+        DBG_MSG("EHCI", "periodic schedule: enable failed");
+    } else {
+        DBG_MSG("EHCI", "periodic schedule enabled");
+    }
+}
+
+static void ehci_int_rearm(ehci_ctrl_t *c, int i, uint8_t toggle, uint32_t len) {
+    ehci_qtd_t *td = int_qtd(c, i);
+    ehci_qh_t  *qh = int_qh(c, i);
+    ehci_qtd_fill(td, EHCI_QTD_PID_IN, (uint16_t)len, int_buf_phys(c, i), toggle);
+    td->next_qtd = EHCI_PTR_TERMINATE;
+     
+
+    qh->token        = 0;
+    qh->alt_next_qtd = EHCI_PTR_TERMINATE;
+    qh->next_qtd     = (uint32_t)int_qtd_phys(c, i);
+}
+
+ 
+
+
+static int ehci_int_in_poll_periodic(ehci_ctrl_t *c, uint8_t dev_addr, uint8_t speed,
+                                     uint8_t ep_addr, uint16_t max_packet,
+                                     void *data, uint32_t len, uint8_t *toggle_inout) {
+    if (!(ep_addr & 0x80u) || !data) return -1;
+    if (max_packet == 0) max_packet = 8;
+    if (len == 0 || len > max_packet || len > 64) return -1;
+
+    uint32_t eps_bits, qh_cap;
+    if (!ehci_qh_target(c, dev_addr, speed, false, &eps_bits, &qh_cap)) return -1;
+    uint8_t tt_hub  = c->tt_hub[dev_addr & 0x7F];
+    uint8_t tt_port = c->tt_port[dev_addr & 0x7F];
+
+    int si = -1, fi = -1;
+    for (int i = 0; i < EHCI_INT_SLOTS; i++) {
+        ehci_int_slot_t *sl = &c->islot[i];
+        if (sl->used && sl->dev_addr == dev_addr && sl->ep_addr == ep_addr) { si = i; break; }
+        if (!sl->used && fi < 0) fi = i;
+    }
+    bool configure = false;
+    if (si < 0) {
+        if (fi < 0) return -1;
+        si = fi; configure = true;
+    } else {
+        ehci_int_slot_t *sl = &c->islot[si];
+        if (sl->tt_hub != tt_hub || sl->tt_port != tt_port || sl->maxp != max_packet) configure = true;
+    }
+
+    ehci_qh_t       *qh = int_qh(c, si);
+    ehci_qtd_t      *td = int_qtd(c, si);
+    ehci_int_slot_t *sl = &c->islot[si];
+
+    if (configure) {
+        if (!ehci_ensure_running(c)) return -4;
+        ehci_periodic_set(c, false);           
+        qh->ep_cap = (1u << 30);               
+        uint8_t tg = toggle_inout ? (uint8_t)(*toggle_inout & 1u) : 0;
+        qh->ep_char = EHCI_QH_ADDR(dev_addr) | EHCI_QH_EPNUM(ep_addr & 0x0Fu) |
+                      eps_bits | EHCI_QH_DTC | EHCI_QH_MAXP(max_packet);    
+        qh->cur_qtd = 0;
+        ehci_int_rearm(c, si, tg, len);
+        qh->ep_cap = qh_cap | EHCI_INT_SMASK | (EHCI_INT_CMASK << 8);
+        sl->used = true; sl->dev_addr = dev_addr; sl->ep_addr = ep_addr;
+        sl->tt_hub = tt_hub; sl->tt_port = tt_port; sl->maxp = max_packet;
+        sl->toggle = tg; sl->len = len;
+        ehci_periodic_set(c, true);
+        g_int_cfg++;
+        DBG_VAL("EHCI", "interrupt-split slot configured, dev", dev_addr);
+        return 0;
+    }
+
+    g_int_polls++;
+    g_int_qhtok = qh->token & 0xFFu;
+    uint32_t tok = td->token;
+    if (tok & EHCI_QTD_STATUS_ACTIVE) return 0;       
+
+    if (tok & EHCI_QTD_STATUS_HALTED) {
+        g_int_halt++;
+        g_int_qhtok = tok & 0xFFu;
+        ehci_int_rearm(c, si, sl->toggle, sl->len);
+        return -2;
+    }
+
+    uint32_t remaining = (tok >> 16) & 0x7FFFu;
+    uint32_t got = (remaining <= sl->len) ? (sl->len - remaining) : 0;
+    uint8_t  nt  = got ? (uint8_t)(sl->toggle ^ 1u) : sl->toggle;
+    if (got) {
+        uint32_t n = got < len ? got : len;
+        memcpy(data, int_buf(c, si), n);
+        g_int_done++;
+    }
+    sl->toggle = nt;
+    if (toggle_inout) *toggle_inout = nt;
+    ehci_int_rearm(c, si, nt, sl->len);
+    return (int)got;
+}
+
+static int ehci_int_in_poll(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                            uint8_t ep_addr, uint16_t max_packet,
+                            void *data, uint32_t len, uint8_t *toggle_inout,
+                            uint32_t timeout_us) {
+    ehci_ctrl_t *c = (ehci_ctrl_t *)hcd->priv;
+    uint64_t fl = usb_irq_save();
+    int rc;
+    if (speed != USB_SPEED_HIGH && c->frame_list && c->int_mem)
+        rc = ehci_int_in_poll_periodic(c, dev_addr, speed, ep_addr, max_packet, data, len, toggle_inout);
+    else
+        rc = ehci_int_in_poll_impl(hcd, dev_addr, speed, ep_addr, max_packet, data, len,
+                                   toggle_inout, timeout_us);
+    usb_irq_restore(fl);
+    return rc;
+}
+
+ 
+
+
+static bool ehci_port_connected(usb_hcd_t *hcd, uint8_t port, bool *out_connected) {
+    ehci_ctrl_t *c = (ehci_ctrl_t *)hcd->priv;
+    if (port >= c->num_ports) return false;
+    uint32_t val = op_r32(c, EHCI_OP_PORTSC_BASE + (uint32_t)port * 4);
+    *out_connected = (val & EHCI_PORTSC_CCS) != 0;
+    return true;
+}
+
 static const usb_hcd_ops_t g_ehci_ops = {
     .control_transfer = ehci_control_transfer,
     .port_reset       = ehci_port_reset,
     .bulk_transfer    = ehci_bulk_transfer,
+    .set_route        = ehci_set_route,
+    .port_connected   = ehci_port_connected,
+    .int_in_poll      = ehci_int_in_poll,
+    .bulk_in_poll     = ehci_bulk_in_poll,
+    .supports_hubs    = true,
 };
 
-/* =========================================================================
- * BIOS->OS handoff (EHCI spec §2.2.4, Extended Capabilities / EECP)
- * ========================================================================= */
+ 
+
+
 static void ehci_bios_handoff(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t hccparams) {
     uint32_t eecp = (hccparams >> 8) & 0xFFu;
-    if (eecp < 0x40) return;   /* нет расширенных возможностей вообще */
+    if (eecp < 0x40) return;    
 
     int guard = 0;
     while (eecp != 0 && guard++ < 16) {
@@ -474,25 +1069,25 @@ static void ehci_bios_handoff(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t hcc
         uint8_t  cap_id = (uint8_t)(cap & 0xFFu);
         uint8_t  next   = (uint8_t)((cap >> 8) & 0xFFu);
 
-        if (cap_id == 0x01) {   /* USB Legacy Support Capability */
+        if (cap_id == 0x01) {    
             DBG_VAL("EHCI", "BIOS handoff: legacy cap at", eecp);
-            pci_write32(bus, dev, fn, (uint8_t)eecp, cap | (1u << 16));   /* HC OS Owned = 1 */
+            pci_write32(bus, dev, fn, (uint8_t)eecp, cap | (1u << 16));    
 
             bool released = false;
             for (int i = 0; i < 1000; i++) {
                 uint32_t v = pci_read32(bus, dev, fn, (uint8_t)eecp);
-                if (!(v & (1u << 24))) { released = true; break; }   /* HC BIOS Owned == 0 */
+                if (!(v & (1u << 24))) { released = true; break; }    
                 ehci_delay_ms(1);
             }
             if (!released) {
-                DBG_MSG("EHCI", "BIOS didn't release ownership in time — форсируем");
+                DBG_MSG("EHCI", "BIOS did not release ownership in time - forcing takeover");
                 uint32_t v = pci_read32(bus, dev, fn, (uint8_t)eecp);
                 pci_write32(bus, dev, fn, (uint8_t)eecp, v & ~(1u << 24));
             }
 
-            /* USBLEGCTLSTS (следующий dword) — гасим все SMI-триггеры,
-             * чтобы прошивка больше не пыталась вмешиваться параллельно
-             * с нами (тот же приём, что LEGSUP в UHCI.c). */
+             
+
+
             pci_write32(bus, dev, fn, (uint8_t)(eecp + 4), 0);
             break;
         }
@@ -500,9 +1095,9 @@ static void ehci_bios_handoff(uint8_t bus, uint8_t dev, uint8_t fn, uint32_t hcc
     }
 }
 
-/* =========================================================================
- * Инициализация одного контроллера
- * ========================================================================= */
+ 
+
+
 static bool ehci_init_controller(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t mmio_phys) {
     if (g_ehci_count >= EHCI_MAX_CONTROLLERS) return false;
     ehci_ctrl_t *c = &g_ehci[g_ehci_count];
@@ -515,12 +1110,14 @@ static bool ehci_init_controller(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t 
     uint32_t hccparams  = mmio_r32(c->mmio_va + EHCI_CAP_HCCPARAMS);
     c->op_va = c->mmio_va + caplength;
 
+    c->pci_id = pci_read32(bus, dev, fn, 0x00);
+    c->hcsparams = hcsparams; c->hccparams = hccparams;
     c->num_ports = (uint8_t)(hcsparams & 0x0Fu);
     if (c->num_ports == 0 || c->num_ports > EHCI_MAX_PORTS) c->num_ports = EHCI_MAX_PORTS;
 
     ehci_bios_handoff(bus, dev, fn, hccparams);
 
-    /* Останавливаем, если контроллер уже был запущен прошивкой */
+     
     if (!(op_r32(c, EHCI_OP_USBSTS) & EHCI_STS_HALTED)) {
         op_w32(c, EHCI_OP_USBCMD, op_r32(c, EHCI_OP_USBCMD) & ~EHCI_CMD_RS);
         bool halted = false;
@@ -531,7 +1128,7 @@ static bool ehci_init_controller(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t 
         if (!halted) { DBG_MSG("EHCI", "controller won't halt, skip"); return false; }
     }
 
-    /* Полный сброс */
+     
     op_w32(c, EHCI_OP_USBCMD, EHCI_CMD_HCRESET);
     bool reset_ok = false;
     for (int i = 0; i < 200; i++) {
@@ -540,7 +1137,7 @@ static bool ehci_init_controller(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t 
     }
     if (!reset_ok) { DBG_MSG("EHCI", "HCRESET timeout, skip"); return false; }
 
-    /* DMA-структуры: постоянная async QH, пул qTD, scratch под setup+данные */
+     
     c->ctrl_qh = (ehci_qh_t *)dma32_alloc(4096, &c->ctrl_qh_phys);
     c->td_pool = (ehci_qtd_t *)dma32_alloc(EHCI_TD_POOL_COUNT * sizeof(ehci_qtd_t), &c->td_pool_phys);
     c->scratch = (uint8_t   *)dma32_alloc(4096, &c->scratch_phys);
@@ -550,22 +1147,24 @@ static bool ehci_init_controller(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t 
         return false;
     }
 
-    /* QH зациклена сама на себя — единственный элемент async-списка. */
+     
     c->ctrl_qh->horiz_link    = (uint32_t)c->ctrl_qh_phys | EHCI_PTR_TYPE_QH;
-    c->ctrl_qh->ep_char       = (1u << 14);   /* H=1, остальное дозаполнится в control_transfer */
+    c->ctrl_qh->ep_char       = EHCI_QH_H;    
     c->ctrl_qh->ep_cap        = (1u << 30);
     c->ctrl_qh->cur_qtd       = 0;
     c->ctrl_qh->next_qtd      = EHCI_PTR_TERMINATE;
     c->ctrl_qh->alt_next_qtd  = EHCI_PTR_TERMINATE;
     c->ctrl_qh->token         = 0;
 
-    op_w32(c, EHCI_OP_CTRLDSSEGMENT, 0);              /* весь DMA этого драйвера < 4ГБ */
+    op_w32(c, EHCI_OP_CTRLDSSEGMENT, 0);               
     op_w32(c, EHCI_OP_ASYNCLISTADDR, (uint32_t)c->ctrl_qh_phys);
-    op_w32(c, EHCI_OP_USBINTR, 0);                     /* без прерываний — polling, как везде в этом ядре */
+    op_w32(c, EHCI_OP_USBINTR, 0);                      
 
-    /* Периодическое расписание сознательно не поднимаем (см. шапку файла) —
-     * только Run/Stop + Async Schedule Enable. */
-    op_w32(c, EHCI_OP_USBCMD, EHCI_CMD_RS | EHCI_CMD_ASE);
+     
+
+     
+
+    op_w32(c, EHCI_OP_USBCMD, EHCI_CMD_RS | (8u << 16));
 
     bool started = false;
     for (int i = 0; i < 100; i++) {
@@ -574,11 +1173,29 @@ static bool ehci_init_controller(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t 
     }
     if (!started) { DBG_MSG("EHCI", "controller didn't start (USBSTS.HCHalted stuck), skip"); return false; }
 
-    /* Забираем все порты себе (маршрутизация по умолчанию — companion) —
-     * без этого порты остаются "молчаливо" привязаны к companion-
-     * контроллеру и до High-Speed устройств EHCI просто не достучится. */
+     
+    ehci_periodic_init(c);
+
+     
+
+
     op_w32(c, EHCI_OP_CONFIGFLAG, 1);
     ehci_delay_ms(5);
+
+     
+
+
+
+
+
+    for (uint8_t pn = 0; pn < c->num_ports; pn++) {
+        uint32_t reg = EHCI_OP_PORTSC_BASE + (uint32_t)pn * 4;
+        uint32_t v = op_r32(c, reg);
+        if (!(v & EHCI_PORTSC_PP))
+            op_w32(c, reg, (v & ~EHCI_PORTSC_RWC_MASK) | EHCI_PORTSC_PP);
+    }
+    ehci_delay_ms(20);
+    ehci_delay_ms(150);
 
     c->hcd.ops       = &g_ehci_ops;
     c->hcd.priv      = c;
@@ -590,9 +1207,9 @@ static bool ehci_init_controller(uint8_t bus, uint8_t dev, uint8_t fn, uint64_t 
     return true;
 }
 
-/* =========================================================================
- * PCI-сканирование — class 0x0C, subclass 0x03, prog-if 0x20 (EHCI).
- * ========================================================================= */
+ 
+
+
 void ehci_pci_scan(void) {
     DBG_MSG("EHCI", "=== ehci_pci_scan ===");
     int found = 0;
@@ -619,18 +1236,18 @@ void ehci_pci_scan(void) {
                 DBG_VAL("EHCI", "  vendor:device", id);
 
                 uint32_t pcmd = pci_read32((uint8_t)bus, dev, fn, 0x04);
-                pci_write32((uint8_t)bus, dev, fn, 0x04, pcmd | 0x06);   /* Memory Space + Bus Master */
+                pci_write32((uint8_t)bus, dev, fn, 0x04, pcmd | 0x06);    
 
-                /* BAR0 — MMIO, может быть 32- или 64-битным (бит2:1 типа
-                 * в BAR: 00=32-bit, 10=64-bit). У большинства EHCI это
-                 * 32-битный BAR, но проверяем честно. */
+                 
+
+
                 uint32_t bar0 = pci_read32((uint8_t)bus, dev, fn, 0x10);
                 if (bar0 & 1) {
-                    DBG_MSG("EHCI", "BAR0 is I/O space?! — не по спеке, skip");
+                    DBG_MSG("EHCI", "BAR0 is I/O space (not per spec), skip");
                     continue;
                 }
                 uint64_t mmio_phys = (uint64_t)(bar0 & 0xFFFFFFF0u);
-                if (((bar0 >> 1) & 0x3u) == 0x2u) {   /* 64-битный BAR — верхняя половина в следующем dword */
+                if (((bar0 >> 1) & 0x3u) == 0x2u) {    
                     uint32_t bar1 = pci_read32((uint8_t)bus, dev, fn, 0x14);
                     mmio_phys |= ((uint64_t)bar1 << 32);
                 }

@@ -1,29 +1,16 @@
-/*
- * calc.c — простейший калькулятор для FEXOS, НАСТОЯЩЕЕ userspace
- * ELF64-приложение (не встроенное в ядро, в отличие от "My Computer").
- *
- * Собирается ОТДЕЛЬНО от ядра (см. Compile.sh, секция "Калькулятор"),
- * компонуется как статический ET_EXEC без libc/crt0 — только то, что
- * есть в этом файле. Общается с ядром исключительно через syscall'ы
- * (см. Syscall.h): создаёт своё окно, получает framebuffer и область
- * содержимого окна, опрашивает мышь и сам рисует все пиксели —
- * ядро ничего не знает про арифметику/кнопки калькулятора.
- *
- * Возможности: цифры 0-9, +, -, =, C (сброс), результат сверху.
- * Никакой библиотеки — свой syscall-wrapper, свой мини-шрифт (только
- * цифры/несколько символов, блочный 5x7), своя целочисленная
- * арифметика (int64_t, без чисел с плавающей точкой).
- */
+/* Fexox OS Project, EULA GPLv2 */
+ 
+
 
 #include <stdint.h>
 #include <stdbool.h>
 
-/* =========================================================================
- * Номера syscall'ов и структуры — продублировано из Syscall.h, т.к. у
- * userspace-приложений нет доступа к заголовкам ядра (freestanding,
- * отдельная цель компиляции — см. Compile.sh). Держать в синхроне
- * вручную с Syscall.h при любых изменениях ABI.
- * ========================================================================= */
+ 
+
+
+
+
+
 #define SYS_EXIT          60
 #define SYS_SCHED_YIELD   24
 #define SYS_GET_FRAMEBUFFER 500
@@ -53,10 +40,10 @@ typedef struct {
     uint8_t buttons;
 } sc_input_t;
 
-/* =========================================================================
- * syscall wrapper — соглашение из Syscall.h: rax=nr, rdi,rsi,rdx,r10,r8,r9
- * = аргументы, возврат в rax (<0 — errno отрицательный).
- * ========================================================================= */
+ 
+
+
+
 static inline int64_t sys_call(int64_t nr, int64_t a1, int64_t a2,
                                int64_t a3, int64_t a4, int64_t a5) {
     int64_t ret;
@@ -90,25 +77,25 @@ static int64_t sys_input_poll(sc_input_t *out) {
     return sys_call(SYS_INPUT_POLL, (int64_t)(uintptr_t)out, 0, 0, 0, 0);
 }
 
-/* =========================================================================
- * Мини-libc: без настоящей libc в freestanding-окружении.
- * ========================================================================= */
+ 
+
+
 static uint64_t u64_strlen(const char *s) { uint64_t n = 0; while (s[n]) n++; return n; }
 
-/* =========================================================================
- * Framebuffer: прямая запись пикселей в замапленный задний буфер ядра
- * (см. sys_get_framebuffer — virt_addr уже настоящий userspace-указатель,
- * реально замапленный через vmm_map_user на стороне ядра).
- * ========================================================================= */
+ 
+
+
+
+
 static sc_framebuffer_t g_fb;
-static sc_win_rect_t    g_rect;   /* область содержимого НАШЕГО окна */
+static sc_win_rect_t    g_rect;    
 
 static inline void put_px(int32_t x, int32_t y, uint8_t r, uint8_t g, uint8_t b) {
-    /* x/y приходят в ЛОКАЛЬНЫХ координатах содержимого окна (0..WIN_W,
-     * 0..WIN_H) — так же, как их использует hit-test кликов (lx/ly в
-     * calc_main). Чтобы реально попасть в область окна на экране, нужно
-     * прибавить его текущее положение (g_rect.x/y), иначе всё рисуется
-     * в углу общего framebuffer'а, а не внутри окна. */
+     
+
+
+
+
     int32_t ax = x + g_rect.x;
     int32_t ay = y + g_rect.y;
     if (ax < 0 || ay < 0 || (uint32_t)ax >= g_fb.width || (uint32_t)ay >= g_fb.height) return;
@@ -117,8 +104,8 @@ static inline void put_px(int32_t x, int32_t y, uint8_t r, uint8_t g, uint8_t b)
                       ((uint32_t)b << g_fb.b_shift);
     uint8_t *dst = (uint8_t *)(uintptr_t)g_fb.virt_addr +
                    (uint64_t)ay * g_fb.pitch + (uint64_t)ax * (g_fb.bpp / 8u);
-    /* bpp у GOP всегда 32 в этом ядре (см. Framebuffer.c) — пишем как
-     * 4 байта, порядок диктуют сдвиги выше, а не порядок записи байт. */
+     
+
     *(volatile uint32_t *)dst = native;
 }
 
@@ -137,12 +124,12 @@ static void draw_rect_outline(int32_t x, int32_t y, uint32_t w, uint32_t h,
     fill_rect(x + (int32_t)w - 2, y, 2, h, r, g, b);
 }
 
-/* =========================================================================
- * Мини-шрифт: блочный 5 (ширина) x 7 (высота), 1 бит = 1 пиксель,
- * только то, что нужно калькулятору: 0-9, +, -, =, C, пробел, минус
- * отдельно от "C" (используем как индикатор ошибки).
- * Каждая строка глифа — 5 младших бит байта (бит4=левый пиксель).
- * ========================================================================= */
+ 
+
+
+
+
+
 typedef struct { char c; uint8_t rows[7]; } glyph_t;
 
 static const glyph_t FONT[] = {
@@ -160,7 +147,7 @@ static const glyph_t FONT[] = {
     {'-', {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}},
     {'=', {0x00,0x00,0x1F,0x00,0x1F,0x00,0x00}},
     {'C', {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}},
-    {'E', {0x1F,0x10,0x1E,0x10,0x10,0x10,0x1F}},  /* "Error" индикатор */
+    {'E', {0x1F,0x10,0x1E,0x10,0x10,0x10,0x1F}},   
     {'.', {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}},
     {' ', {0,0,0,0,0,0,0}},
 };
@@ -169,7 +156,7 @@ static const glyph_t FONT[] = {
 static const glyph_t *find_glyph(char c) {
     for (int i = 0; i < FONT_N; i++)
         if (FONT[i].c == c) return &FONT[i];
-    return &FONT[FONT_N - 1]; /* пробел по умолчанию */
+    return &FONT[FONT_N - 1];  
 }
 
 static void draw_char(int32_t x, int32_t y, char c, uint8_t scale,
@@ -199,9 +186,9 @@ static uint32_t text_width(const char *s, uint8_t scale) {
     return (uint32_t)(u64_strlen(s) * 6u * scale);
 }
 
-/* =========================================================================
- * Число -> строка (без libc), int64_t, десятичное, со знаком.
- * ========================================================================= */
+ 
+
+
 static int i64_to_str(int64_t v, char *out, int out_sz) {
     char tmp[24];
     int n = 0;
@@ -221,9 +208,9 @@ static int i64_to_str(int64_t v, char *out, int out_sz) {
     return len;
 }
 
-/* =========================================================================
- * Раскладка кнопок: 4 колонки x 4 строки, дисплей результата сверху.
- * ========================================================================= */
+ 
+
+
 #define WIN_W   220u
 #define WIN_H   300u
 #define DISP_H   50u
@@ -252,17 +239,17 @@ static void btn_rect(int col, int row, int32_t *bx, int32_t *by, uint32_t *bw, u
     *bh = ch;
 }
 
-/* =========================================================================
- * Состояние калькулятора — простая лево-направо арифметика без
- * приоритета операций (как в любом "бытовом" калькуляторе).
- * ========================================================================= */
-static int64_t g_acc = 0;      /* накопитель */
-static int64_t g_cur = 0;      /* текущее набираемое число */
+ 
+
+
+
+static int64_t g_acc = 0;       
+static int64_t g_cur = 0;       
 static char    g_pending_op = 0;
 static bool    g_typing = false;
 static bool    g_error = false;
 
-#define CUR_MAX  99999999LL   /* ограничение набора, чтобы не переполнить дисплей */
+#define CUR_MAX  99999999LL    
 
 static int64_t apply_op(int64_t a, char op, int64_t b) {
     switch (op) {
@@ -277,7 +264,7 @@ static void calc_reset(void) {
 }
 
 static void calc_press(char label) {
-    if (g_error && label != 'C') return;   /* после ошибки — только сброс */
+    if (g_error && label != 'C') return;    
 
     if (label >= '0' && label <= '9') {
         if (!g_typing) { g_cur = 0; g_typing = true; }
@@ -312,9 +299,9 @@ static int64_t calc_display_value(void) {
     return g_typing ? g_cur : g_acc;
 }
 
-/* =========================================================================
- * Отрисовка
- * ========================================================================= */
+ 
+
+
 static void draw_display(void) {
     fill_rect(0, 0, WIN_W, DISP_H, 20, 20, 24);
     draw_rect_outline(0, 0, WIN_W, DISP_H, 60, 60, 68);
@@ -368,25 +355,25 @@ static void draw_all(int pressed_col, int pressed_row) {
             draw_button(col, row, (col == pressed_col && row == pressed_row));
 }
 
-/* =========================================================================
- * main
- * ========================================================================= */
-/* НЕ static и с __attribute__((used)): единственный вызов — из "сырого"
- * asm-блока ниже (__asm__(...) вне функции), который компилятор не
- * умеет разбирать как ссылку на символ. При -O0 static-функция без
- * видимых С-вызовов всё равно может быть не сгенерирована в объектный
- * файл вовсе (см. предупреждение "unused function") — тогда линкер не
- * находит calc_main и падает с "undefined symbol". Оба атрибута вместе
- * гарантируют, что символ реально попадёт в build/calc.o. */
+ 
+
+
+ 
+
+
+
+
+
+
 __attribute__((used))
 void calc_main(void) {
     const char title[] = "Calculator";
-    /* Ядро возвращает через sys_win_get_rect() область СОДЕРЖИМОГО окна —
-     * т.е. запрошенную высоту МИНУС заголовок (UI_WIN_TITLEBAR_H=28,
-     * см. Framebuffer.c). Весь layout ниже (btn_rect/draw_display и т.д.)
-     * считает в предположении, что содержимого ровно WIN_H пикселей —
-     * поэтому запрашиваем окно на 28px выше, иначе нижние ряды кнопок
-     * рисуются за физической нижней границей окна. */
+     
+
+
+
+
+
     #define WIN_TITLEBAR_H 28u
     int64_t win_id = sys_win_create(title, (uint32_t)u64_strlen(title), WIN_W, WIN_H + WIN_TITLEBAR_H);
     if (win_id < 0) sys_exit(1);
@@ -401,30 +388,30 @@ void calc_main(void) {
     bool prev_lmb = false;
     int  active_col = -1;
 
-    /* Позиция окна на момент последней отрисовки — нужна, чтобы заметить
-     * перетаскивание. Ядро (Framebuffer.c: ui_win_move_ex) при КАЖДОМ
-     * тике drag'а само вызывает ui_win_draw() и закрашивает всё тело
-     * окна фоном — оно ничего не знает про то, что мы туда нарисовали,
-     * и никакого "expose"-события userspace не получает. Единственный
-     * способ не остаться с пустым окном после любого перетаскивания —
-     * самим следить за g_rect (который и так перечитываем каждую
-     * итерацию) и перерисовываться заново, как только он изменился. */
+     
+
+
+
+
+
+
+
     int32_t last_rx = g_rect.x, last_ry = g_rect.y;
 
     for (;;) {
-        /* Окно могли подвинуть перетаскиванием за заголовок — координаты
-         * содержимого нужно перечитывать, иначе после drag'а рисование
-         * "уедет" от реального положения окна на экране. Дёшево (просто
-         * чтение полей структуры окна ядром), можно каждую итерацию. */
+         
+
+
+
         if (sys_win_get_rect((int)win_id, &g_rect) < 0) {
-            /* Окно закрыли (крестиком) — win_id стал невалиден. Выходим. */
+             
             sys_exit(0);
         }
 
         if (g_rect.x != last_rx || g_rect.y != last_ry) {
-            /* Окно физически передвинули — ядро уже стёрло его тело в
-             * задний буфер (см. ui_win_move_ex/ui_win_draw), рисуем
-             * себя заново поверх новой пустой области. */
+             
+
+
             last_rx = g_rect.x;
             last_ry = g_rect.y;
             draw_all(-1, -1);
@@ -436,7 +423,7 @@ void calc_main(void) {
         int32_t ly = in.y - g_rect.y;
         bool inside = lx >= 0 && ly >= 0 && (uint32_t)lx < g_rect.w && (uint32_t)ly < g_rect.h;
         bool lmb = (in.buttons & 0x01) != 0;
-        bool click_edge = lmb && !prev_lmb;   /* переход "не нажато -> нажато" */
+        bool click_edge = lmb && !prev_lmb;    
 
         if (inside && click_edge) {
             for (int row = 0; row < GRID_ROWS && active_col < 0; row++) {
@@ -453,7 +440,7 @@ void calc_main(void) {
                 }
             }
         } else if (!lmb && active_col >= 0) {
-            /* Отпустили кнопку мыши — снимаем подсветку нажатой кнопки. */
+             
             draw_all(-1, -1);
             active_col = -1;
         }
@@ -463,17 +450,17 @@ void calc_main(void) {
     }
 }
 
-/* =========================================================================
- * Точка входа. ELF64.c грузит образ и прыгает на e_entry без argv/envp
- * (см. ELF64.h: "текущая реализация не передаёт argv/envp"). Никакого
- * crt0 нет — стек уже готов (elf64_load выставляет stack_top), выравнивание
- * по 16 байт для System V ABI гарантирует загрузчик.
- * ========================================================================= */
+ 
+
+
+
+
+
 __asm__(
     ".global _start\n"
     "_start:\n"
     "    call calc_main\n"
-    "    mov $60, %rax\n"   /* SYS_EXIT на случай если calc_main вернётся */
+    "    mov $60, %rax\n"    
     "    xor %rdi, %rdi\n"
     "    syscall\n"
     "1:  jmp 1b\n"

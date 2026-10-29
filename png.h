@@ -1,11 +1,7 @@
-/*
- * png.h — минимальный PNG-декодер для FEXOS (freestanding, без libc/zlib)
- *
- * Поддерживает:
- *   - 8-bit PNG, цветовые типы 2 (RGB) и 6 (RGBA), без interlace
- *   - фильтры строк 0..4 (None/Sub/Up/Average/Paeth)
- *   - собственная реализация DEFLATE/INFLATE (stored, fixed и dynamic Huffman)
- */
+/* Fexox OS Project, EULA GPLv2 */
+ 
+
+
 #ifndef PNG_H
 #define PNG_H
 

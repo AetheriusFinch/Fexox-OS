@@ -1,25 +1,6 @@
-/*
- * SysLogsApp.c — приложение "System Logs" для FEXOS
- *
- * Простое userspace-приложение (тот же паттерн, что calc.c): открывает
- * своё окно через SYS_WIN_CREATE, получает framebuffer через
- * SYS_GET_FRAMEBUFFER, и рисует пиксели прямо в него сам — без всякой
- * связи с ядром, кроме системных вызовов. Никакого отдельного
- * "ring buffer" системных логов в ядре пока нет, поэтому окно
- * показывает:
- *   - несколько статичных строк о стадиях загрузки (для вида/контекста);
- *   - реальные живые данные, которые можно получить через syscall'ы
- *     (pid процесса, режим/разрешение framebuffer'а, "тик" — чтобы
- *     было видно, что окно живое);
- *   - содержимое файла /system.log, если он есть на диске (по строке
- *     на файловую строку, до первого перевода строки) — так что если
- *     когда-нибудь ядро/другие программы начнут дописывать туда
- *     реальные логи, это окно их сразу покажет без переделок.
- *
- * Свой собственный маленький шрифт 5x7 (см. ниже) — никаких внешних
- * зависимостей, никакого libc (freestanding, статическая линковка,
- * см. Compile.sh: CFLAGS_USER/LDFLAGS_USER).
- */
+/* Fexox OS Project, EULA GPLv2 */
+ 
+
 
 #include <stdint.h>
 #include <stddef.h>
@@ -27,427 +8,452 @@
 
 #include "../Syscall.h"
 
-/* =========================================================================
- * "Сырые" системные вызовы — напрямую через инструкцию SYSCALL.
- * Соглашение (см. Syscall.h): rax=nr, rdi=a1, rsi=a2, rdx=a3, r10=a4,
- * r8=a5 — как обычный Linux x86_64 syscall ABI (r10 вместо rcx, т.к.
- * rcx затирается самой инструкцией syscall).
- * ========================================================================= */
-static inline long raw_syscall(long nr, long a1, long a2, long a3,
-                                long a4, long a5) {
+#define SLG_SYS_INPUT_POLL 604
+#define SLG_SYS_KLOG_READ  880
+#define SLG_SYS_EXIT       60
+#define SLG_SYS_YIELD      24
+#define SLG_SYS_NANOSLEEP  35
+#define SLG_SYS_FB         500
+#define SLG_SYS_WIN_CREATE 600
+#define SLG_SYS_WIN_RECT   603
+
+typedef struct { int32_t x, y; uint8_t buttons; } slg_input_t;
+
+static inline long raw_syscall(long nr, long a1, long a2, long a3, long a4, long a5) {
     long ret;
     register long r10 __asm__("r10") = a4;
     register long r8  __asm__("r8")  = a5;
-    __asm__ volatile (
-        "syscall"
+    __asm__ volatile ("syscall"
         : "=a"(ret)
         : "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8)
-        : "rcx", "r11", "memory"
-    );
+        : "rcx", "r11", "memory");
     return ret;
 }
 
-static inline void sys_exit(int code) {
-    raw_syscall(SYS_EXIT, code, 0, 0, 0, 0);
-    for (;;) { /* не должны сюда попасть */ }
+static void sys_exit(int code) {
+    raw_syscall(SLG_SYS_EXIT, code, 0, 0, 0, 0);
+    for (;;) { }
+}
+static void sys_yield(void) { raw_syscall(SLG_SYS_YIELD, 0, 0, 0, 0, 0); }
+ 
+
+typedef struct { int64_t tv_sec; int64_t tv_nsec; } slg_timespec_t;
+static void sys_sleep_ms(unsigned ms) {
+    slg_timespec_t ts; ts.tv_sec = ms / 1000; ts.tv_nsec = (int64_t)(ms % 1000) * 1000000;
+    raw_syscall(SLG_SYS_NANOSLEEP, (long)(uintptr_t)&ts, 0, 0, 0, 0);
 }
 
-static inline long sys_sched_yield(void) {
-    return raw_syscall(SYS_SCHED_YIELD, 0, 0, 0, 0, 0);
+ 
+
+
+
+
+
+#if defined(__GNUC__) && !defined(__clang__)
+#define NO_LOOP_PATTERNS __attribute__((optimize("no-tree-loop-distribute-patterns")))
+#else
+#define NO_LOOP_PATTERNS
+#endif
+NO_LOOP_PATTERNS void *memset(void *d, int c, size_t n) {
+    unsigned char *p = (unsigned char *)d; while (n--) *p++ = (unsigned char)c; return d;
+}
+NO_LOOP_PATTERNS void *memcpy(void *d, const void *s, size_t n) {
+    unsigned char *dd = (unsigned char *)d; const unsigned char *ss = (const unsigned char *)s;
+    while (n--) *dd++ = *ss++; return d;
+}
+NO_LOOP_PATTERNS void *memmove(void *d, const void *s, size_t n) {
+    unsigned char *dd = (unsigned char *)d; const unsigned char *ss = (const unsigned char *)s;
+    if (dd < ss) { while (n--) *dd++ = *ss++; }
+    else { dd += n; ss += n; while (n--) *--dd = *--ss; }
+    return d;
 }
 
-static inline long sys_open(const char *path, long flags) {
-    return raw_syscall(SYS_OPEN, (long)(uintptr_t)path, flags, 0, 0, 0);
-}
+ 
+static unsigned long str_len(const char *s) { unsigned long n = 0; while (s[n]) n++; return n; }
 
-static inline long sys_read(long fd, void *buf, long count) {
-    return raw_syscall(SYS_READ, fd, (long)(uintptr_t)buf, count, 0, 0);
-}
-
-static inline long sys_close(long fd) {
-    return raw_syscall(SYS_CLOSE, fd, 0, 0, 0, 0);
-}
-
-static inline long sys_getpid(void) {
-    return raw_syscall(SYS_GETPID, 0, 0, 0, 0, 0);
-}
-
-static inline long sys_get_framebuffer(sc_framebuffer_t *fb) {
-    return raw_syscall(SYS_GET_FRAMEBUFFER, (long)(uintptr_t)fb, 0, 0, 0, 0);
-}
-
-static inline long sys_win_create(const char *title, unsigned long len,
-                                   unsigned long w, unsigned long h) {
-    return raw_syscall(SYS_WIN_CREATE, (long)(uintptr_t)title, (long)len,
-                        (long)w, (long)h, 0);
-}
-
-static inline long sys_win_get_rect(long win_id, sc_win_rect_t *out) {
-    return raw_syscall(SYS_WIN_GET_RECT, win_id, (long)(uintptr_t)out, 0, 0, 0);
-}
-
-/* =========================================================================
- * Мини-libc: своя, т.к. ядерная klibc.c в userspace-цель не линкуется
- * (см. Compile.sh — калькулятор и SysLogs собираются отдельно, без
- *klibc.o). Только то, что реально нужно ниже.
- * ========================================================================= */
-static unsigned long str_len(const char *s) {
-    unsigned long n = 0;
-    while (s[n]) n++;
-    return n;
-}
-
-static void str_copy(char *dst, const char *src, unsigned long maxlen) {
-    unsigned long i = 0;
-    while (i + 1 < maxlen && src[i]) { dst[i] = src[i]; i++; }
-    dst[i] = '\0';
-}
-
-/* uint -> decimal string (без libc). Возвращает длину. */
-static unsigned long uint_to_str(unsigned long v, char *out) {
-    char tmp[24];
-    int n = 0;
-    if (v == 0) { out[0] = '0'; out[1] = '\0'; return 1; }
-    while (v > 0) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
-    for (int i = 0; i < n; i++) out[i] = tmp[n - 1 - i];
-    out[n] = '\0';
-    return (unsigned long)n;
-}
-
-/* =========================================================================
- * Мини-шрифт 5x7 (свой, без внешних зависимостей) — покрывает A-Z,
- * 0-9, пробел и базовую пунктуацию. Строчные буквы рисуются как
- * заглавные (для простого лог-вывода этого достаточно). Символы, для
- * которых нет глифа, рисуются как пробел.
- * Формат: 7 байт на символ, в каждом байте биты 4..0 = пиксели строки
- * слева направо (бит4 = самый левый пиксель).
- * ========================================================================= */
-typedef struct { char c; uint8_t rows[7]; } glyph_t;
-
-static const glyph_t FONT[] = {
-    {' ', {0x00,0x00,0x00,0x00,0x00,0x00,0x00}},
-    {'0', {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}},
-    {'1', {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}},
-    {'2', {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}},
-    {'3', {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}},
-    {'4', {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}},
-    {'5', {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}},
-    {'6', {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}},
-    {'7', {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}},
-    {'8', {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}},
-    {'9', {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}},
-    {'A', {0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}},
-    {'B', {0x1E,0x11,0x11,0x1E,0x11,0x11,0x1E}},
-    {'C', {0x0F,0x10,0x10,0x10,0x10,0x10,0x0F}},
-    {'D', {0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}},
-    {'E', {0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}},
-    {'F', {0x1F,0x10,0x10,0x1E,0x10,0x10,0x10}},
-    {'G', {0x0F,0x10,0x10,0x13,0x11,0x11,0x0F}},
-    {'H', {0x11,0x11,0x11,0x1F,0x11,0x11,0x11}},
-    {'I', {0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}},
-    {'J', {0x01,0x01,0x01,0x01,0x01,0x11,0x0E}},
-    {'K', {0x11,0x12,0x14,0x18,0x14,0x12,0x11}},
-    {'L', {0x10,0x10,0x10,0x10,0x10,0x10,0x1F}},
-    {'M', {0x11,0x1B,0x15,0x15,0x11,0x11,0x11}},
-    {'N', {0x11,0x19,0x15,0x15,0x13,0x11,0x11}},
-    {'O', {0x0E,0x11,0x11,0x11,0x11,0x11,0x0E}},
-    {'P', {0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}},
-    {'Q', {0x0E,0x11,0x11,0x11,0x15,0x12,0x0D}},
-    {'R', {0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}},
-    {'S', {0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}},
-    {'T', {0x1F,0x04,0x04,0x04,0x04,0x04,0x04}},
-    {'U', {0x11,0x11,0x11,0x11,0x11,0x11,0x0E}},
-    {'V', {0x11,0x11,0x11,0x11,0x11,0x0A,0x04}},
-    {'W', {0x11,0x11,0x11,0x15,0x15,0x15,0x0A}},
-    {'X', {0x11,0x11,0x0A,0x04,0x0A,0x11,0x11}},
-    {'Y', {0x11,0x11,0x0A,0x04,0x04,0x04,0x04}},
-    {'Z', {0x1F,0x01,0x02,0x04,0x08,0x10,0x1F}},
-    {':', {0x00,0x04,0x00,0x00,0x04,0x00,0x00}},
-    {'.', {0x00,0x00,0x00,0x00,0x00,0x04,0x00}},
-    {',', {0x00,0x00,0x00,0x00,0x00,0x04,0x08}},
-    {'-', {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}},
-    {'_', {0x00,0x00,0x00,0x00,0x00,0x00,0x1F}},
-    {'/', {0x01,0x02,0x02,0x04,0x08,0x08,0x10}},
-    {'(', {0x02,0x04,0x08,0x08,0x08,0x04,0x02}},
-    {')', {0x08,0x04,0x02,0x02,0x02,0x04,0x08}},
-    {'[', {0x0E,0x08,0x08,0x08,0x08,0x08,0x0E}},
-    {']', {0x0E,0x02,0x02,0x02,0x02,0x02,0x0E}},
-    {'%', {0x19,0x1A,0x04,0x04,0x0B,0x13,0x00}},
-    {'!', {0x04,0x04,0x04,0x04,0x04,0x00,0x04}},
-    {'?', {0x0E,0x11,0x02,0x04,0x04,0x00,0x04}},
-    {'=', {0x00,0x00,0x1F,0x00,0x1F,0x00,0x00}},
-    {'>', {0x10,0x08,0x04,0x02,0x04,0x08,0x10}},
-    {'<', {0x02,0x04,0x08,0x10,0x08,0x04,0x02}},
+ 
+static const unsigned char g_font8x8[95][8] = {
+    { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },  
+    { 0x18,0x3C,0x3C,0x18,0x18,0x00,0x18,0x00 },  
+    { 0x36,0x36,0x00,0x00,0x00,0x00,0x00,0x00 },  
+    { 0x36,0x36,0x7F,0x36,0x7F,0x36,0x36,0x00 },  
+    { 0x0C,0x3E,0x03,0x1E,0x30,0x1F,0x0C,0x00 },  
+    { 0x00,0x63,0x33,0x18,0x0C,0x66,0x63,0x00 },  
+    { 0x1C,0x36,0x1C,0x6E,0x3B,0x33,0x6E,0x00 },  
+    { 0x06,0x06,0x03,0x00,0x00,0x00,0x00,0x00 },  
+    { 0x18,0x0C,0x06,0x06,0x06,0x0C,0x18,0x00 },  
+    { 0x06,0x0C,0x18,0x18,0x18,0x0C,0x06,0x00 },  
+    { 0x00,0x66,0x3C,0xFF,0x3C,0x66,0x00,0x00 },  
+    { 0x00,0x0C,0x0C,0x3F,0x0C,0x0C,0x00,0x00 },  
+    { 0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x06 },  
+    { 0x00,0x00,0x00,0x3F,0x00,0x00,0x00,0x00 },  
+    { 0x00,0x00,0x00,0x00,0x00,0x0C,0x0C,0x00 },  
+    { 0x60,0x30,0x18,0x0C,0x06,0x03,0x01,0x00 },  
+    { 0x3E,0x63,0x73,0x7B,0x6F,0x67,0x3E,0x00 },  
+    { 0x0C,0x0E,0x0C,0x0C,0x0C,0x0C,0x3F,0x00 },  
+    { 0x1E,0x33,0x30,0x1C,0x06,0x33,0x3F,0x00 },  
+    { 0x1E,0x33,0x30,0x1C,0x30,0x33,0x1E,0x00 },  
+    { 0x38,0x3C,0x36,0x33,0x7F,0x30,0x78,0x00 },  
+    { 0x3F,0x03,0x1F,0x30,0x30,0x33,0x1E,0x00 },  
+    { 0x1C,0x06,0x03,0x1F,0x33,0x33,0x1E,0x00 },  
+    { 0x3F,0x33,0x30,0x18,0x0C,0x0C,0x0C,0x00 },  
+    { 0x1E,0x33,0x33,0x1E,0x33,0x33,0x1E,0x00 },  
+    { 0x1E,0x33,0x33,0x3E,0x30,0x18,0x0E,0x00 },  
+    { 0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x00 },  
+    { 0x00,0x0C,0x0C,0x00,0x00,0x0C,0x0C,0x06 },  
+    { 0x18,0x0C,0x06,0x03,0x06,0x0C,0x18,0x00 },  
+    { 0x00,0x00,0x3F,0x00,0x00,0x3F,0x00,0x00 },  
+    { 0x06,0x0C,0x18,0x30,0x18,0x0C,0x06,0x00 },  
+    { 0x1E,0x33,0x30,0x18,0x0C,0x00,0x0C,0x00 },  
+    { 0x3E,0x63,0x7B,0x7B,0x7B,0x03,0x1E,0x00 },  
+    { 0x0C,0x1E,0x33,0x33,0x3F,0x33,0x33,0x00 },  
+    { 0x3F,0x66,0x66,0x3E,0x66,0x66,0x3F,0x00 },  
+    { 0x3C,0x66,0x03,0x03,0x03,0x66,0x3C,0x00 },  
+    { 0x1F,0x36,0x66,0x66,0x66,0x36,0x1F,0x00 },  
+    { 0x7F,0x46,0x16,0x1E,0x16,0x46,0x7F,0x00 },  
+    { 0x7F,0x46,0x16,0x1E,0x16,0x06,0x0F,0x00 },  
+    { 0x3C,0x66,0x03,0x03,0x73,0x66,0x7C,0x00 },  
+    { 0x33,0x33,0x33,0x3F,0x33,0x33,0x33,0x00 },  
+    { 0x1E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00 },  
+    { 0x78,0x30,0x30,0x30,0x33,0x33,0x1E,0x00 },  
+    { 0x67,0x66,0x36,0x1E,0x36,0x66,0x67,0x00 },  
+    { 0x0F,0x06,0x06,0x06,0x46,0x66,0x7F,0x00 },  
+    { 0x63,0x77,0x7F,0x7F,0x6B,0x63,0x63,0x00 },  
+    { 0x63,0x67,0x6F,0x7B,0x73,0x63,0x63,0x00 },  
+    { 0x1C,0x36,0x63,0x63,0x63,0x36,0x1C,0x00 },  
+    { 0x3F,0x66,0x66,0x3E,0x06,0x06,0x0F,0x00 },  
+    { 0x1E,0x33,0x33,0x33,0x3B,0x1E,0x38,0x00 },  
+    { 0x3F,0x66,0x66,0x3E,0x36,0x66,0x67,0x00 },  
+    { 0x1E,0x33,0x07,0x0E,0x38,0x33,0x1E,0x00 },  
+    { 0x3F,0x2D,0x0C,0x0C,0x0C,0x0C,0x1E,0x00 },  
+    { 0x33,0x33,0x33,0x33,0x33,0x33,0x3F,0x00 },  
+    { 0x33,0x33,0x33,0x33,0x33,0x1E,0x0C,0x00 },  
+    { 0x63,0x63,0x63,0x6B,0x7F,0x77,0x63,0x00 },  
+    { 0x63,0x63,0x36,0x1C,0x1C,0x36,0x63,0x00 },  
+    { 0x33,0x33,0x33,0x1E,0x0C,0x0C,0x1E,0x00 },  
+    { 0x7F,0x63,0x31,0x18,0x4C,0x66,0x7F,0x00 },  
+    { 0x1E,0x06,0x06,0x06,0x06,0x06,0x1E,0x00 },  
+    { 0x03,0x06,0x0C,0x18,0x30,0x60,0x40,0x00 },  
+    { 0x1E,0x18,0x18,0x18,0x18,0x18,0x1E,0x00 },  
+    { 0x08,0x1C,0x36,0x63,0x00,0x00,0x00,0x00 },  
+    { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xFF },  
+    { 0x0C,0x0C,0x18,0x00,0x00,0x00,0x00,0x00 },  
+    { 0x00,0x00,0x1E,0x30,0x3E,0x33,0x6E,0x00 },  
+    { 0x07,0x06,0x06,0x3E,0x66,0x66,0x3B,0x00 },  
+    { 0x00,0x00,0x1E,0x33,0x03,0x33,0x1E,0x00 },  
+    { 0x38,0x30,0x30,0x3E,0x33,0x33,0x6E,0x00 },  
+    { 0x00,0x00,0x1E,0x33,0x3F,0x03,0x1E,0x00 },  
+    { 0x1C,0x36,0x06,0x0F,0x06,0x06,0x0F,0x00 },  
+    { 0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x1F },  
+    { 0x07,0x06,0x36,0x6E,0x66,0x66,0x67,0x00 },  
+    { 0x0C,0x00,0x0E,0x0C,0x0C,0x0C,0x1E,0x00 },  
+    { 0x30,0x00,0x30,0x30,0x30,0x33,0x33,0x1E },  
+    { 0x07,0x06,0x66,0x36,0x1E,0x36,0x67,0x00 },  
+    { 0x0E,0x0C,0x0C,0x0C,0x0C,0x0C,0x1E,0x00 },  
+    { 0x00,0x00,0x33,0x7F,0x7F,0x6B,0x63,0x00 },  
+    { 0x00,0x00,0x1F,0x33,0x33,0x33,0x33,0x00 },  
+    { 0x00,0x00,0x1E,0x33,0x33,0x33,0x1E,0x00 },  
+    { 0x00,0x00,0x3B,0x66,0x66,0x3E,0x06,0x0F },  
+    { 0x00,0x00,0x6E,0x33,0x33,0x3E,0x30,0x78 },  
+    { 0x00,0x00,0x3B,0x6E,0x66,0x06,0x0F,0x00 },  
+    { 0x00,0x00,0x3E,0x03,0x1E,0x30,0x1F,0x00 },  
+    { 0x08,0x0C,0x3E,0x0C,0x0C,0x2C,0x18,0x00 },  
+    { 0x00,0x00,0x33,0x33,0x33,0x33,0x6E,0x00 },  
+    { 0x00,0x00,0x33,0x33,0x33,0x1E,0x0C,0x00 },  
+    { 0x00,0x00,0x63,0x6B,0x7F,0x7F,0x36,0x00 },  
+    { 0x00,0x00,0x63,0x36,0x1C,0x36,0x63,0x00 },  
+    { 0x00,0x00,0x33,0x33,0x33,0x3E,0x30,0x1F },  
+    { 0x00,0x00,0x3F,0x19,0x0C,0x26,0x3F,0x00 },  
+    { 0x38,0x0C,0x0C,0x07,0x0C,0x0C,0x38,0x00 },  
+    { 0x18,0x18,0x18,0x00,0x18,0x18,0x18,0x00 },  
+    { 0x07,0x0C,0x0C,0x38,0x0C,0x0C,0x07,0x00 },  
+    { 0x6E,0x3B,0x00,0x00,0x00,0x00,0x00,0x00 },  
 };
-#define FONT_N (sizeof(FONT) / sizeof(FONT[0]))
 
-static const glyph_t *glyph_for(char c) {
-    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
-    for (unsigned long i = 0; i < FONT_N; i++)
-        if (FONT[i].c == c) return &FONT[i];
-    return &FONT[0]; /* неизвестный символ -> пробел */
+ 
+static sc_framebuffer_t g_fb;
+static uint8_t *g_fb_base;
+static uint32_t g_bpp_bytes;
+static int32_t g_clip_x0, g_clip_y0, g_clip_x1, g_clip_y1;
+
+static uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) {
+    return ((uint32_t)r << g_fb.r_shift) | ((uint32_t)g << g_fb.g_shift) | ((uint32_t)b << g_fb.b_shift);
 }
 
-/* =========================================================================
- * Рисование пикселей прямо в mapped framebuffer (см. sc_get_framebuffer:
- * fb.virt_addr — уже готовый юзерский указатель, fb.pitch — байт на
- * строку, r/g/b_shift — как собрать нативный 32-битный пиксель).
- * ========================================================================= */
-static sc_framebuffer_t g_fb;
-static uint8_t         *g_fb_base;
-static uint32_t         g_bpp_bytes;
-
-/* Область отсечения — устанавливается перед каждой перерисовкой в
- * границы СОДЕРЖИМОГО нашего окна (см. sys_win_get_rect), чтобы
- * случайно длинная строка лога не нарисовала пиксели по чужим окнам/
- * рабочему столу за пределами нашего окна. */
-static int32_t  g_clip_x0, g_clip_y0, g_clip_x1, g_clip_y1;
+static void put_px(int32_t x, int32_t y, uint32_t c) {
+    if (x < g_clip_x0 || y < g_clip_y0 || x >= g_clip_x1 || y >= g_clip_y1) return;
+    uint8_t *p = g_fb_base + (size_t)y * g_fb.pitch + (size_t)x * g_bpp_bytes;
+    if (g_bpp_bytes == 4) *(volatile uint32_t *)p = c;
+    else { p[0] = (uint8_t)c; p[1] = (uint8_t)(c >> 8); p[2] = (uint8_t)(c >> 16); }
+}
 
 static void set_clip(const sc_win_rect_t *r) {
-    g_clip_x0 = r->x;
-    g_clip_y0 = r->y;
-    g_clip_x1 = r->x + (int32_t)r->w;
-    g_clip_y1 = r->y + (int32_t)r->h;
+    g_clip_x0 = r->x; g_clip_y0 = r->y;
+    g_clip_x1 = r->x + (int32_t)r->w; g_clip_y1 = r->y + (int32_t)r->h;
+    if (g_clip_x0 < 0) g_clip_x0 = 0;
+    if (g_clip_y0 < 0) g_clip_y0 = 0;
+    if (g_clip_x1 > (int32_t)g_fb.width)  g_clip_x1 = (int32_t)g_fb.width;
+    if (g_clip_y1 > (int32_t)g_fb.height) g_clip_y1 = (int32_t)g_fb.height;
 }
 
-static inline uint32_t pack_color(uint8_t r, uint8_t g, uint8_t b) {
-    return ((uint32_t)r << g_fb.r_shift) |
-           ((uint32_t)g << g_fb.g_shift) |
-           ((uint32_t)b << g_fb.b_shift);
+static void fill_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t c) {
+    for (int32_t yy = y; yy < y + h; yy++)
+        for (int32_t xx = x; xx < x + w; xx++) put_px(xx, yy, c);
 }
 
-static void put_pixel(int32_t x, int32_t y, uint32_t native) {
-    if (x < 0 || y < 0 || (uint32_t)x >= g_fb.width || (uint32_t)y >= g_fb.height)
-        return;
-    if (x < g_clip_x0 || x >= g_clip_x1 || y < g_clip_y0 || y >= g_clip_y1)
-        return;
-    uint8_t *p = g_fb_base + (size_t)y * g_fb.pitch + (size_t)x * g_bpp_bytes;
-    *(volatile uint32_t *)p = native;
+static void draw_char(int32_t x, int32_t y, char ch, uint32_t fg) {
+    if (ch < 0x20 || ch > 0x7E) return;
+    const unsigned char *g = g_font8x8[(unsigned char)ch - 0x20];
+    for (int row = 0; row < 8; row++)
+        for (int col = 0; col < 8; col++)
+            if (g[row] & (1u << col)) put_px(x + col, y + row, fg);
 }
 
-static void fill_rect(int32_t x, int32_t y, uint32_t w, uint32_t h, uint32_t native) {
-    for (uint32_t row = 0; row < h; row++)
-        for (uint32_t col = 0; col < w; col++)
-            put_pixel(x + (int32_t)col, y + (int32_t)row, native);
+static void draw_text(int32_t x, int32_t y, const char *s, uint32_t fg) {
+    while (*s) { draw_char(x, y, *s++, fg); x += 8; }
 }
 
-#define GLYPH_SCALE   2u
-#define GLYPH_W       (5u * GLYPH_SCALE)
-#define GLYPH_H       (7u * GLYPH_SCALE)
-#define GLYPH_ADVANCE (GLYPH_W + 2u)
-#define LINE_HEIGHT   (GLYPH_H + 4u)
+ 
+#define WIN_W      700u
+#define WIN_H      440u
+#define BAR_H      30
+#define PAD        6
+#define LINE_H     10
+#define MAX_COLS   120
+#define MAX_LINES  600             
 
-static void draw_char(int32_t x, int32_t y, char c, uint32_t fg) {
-    const glyph_t *g = glyph_for(c);
-    for (int row = 0; row < 7; row++) {
-        uint8_t bits = g->rows[row];
-        for (int col = 0; col < 5; col++) {
-            if (bits & (1u << (4 - col))) {
-                fill_rect(x + (int32_t)(col * GLYPH_SCALE),
-                          y + (int32_t)(row * GLYPH_SCALE),
-                          GLYPH_SCALE, GLYPH_SCALE, fg);
-            }
-        }
+static char     g_lines[MAX_LINES][MAX_COLS + 1];
+static uint32_t g_line_col[MAX_LINES];
+static uint32_t g_total;           
+static int      g_cur_len;         
+static char     g_cur[MAX_COLS + 1];
+static int      g_cols = 80;
+static int      g_scroll_back;     
+static bool     g_dirty = true;
+
+static uint32_t COL_BG, COL_BAR, COL_TXT, COL_ERR, COL_OK, COL_NET, COL_DIM, COL_BTN, COL_BTN_ON, COL_WHITE, COL_WARN;
+
+static bool has(const char *s, const char *needle) {
+    for (; *s; s++) {
+        const char *a = s, *b = needle;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return true;
     }
+    return false;
 }
 
-static void draw_string(int32_t x, int32_t y, const char *s, uint32_t fg) {
-    int32_t cx = x;
-    while (*s) {
-        draw_char(cx, y, *s, fg);
-        cx += (int32_t)GLYPH_ADVANCE;
-        s++;
-    }
+static uint32_t classify(const char *s) {
+    if (has(s, "PANIC") || has(s, "FAIL") || has(s, "failed") || has(s, "error") ||
+        has(s, "ERR") || has(s, "not found") || has(s, "FAULT") || has(s, "timeout"))
+        return COL_ERR;
+    if (has(s, "[USB") || has(s, "[NET") || has(s, "[EHCI") || has(s, "[UHCI") || has(s, "[MSC"))
+        return COL_NET;
+    if (has(s, "[ELF") || has(s, "[FXA") || has(s, "[WIN") || has(s, "[UI"))
+        return COL_OK;
+    if (has(s, "[KM") || has(s, "ignored") || has(s, "skipped") || has(s, "WARN"))
+        return COL_WARN;
+    return COL_TXT;
 }
 
-/* =========================================================================
- * Логика приложения
- * ========================================================================= */
-#define WIN_W   480u
-#define WIN_H   340u
-#define PAD     10
-
-#define COL_BG      0x00141414U   /* тёмный фон окна */
-#define COL_HEADER  0x00202020U
-#define COL_TEXT    0x00D0D0D0U   /* обычный лог */
-#define COL_OK      0x0060D060U   /* зелёный — "успешные" строки */
-#define COL_WARN    0x00D0C050U   /* жёлтый  — предупреждения */
-#define COL_DIM     0x00707070U   /* тусклый — заголовок/разделитель */
-
-#define MAX_LINES   16
-#define LINE_LEN    56
-
-static char g_lines[MAX_LINES][LINE_LEN];
-static uint32_t g_line_color[MAX_LINES];
-static int g_line_count = 0;
-
-static void add_line(const char *text, uint32_t color) {
-    if (g_line_count >= MAX_LINES) return;
-    str_copy(g_lines[g_line_count], text, LINE_LEN);
-    g_line_color[g_line_count] = color;
-    g_line_count++;
+static void push_line(void) {
+    g_cur[g_cur_len] = '\0';
+    uint32_t idx = g_total % MAX_LINES;
+    for (int i = 0; i <= g_cur_len; i++) g_lines[idx][i] = g_cur[i];
+    g_line_col[idx] = classify(g_cur);
+    g_total++;
+    g_cur_len = 0;
+    g_dirty = true;
 }
 
-/* Читает /system.log (если есть) и добавляет его содержимое построчно,
- * с префиксом "[LOG] ". Если файла нет — просто ничего не делает,
- * никакой ошибки пользователю не показываем (это опциональный источник). */
-static void load_system_log(void) {
-    long fd = sys_open("/system.log", 0 /* O_RDONLY */);
-    if (fd < 0) return;
-
-    char buf[1024];
-    long n = sys_read(fd, buf, (long)sizeof(buf) - 1);
-    sys_close(fd);
-    if (n <= 0) return;
-    buf[n] = '\0';
-
-    char line[LINE_LEN];
-    unsigned long li = 0;
-    for (long i = 0; i < n && g_line_count < MAX_LINES; i++) {
+static void feed(const char *buf, long n) {
+    for (long i = 0; i < n; i++) {
         char c = buf[i];
-        if (c == '\n' || c == '\r') {
-            if (li > 0) {
-                line[li] = '\0';
-                char full[LINE_LEN];
-                str_copy(full, "[LOG] ", LINE_LEN);
-                unsigned long base = str_len(full);
-                unsigned long j = 0;
-                while (base + j < LINE_LEN - 1 && line[j]) { full[base + j] = line[j]; j++; }
-                full[base + j] = '\0';
-                add_line(full, COL_TEXT);
-                li = 0;
-            }
-        } else if (li < sizeof(line) - 1) {
-            line[li++] = c;
-        }
+        if (c == '\n') { push_line(); continue; }
+        if (c == '\t') c = ' ';
+        if ((unsigned char)c < 0x20 || (unsigned char)c > 0x7E) c = '.';    
+        if (g_cur_len >= g_cols) push_line();                                
+        g_cur[g_cur_len++] = c;
     }
 }
 
-static void build_lines(int pid) {
-    g_line_count = 0;
-    add_line("[BOOT] FEXOS KERNEL START", COL_OK);
-    add_line("[MM]   MEMORY MANAGER OK", COL_OK);
-    add_line("[VFS]  FAT32 MOUNTED", COL_OK);
-    add_line("[SCHED] SCHEDULER READY", COL_OK);
-    add_line("[UI]   WINDOW MANAGER READY", COL_OK);
-    add_line("[NET]  NOT AVAILABLE", COL_WARN);
-
-    char line[LINE_LEN];
-    char num[24];
-    str_copy(line, "[APP]  SYSLOGS STARTED, PID=", LINE_LEN);
-    uint_to_str((unsigned long)pid, num);
-    unsigned long base = str_len(line);
-    unsigned long j = 0;
-    while (base + j < LINE_LEN - 1 && num[j]) { line[base + j] = num[j]; j++; }
-    line[base + j] = '\0';
-    add_line(line, COL_OK);
-
-    str_copy(line, "[FB]   ", LINE_LEN);
-    base = str_len(line);
-    if (g_fb.mode == 1) {
-        const char *mode = "LINEAR ";
-        j = 0;
-        while (base + j < LINE_LEN - 1 && mode[j]) { line[base + j] = mode[j]; j++; }
-        base += j;
-        uint_to_str(g_fb.width, num);
-        j = 0;
-        while (base + j < LINE_LEN - 1 && num[j]) { line[base + j] = num[j]; j++; }
-        base += j;
-        if (base < LINE_LEN - 1) line[base++] = 'X';
-        uint_to_str(g_fb.height, num);
-        j = 0;
-        while (base + j < LINE_LEN - 1 && num[j]) { line[base + j] = num[j]; j++; }
-        base += j;
-        line[base] = '\0';
-    } else {
-        str_copy(line + base, "VGA TEXT", LINE_LEN - base);
-    }
-    add_line(line, COL_TEXT);
-
-    load_system_log();
+static void add_msg(const char *s, uint32_t col) {
+    int saved = g_cur_len;
+    (void)saved;
+    int i = 0;
+    while (s[i] && i < MAX_COLS) { g_cur[i] = s[i]; i++; }
+    g_cur_len = i;
+    push_line();
+    g_line_col[(g_total - 1) % MAX_LINES] = col;
 }
 
-/* Полная перерисовка тела окна: тёмный фон + шапка + все строки. */
-static void full_redraw(const sc_win_rect_t *r) {
+ 
+typedef struct { int32_t x, y, w, h; } btn_t;
+static btn_t B_LOG, B_CLEAR, B_UP, B_DN;
+static bool g_logging = true;    
+
+static bool in_btn(const btn_t *b, int32_t lx, int32_t ly) {
+    return lx >= b->x && ly >= b->y && lx < b->x + b->w && ly < b->y + b->h;
+}
+
+static void draw_btn(const sc_win_rect_t *r, const btn_t *b, const char *label, bool on) {
+    uint32_t bg = on ? COL_BTN_ON : COL_BTN;
+    fill_rect(r->x + b->x, r->y + b->y, b->w, b->h, bg);
+    int32_t tw = (int32_t)str_len(label) * 8;
+    draw_text(r->x + b->x + (b->w - tw) / 2, r->y + b->y + (b->h - 8) / 2, label, COL_WHITE);
+}
+
+static void layout(const sc_win_rect_t *r) {
+    B_LOG   = (btn_t){ PAD, 4, 104, 22 };
+    B_CLEAR = (btn_t){ PAD + 112, 4, 64, 22 };
+    B_UP    = (btn_t){ (int32_t)r->w - PAD - 2 * 44 - 4, 4, 44, 22 };
+    B_DN    = (btn_t){ (int32_t)r->w - PAD - 44, 4, 44, 22 };
+    g_cols = ((int32_t)r->w - 2 * PAD) / 8;
+    if (g_cols > MAX_COLS) g_cols = MAX_COLS;
+    if (g_cols < 20) g_cols = 20;
+}
+
+static void number(unsigned long v, char *out) {
+    char t[24]; int n = 0;
+    if (!v) { out[0] = '0'; out[1] = 0; return; }
+    while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    for (int i = 0; i < n; i++) out[i] = t[n - 1 - i];
+    out[n] = 0;
+}
+
+static void redraw(const sc_win_rect_t *r) {
     set_clip(r);
-    fill_rect(r->x, r->y, r->w, r->h, COL_BG);
-    fill_rect(r->x, r->y, r->w, LINE_HEIGHT + 4, COL_HEADER);
-    draw_string(r->x + PAD, r->y + 6, "SYSTEM LOGS", COL_TEXT);
+    fill_rect(r->x, r->y, (int32_t)r->w, (int32_t)r->h, COL_BG);
+    fill_rect(r->x, r->y, (int32_t)r->w, BAR_H, COL_BAR);
+    draw_btn(r, &B_LOG, g_logging ? "Stop Log" : "Log System", g_logging);
+    draw_btn(r, &B_CLEAR, "Clear", false);
+    draw_btn(r, &B_UP, "Up", false);
+    draw_btn(r, &B_DN, "Dn", false);
 
-    int32_t y = r->y + (int32_t)LINE_HEIGHT + 10;
-    for (int i = 0; i < g_line_count; i++) {
-        if (y + (int32_t)LINE_HEIGHT > r->y + (int32_t)r->h - PAD) break;
-        draw_string(r->x + PAD, y, g_lines[i], g_line_color[i]);
-        y += (int32_t)LINE_HEIGHT;
+     
+    char st[40];
+    const char *lbl = "lines: ";
+    int p = 0; while (lbl[p]) { st[p] = lbl[p]; p++; }
+    char nb[24]; number(g_total, nb);
+    for (int i = 0; nb[i] && p < 38; i++) st[p++] = nb[i];
+    st[p] = 0;
+    draw_text(r->x + PAD + 112 + 64 + 12, r->y + 11, st, COL_DIM);
+    draw_text(r->x + (int32_t)r->w / 2 - 20, r->y + 11, "SysLogs v2", COL_WHITE);
+
+    int32_t area_y = BAR_H + 4;
+    int visible = ((int32_t)r->h - area_y - PAD) / LINE_H;
+    if (visible < 1) visible = 1;
+
+    uint32_t avail = g_total < MAX_LINES ? g_total : MAX_LINES;
+    if (g_scroll_back > (int)avail - visible) g_scroll_back = (int)avail - visible;
+    if (g_scroll_back < 0) g_scroll_back = 0;
+    int32_t last = (int32_t)g_total - 1 - g_scroll_back;      
+    int32_t first = last - visible + 1;
+    int32_t oldest = (int32_t)g_total - (int32_t)avail;
+    if (first < oldest) first = oldest;
+
+    int32_t y = r->y + area_y;
+    if (g_total == 0) {
+        draw_text(r->x + PAD, y, g_logging ? "Waiting for log..." :
+                  "Press [Log System] to stream the kernel log (same as QEMU serial).", COL_DIM);
     }
+    for (int32_t i = first; i <= last; i++, y += LINE_H) {
+        uint32_t idx = (uint32_t)i % MAX_LINES;
+        draw_text(r->x + PAD, y, g_lines[idx], g_line_col[idx]);
+    }
+    g_dirty = false;
 }
 
-/* Перерисовать только последнюю строку (heartbeat) — дёшево, без
- * перерисовки всего окна на каждом тике. */
-static void redraw_heartbeat(const sc_win_rect_t *r, const char *text) {
-    set_clip(r);
-    int32_t y = r->y + (int32_t)LINE_HEIGHT + 10 +
-                (int32_t)((g_line_count > 0 ? g_line_count - 1 : 0) * LINE_HEIGHT);
-    if (y + (int32_t)LINE_HEIGHT > r->y + (int32_t)r->h - PAD) return;
-    fill_rect(r->x + PAD, y, r->w - 2u * PAD, LINE_HEIGHT, COL_BG);
-    draw_string(r->x + PAD, y, text, COL_DIM);
-}
+static char g_rd[8192];
+static uint64_t g_pos;
 
-void _start(void) {
-    if (sys_get_framebuffer(&g_fb) != 0 || g_fb.mode != 1) {
-        /* Нет линейного framebuffer'а — GUI-окно рисовать некуда. */
-        sys_exit(1);
-    }
-    g_fb_base   = (uint8_t *)(uintptr_t)g_fb.virt_addr;
-    g_bpp_bytes = g_fb.bpp / 8;
-    if (g_bpp_bytes == 0) g_bpp_bytes = 4;
+void syslogs_main(void) {
+    if (raw_syscall(SLG_SYS_FB, (long)(uintptr_t)&g_fb, 0, 0, 0, 0) != 0 || g_fb.mode != 1) sys_exit(1);
+    g_fb_base = (uint8_t *)(uintptr_t)g_fb.virt_addr;
+    g_bpp_bytes = g_fb.bpp / 8; if (!g_bpp_bytes) g_bpp_bytes = 4;
 
-    /* ВАЖНО (тот же приём, что и в calc.c): sys_win_get_rect() отдаёт
-     * область СОДЕРЖИМОГО окна — запрошенную высоту МИНУС заголовок
-     * (UI_WIN_TITLEBAR_H = 28, см. Framebuffer.c: ui_win_get_rect). Весь
-     * layout ниже (full_redraw/LINE_HEIGHT и т.п.) считает в предположении,
-     * что содержимого ровно WIN_H пикселей — поэтому запрашиваем окно на
-     * 28px выше, иначе последние строки логов обрезаются снизу. */
-    #define WIN_TITLEBAR_H 28u
-    const char title[] = "System Logs";
-    long win_id = sys_win_create(title, str_len(title), WIN_W, WIN_H + WIN_TITLEBAR_H);
+    COL_BG = rgb(0x0C, 0x0C, 0x0C);  COL_BAR = rgb(0x26, 0x26, 0x2C);
+    COL_TXT = rgb(0xCC, 0xCC, 0xCC); COL_ERR = rgb(0xFF, 0x60, 0x60);
+    COL_OK = rgb(0x70, 0xE0, 0x70);  COL_NET = rgb(0x60, 0xD0, 0xF0);
+    COL_DIM = rgb(0x80, 0x80, 0x80); COL_BTN = rgb(0x3A, 0x5F, 0xA8);
+    COL_BTN_ON = rgb(0xB0, 0x40, 0x40); COL_WHITE = rgb(0xFF, 0xFF, 0xFF);
+    COL_WARN = rgb(0xE8, 0xC0, 0x50);
+
+    static const char title[] = "System Logs";
+    long win_id = raw_syscall(SLG_SYS_WIN_CREATE, (long)(uintptr_t)title, (long)str_len(title),
+                              (long)WIN_W, (long)(WIN_H + 28u), 0);
     if (win_id < 0) sys_exit(1);
 
-    int pid = (int)sys_getpid();
-    build_lines(pid);
-
-    /* Держим последнюю строку как "живой" heartbeat, чтобы было видно,
-     * что окно не зависло. */
-    if (g_line_count < MAX_LINES) {
-        add_line("[TICK] N=0", COL_DIM);
-    }
-
     sc_win_rect_t rect;
-    if (sys_win_get_rect(win_id, &rect) != 0) sys_exit(0);
-    full_redraw(&rect);
+    if (raw_syscall(SLG_SYS_WIN_RECT, win_id, (long)(uintptr_t)&rect, 0, 0, 0) != 0) sys_exit(0);
+    add_msg("[SYSLOGS] v2 started, streaming kernel log (same as QEMU serial)...", COL_OK);
+    layout(&rect);
+    int32_t last_x = rect.x, last_y = rect.y;
+    redraw(&rect);
 
-    unsigned long tick = 0;
+    slg_input_t in;
+    bool prev_lmb = false;
+    unsigned idle_ticks = 0;
+
     for (;;) {
-        /* Окно закрыли крестиком (kернel сам обрабатывает клик по
-         * крестику и закрывает окно) — sys_win_get_rect вернёт ошибку,
-         * значит наша работа сделана. */
-        if (sys_win_get_rect(win_id, &rect) != 0) {
-            sys_exit(0);
+        if (raw_syscall(SLG_SYS_WIN_RECT, win_id, (long)(uintptr_t)&rect, 0, 0, 0) != 0) sys_exit(0);
+        if (rect.x != last_x || rect.y != last_y) { last_x = rect.x; last_y = rect.y; g_dirty = true; }
+
+         
+        bool got_data = false;
+        if (g_logging) {
+            for (int chunk = 0; chunk < 8; chunk++) {
+                long n = raw_syscall(SLG_SYS_KLOG_READ, (long)(uintptr_t)&g_pos, (long)(uintptr_t)g_rd,
+                                     (long)sizeof(g_rd), 0, 0);
+                if (n < 0) {
+                    add_msg("[SYSLOGS] SYS_KLOG_READ (880) not available: add the case to syscall_dispatch", COL_ERR);
+                    g_logging = false;
+                    break;
+                }
+                if (n == 0) break;
+                feed(g_rd, n);
+                got_data = true;
+                if ((unsigned long)n < sizeof(g_rd)) break;
+            }
         }
 
-        /* Простая кооперативная пауза — нет отдельного sleep-syscall'а,
-         * поэтому просто отдаём процессор много раз подряд. */
-        for (int i = 0; i < 400000; i++) sys_sched_yield();
+         
+        if (raw_syscall(SLG_SYS_INPUT_POLL, (long)(uintptr_t)&in, 0, 0, 0, 0) >= 0) {
+            int32_t lx = in.x - rect.x, ly = in.y - rect.y;
+            bool lmb = (in.buttons & 1) != 0;
+            if (lmb && !prev_lmb && lx >= 0 && ly >= 0 && lx < (int32_t)rect.w && ly < (int32_t)rect.h) {
+                if (in_btn(&B_LOG, lx, ly)) {
+                    g_logging = !g_logging;
+                    if (g_logging) {
+                        g_pos = 0;                  
+                        g_total = 0; g_cur_len = 0; g_scroll_back = 0;
+                    }
+                    g_dirty = true;
+                } else if (in_btn(&B_CLEAR, lx, ly)) {
+                    g_total = 0; g_cur_len = 0; g_scroll_back = 0; g_dirty = true;
+                } else if (in_btn(&B_UP, lx, ly)) {
+                    g_scroll_back += 10; g_dirty = true;
+                } else if (in_btn(&B_DN, lx, ly)) {
+                    g_scroll_back -= 10; if (g_scroll_back < 0) g_scroll_back = 0; g_dirty = true;
+                }
+            }
+            prev_lmb = lmb;
+        }
 
-        tick++;
-        char text[LINE_LEN];
-        char num[24];
-        str_copy(text, "[TICK] N=", LINE_LEN);
-        uint_to_str(tick, num);
-        unsigned long base = str_len(text);
-        unsigned long j = 0;
-        while (base + j < LINE_LEN - 1 && num[j]) { text[base + j] = num[j]; j++; }
-        text[base + j] = '\0';
-        redraw_heartbeat(&rect, text);
+         
+        if (g_dirty || ++idle_ticks > 100) { idle_ticks = 0; layout(&rect); redraw(&rect); }
+
+        if (got_data) sys_yield();        
+        else          sys_sleep_ms(30);   
     }
 }
+
+__asm__(
+    ".global _start\n"
+    "_start:\n"
+    "    and $-16, %rsp\n"
+    "    call syslogs_main\n"
+    "    mov $60, %rax\n"
+    "    xor %rdi, %rdi\n"
+    "    syscall\n"
+    "1:  jmp 1b\n"
+);

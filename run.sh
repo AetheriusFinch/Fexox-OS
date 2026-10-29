@@ -1,5 +1,6 @@
 #!/bin/bash
-echo "=== Запуск FEXOS в QEMU ==="
+# Fexox OS Project, EULA GPLv2
+echo "=== Запуск Fexox OS в QEMU ==="
 
 to_win() { cygpath -m "$1" 2>/dev/null || echo "$1"; }
 
