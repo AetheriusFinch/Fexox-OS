@@ -20,7 +20,7 @@ Run the following scripts from the repository root, in this order:
 
 1. ./Compile.sh
 
-   Compiles and links the kernel, user applications, and UEFI loader. It creates build/kernel.bin, build/bootloader.efi, and the user application binaries. When mtools is available, it also creates intermediate FAT images.
+   Compiles and links the kernel, user applications, and UEFI loader. It creates build/kernel.bin, build/bootloader.efi, and the user application binaries. When mtools is available, it also creates build/esp.img and build/data.img for QEMU VirtIO testing.
 
 2. ./build_bios.sh
 
@@ -32,19 +32,27 @@ Run the following scripts from the repository root, in this order:
 
 4. ./make_bios_image.sh
 
-   Packages the BIOS boot stages, UEFI loader, kernel, and available UI and application files into build/usb_bios.img. This step requires the outputs from both previous scripts.
+   Packages the BIOS boot stages, UEFI loader, kernel, and available UI and application files into build/usb_bios.img. This step requires the outputs from the previous scripts.
 
 The order matters. make_usb_image.sh requires build/kernel.bin and build/bootloader.efi. make_bios_image.sh requires build/bios/stage1.bin, build/bios/stage2.bin, build/kernel.bin, and build/bootloader.efi.
 
+Testing in QEMU with VirtIO
+
+For QEMU VirtIO testing, use build/esp.img and build/data.img. The provided run.sh attaches esp.img for UEFI boot and data.img as the VirtIO block data disk:
+
+./run.sh
+
+Do not use build/usb_bios.img as the VirtIO disk for this setup. Make sure QEMU and OVMF are installed in the locations expected by run.sh, and that Compile.sh has created both image files.
+
 Universal BIOS and UEFI USB Image
 
-build/usb_bios.img is a raw, hybrid boot image intended to support both legacy BIOS and x86_64 UEFI boot:
+Use build/usb_bios.img for booting from a USB drive on a real PC. It is a raw, hybrid boot image intended to support both legacy BIOS and x86_64 UEFI boot:
 
 - The MBR contains the legacy BIOS stage1 loader, followed by the stage2 loader in the sectors immediately after the MBR.
 - The FAT32 partition contains the kernel and the UEFI fallback loader at EFI/BOOT/BOOTX64.EFI.
 - A startup.nsh script is included for UEFI firmware that supports the UEFI shell.
 
-The same image can therefore be written to a USB drive and selected from the firmware boot menu in either legacy BIOS mode or UEFI mode. On some systems, the firmware may show separate entries for UEFI and legacy boot. Select the entry matching the mode you want to test.
+The same image can be written to a USB drive and selected from the firmware boot menu in either legacy BIOS mode or UEFI mode. On some systems, the firmware may show separate entries for UEFI and legacy boot. Select the entry matching the mode you want to test.
 
 Writing the Image to a USB Drive
 
@@ -66,17 +74,6 @@ sync
 
 Replace diskN with the verified USB device.
 
-Testing
+Testing on a Real PC
 
 Use build/usb_bios.img for the universal BIOS and UEFI USB drive. Use the system firmware boot menu to select the USB drive. For legacy BIOS testing, select the non-UEFI USB entry when the firmware presents separate options. For UEFI testing, select the UEFI USB entry.
-
-The image can also be tested in QEMU. The following command attaches it as a USB mass-storage device to an emulated EHCI controller:
-
-qemu-system-x86_64 -m 512 -serial stdio -device usb-ehci,id=ehci \
-  -drive if=none,id=usbd,file=build/usb_bios.img,format=raw \
-  -device usb-storage,bus=ehci.0,drive=usbd,bootindex=0
-
-The image can alternatively be attached as a VirtIO block device:
-
-qemu-system-x86_64 -m 512 -serial stdio \
-  -drive file=build/usb_bios.img,if=virtio,format=raw
