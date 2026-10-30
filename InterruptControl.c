@@ -654,7 +654,23 @@ ISR_STUB_IRQ(irq_12, 0x2C, irq_dispatch)
 ISR_STUB_IRQ(irq_13, 0x2D, irq_dispatch)
 ISR_STUB_IRQ(irq_14, 0x2E, irq_dispatch)
 ISR_STUB_IRQ(irq_15, 0x2F, irq_dispatch)
-ISR_STUB_IRQ(irq_nvme, 0x50, irq_dispatch)
+/* NVMe: 16 vectors 0x50..0x5F (MSI-X, one per queue) */
+ISR_STUB_IRQ(irq_nvme_0, 0x50, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_1, 0x51, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_2, 0x52, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_3, 0x53, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_4, 0x54, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_5, 0x55, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_6, 0x56, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_7, 0x57, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_8, 0x58, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_9, 0x59, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_10, 0x5A, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_11, 0x5B, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_12, 0x5C, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_13, 0x5D, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_14, 0x5E, irq_dispatch)
+ISR_STUB_IRQ(irq_nvme_15, 0x5F, irq_dispatch)
 
  
 
@@ -798,8 +814,15 @@ static void apic_calibrate_timer(void) {
     }
 }
 
+static volatile uint64_t g_timer_ticks = 0;
+static volatile uint32_t g_timer_hz = 0;
+
+uint64_t interrupt_get_ticks(void) { return __atomic_load_n(&g_timer_ticks, __ATOMIC_RELAXED); }
+uint32_t interrupt_get_timer_hz(void) { return g_timer_hz; }
+
 static void apic_timer_start(uint32_t freq_hz) {
     if (g_apic_bus_freq == 0) g_apic_bus_freq = 100000000;
+    g_timer_hz = freq_hz;
     uint32_t div = 16;
     uint32_t init_cnt = (g_apic_bus_freq / div) / freq_hz;
 
@@ -824,6 +847,12 @@ int interrupt_register_handler(uint16_t vector, isr_handler_t handler) {
     return 0;
 }
 
+int interrupt_unregister_handler(uint16_t vector) {
+    if (vector >= IDT_ENTRIES) return -1;
+    g_isr_handlers[vector] = NULL;
+    return 0;
+}
+
 void interrupt_set_scheduler_tick(scheduler_tick_fn_t fn) { g_sched_tick = fn; }
 void interrupt_enable(void) { sti(); }
 void interrupt_disable(void) { cli(); }
@@ -834,6 +863,7 @@ void interrupt_disable(void) { cli(); }
 
 uint64_t timer_isr_c(uint64_t frame_rsp) {
     apic_send_eoi(TIMER_VECTOR);
+    __atomic_fetch_add(&g_timer_ticks, 1, __ATOMIC_RELAXED);
     if (g_sched_tick) return g_sched_tick(frame_rsp);
     return frame_rsp;
 }
@@ -898,7 +928,22 @@ int interrupt_init(uint64_t ioapic_phys_addr, uint32_t timer_freq_hz) {
     idt_set_gate(0x2D, irq_13, cs, 0, IDT_GATE_INT);
     idt_set_gate(0x2E, irq_14, cs, 0, IDT_GATE_INT);
     idt_set_gate(0x2F, irq_15, cs, 0, IDT_GATE_INT);
-    idt_set_gate(0x50, irq_nvme, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x50, irq_nvme_0, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x51, irq_nvme_1, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x52, irq_nvme_2, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x53, irq_nvme_3, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x54, irq_nvme_4, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x55, irq_nvme_5, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x56, irq_nvme_6, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x57, irq_nvme_7, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x58, irq_nvme_8, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x59, irq_nvme_9, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x5A, irq_nvme_10, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x5B, irq_nvme_11, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x5C, irq_nvme_12, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x5D, irq_nvme_13, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x5E, irq_nvme_14, cs, 0, IDT_GATE_INT);
+    idt_set_gate(0x5F, irq_nvme_15, cs, 0, IDT_GATE_INT);
 
     DBG_MSG("KR", "14e idt_load");
     idt_load();
