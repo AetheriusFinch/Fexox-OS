@@ -1,31 +1,4 @@
-/* Fexox OS Project, EULA GPLv2 */
-
-/*
- * NVMe driver for FEXOS (rewrite).
- *
- * Features
- *   - MSI-X (one vector per queue) -> MSI -> polling fallback
- *   - several I/O queues, queue depth 64, per-queue spinlocks (irq-safe)
- *   - interrupt-driven completion: the ISR reaps the CQ, the waiting thread
- *     sleeps with hlt; if interrupts never arrive the driver detects it and
- *     silently switches to polling
- *   - multi-page DMA: PRP1/PRP2 + chained PRP lists, MDTS aware,
- *     zero-copy for buffers inside the direct map (or via an optional
- *     virt->phys translator), bounce buffers otherwise
- *   - several commands in flight for one big request (pipelining)
- *   - timeouts -> controller reset + queue re-creation + request retry
- *   - Async Event Requests (SMART / error log events are fetched and logged)
- *   - Flush (once per write request, only if the controller has a volatile
- *     write cache), Dataset Management (TRIM), Write Zeroes
- *   - clean shutdown (CC.SHN) for use at poweroff
- *
- * Requirements from the rest of the kernel (see InterruptControl.c):
- *   interrupt_register_handler / interrupt_unregister_handler
- *   interrupt_get_apic_id
- *   interrupt_get_ticks / interrupt_get_timer_hz      (timeouts, optional)
- *   IDT gates for NVME_IRQ_VECTOR_BASE .. +NVME_IRQ_VECTOR_COUNT-1
- *   nvme_init() must be called AFTER interrupt_init().
- */
+/* Fexox OS, EULA GPLv2 */
 
 #include "VFS.h"
 #include "debug_out.h"
@@ -39,9 +12,9 @@ extern phys_addr_t pmm_alloc_frames_range(uint64_t count, uint64_t align,
                                            phys_addr_t max_phys);
 extern void pmm_free_frames(phys_addr_t pa, uint64_t count);
 
-/* ------------------------------------------------------------------ */
-/* configuration                                                       */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 #ifndef NVME_DIRECT_MAP_OFFSET
 #define NVME_DIRECT_MAP_OFFSET 0xFFFF880000000000ULL
@@ -55,24 +28,24 @@ extern void pmm_free_frames(phys_addr_t pa, uint64_t count);
 #define NVME_MAX_NAMESPACES    8
 #define NVME_MAX_IO_QUEUES     4u
 #define NVME_ADMIN_QUEUE_DEPTH 16u
-#define NVME_IO_QUEUE_DEPTH    64u      /* SQ: 64*64 = 1 page, CQ: 1 page */
-#define NVME_DMA_SLOTS         8u       /* commands in flight per controller */
+#define NVME_IO_QUEUE_DEPTH    64u       
+#define NVME_DMA_SLOTS         8u        
 #ifndef NVME_MAX_XFER_PAGES
-#define NVME_MAX_XFER_PAGES    64u      /* 256 KiB per command (before MDTS) */
+#define NVME_MAX_XFER_PAGES    64u       
 #endif
 #ifndef NVME_PRP_LIST_PAGES
-#define NVME_PRP_LIST_PAGES    1u       /* PRP list pages per slot */
+#define NVME_PRP_LIST_PAGES    1u        
 #endif
 
 #ifndef NVME_IRQ_VECTOR_BASE
 #define NVME_IRQ_VECTOR_BASE   0x50u
 #endif
 #ifndef NVME_IRQ_VECTOR_COUNT
-#define NVME_IRQ_VECTOR_COUNT  16u      /* set to 1 if InterruptControl.c
-                                           still has only vector 0x50 */
+#define NVME_IRQ_VECTOR_COUNT  16u       
+
 #endif
 #ifndef NVME_HAVE_TICKS
-#define NVME_HAVE_TICKS        1        /* interrupt_get_ticks() available */
+#define NVME_HAVE_TICKS        1         
 #endif
 
 #define NVME_POLL_LIMIT        50000000u
@@ -90,9 +63,9 @@ _Static_assert(NVME_IRQ_VECTOR_COUNT >= 1u && NVME_IRQ_VECTOR_COUNT <= 32u,
 _Static_assert(NVME_MAX_XFER_PAGES + 1u <= NVME_PRP_LIST_PAGES * 511u,
                "PRP list too small for the maximum transfer");
 
-/* ------------------------------------------------------------------ */
-/* registers and opcodes                                               */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 #define NVME_REG_CAP           0x0000
 #define NVME_REG_VS            0x0008
@@ -139,7 +112,7 @@ _Static_assert(NVME_MAX_XFER_PAGES + 1u <= NVME_PRP_LIST_PAGES * 511u,
 #define NVME_ONCS_DSM          (1u << 2)
 #define NVME_ONCS_WRITE_ZEROES (1u << 3)
 
-/* software status codes (bit 15 set, never produced by hardware) */
+ 
 #define NVME_SW_FLAG           0x8000u
 #define NVME_SW_TIMEOUT        0x8001u
 #define NVME_SW_ABORT          0x8002u
@@ -147,9 +120,9 @@ _Static_assert(NVME_MAX_XFER_PAGES + 1u <= NVME_PRP_LIST_PAGES * 511u,
 #define NVME_SW_NOMEM          0x8004u
 #define NVME_SW_BADBUF         0x8005u
 
-/* ------------------------------------------------------------------ */
-/* structures                                                          */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 typedef struct {
     uint8_t opcode;
@@ -160,7 +133,7 @@ typedef struct {
     uint64_t mptr;
     uint64_t prp1;
     uint64_t prp2;
-    uint32_t cdw[6];                     /* CDW10 .. CDW15 */
+    uint32_t cdw[6];                      
 } nvme_sqe_t;
 
 typedef struct {
@@ -182,9 +155,9 @@ enum { NVME_REQ_FREE = 0, NVME_REQ_INFLIGHT = 1, NVME_REQ_DONE = 2 };
 typedef struct {
     volatile uint8_t state;
     uint8_t is_aer;
-    uint8_t abandoned;                   /* waiter gave up (timeout) */
+    uint8_t abandoned;                    
     uint8_t pad;
-    uint16_t status;                     /* CQE status >> 1, or NVME_SW_* */
+    uint16_t status;                      
     uint16_t pad2;
     uint32_t result;
 } nvme_request_t;
@@ -197,8 +170,8 @@ typedef struct {
     uint64_t cq_phys;
     uint16_t qid;
     uint16_t depth;
-    uint16_t iv;                         /* NVMe interrupt vector index */
-    uint8_t vector;                      /* x86 vector (0 = polling) */
+    uint16_t iv;                          
+    uint8_t vector;                       
     uint8_t cq_phase;
     uint16_t sq_tail;
     uint16_t sq_head;
@@ -213,9 +186,9 @@ typedef struct {
 } nvme_queue_t;
 
 typedef struct {
-    uint64_t *prp_list;                  /* NVME_PRP_LIST_PAGES pages */
+    uint64_t *prp_list;                   
     uint64_t prp_phys;
-    uint8_t *bounce;                     /* allocated lazily */
+    uint8_t *bounce;                      
     uint64_t bounce_phys;
     uint32_t bounce_bytes;
     volatile uint32_t in_use;
@@ -245,24 +218,24 @@ typedef struct {
     volatile uint32_t state;
     volatile uint32_t recovering;
 
-    /* interrupts */
+     
     nvme_irq_mode_t irq_mode;
-    volatile uint32_t irq_ok;            /* cleared if IRQs turn out dead */
+    volatile uint32_t irq_ok;             
     uint8_t msi_cap, msix_cap;
     uint32_t n_iv;
     uint8_t iv_vector[NVME_MAX_IO_QUEUES + 1u];
-    uint32_t vec_mask;                   /* vectors owned (bit per index) */
+    uint32_t vec_mask;                    
     uint32_t poll_rescues;
 
-    /* queues */
+     
     uint16_t admin_depth, io_depth;
     nvme_queue_t admin;
     nvme_queue_t io[NVME_MAX_IO_QUEUES];
-    uint32_t n_io_alloc;                 /* queues with memory */
-    uint32_t n_io;                       /* queues created in hardware */
+    uint32_t n_io_alloc;                  
+    uint32_t n_io;                        
     volatile uint32_t io_rr;
 
-    /* DMA */
+     
     uint8_t *ident;
     uint64_t ident_phys;
     uint8_t *logbuf;
@@ -271,7 +244,7 @@ typedef struct {
     uint32_t nslots;
     uint32_t max_xfer_bytes;
 
-    /* identify data */
+     
     uint32_t nn;
     uint16_t oncs;
     bool vwc;
@@ -280,12 +253,12 @@ typedef struct {
     char serial[21];
     char fw[9];
 
-    /* async events */
+     
     volatile uint32_t aer_event;
     volatile uint32_t aer_pending;
     volatile uint32_t aer_servicing;
 
-    /* statistics */
+     
     uint64_t resets;
     uint64_t timeouts;
     uint64_t io_errors;
@@ -299,8 +272,8 @@ typedef struct {
 } nvme_namespace_t;
 
 typedef struct {
-    bool translate;                      /* base is a virtual address */
-    uint64_t base;                       /* first byte (phys or virt) */
+    bool translate;                       
+    uint64_t base;                        
 } nvme_dma_map_t;
 
 static nvme_controller_t g_nvme_controllers[NVME_MAX_CONTROLLERS];
@@ -327,9 +300,9 @@ extern uint32_t interrupt_get_timer_hz(void);
 static void nvme_controller_teardown(nvme_controller_t *ctrl);
 static bool nvme_controller_recover(nvme_controller_t *ctrl);
 
-/* ------------------------------------------------------------------ */
-/* CPU / timing helpers                                                */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 #ifndef NVME_ARCH_HOOKS
 static inline uint64_t nvme_irq_save(void) {
@@ -349,8 +322,8 @@ static inline bool nvme_irq_enabled(void) {
     return (flags & (1ULL << 9)) != 0;
 }
 
-/* Sleep until some interrupt arrives, but only if *state is not DONE yet.
- * cli/check/sti;hlt closes the race between the check and the hlt. */
+ 
+
 static inline void nvme_idle_wait(volatile uint8_t *state) {
     __asm__ volatile ("cli" ::: "memory");
     if (*state != NVME_REQ_DONE)
@@ -396,8 +369,8 @@ static void nvme_deadline_start(nvme_deadline_t *d, uint32_t ms) {
     d->spins = 0;
 }
 
-/* Expires by ticks when the timer runs, and always by spin count so that a
- * stopped timer (interrupts disabled) can never hang the driver. */
+ 
+
 static bool nvme_deadline_expired(nvme_deadline_t *d) {
     if (++d->spins > NVME_POLL_LIMIT)
         return true;
@@ -433,9 +406,9 @@ static inline void nvme_str_copy(char *dst, const char *src, int max) {
     dst[i] = '\0';
 }
 
-/* ------------------------------------------------------------------ */
-/* PCI configuration space                                             */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 static inline uint32_t nvme_pci_read32(uint8_t bus, uint8_t dev,
                                        uint8_t fn, uint8_t reg) {
@@ -524,9 +497,9 @@ static void nvme_pci_find_caps(nvme_controller_t *ctrl) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* MMIO (through the kernel direct map)                                */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 static inline uint32_t nvme_mmio_read32(const nvme_controller_t *ctrl,
                                         uint32_t offset) {
@@ -572,8 +545,8 @@ static uint32_t nvme_ctrl_timeout_ms(const nvme_controller_t *ctrl) {
     return to < 2000u ? 2000u : to;
 }
 
-/* ready == true : wait for CSTS.RDY = 1 (fails early on CSTS.CFS)
- * ready == false: wait for CSTS.RDY = 0 (a fatal state is cleared by it) */
+ 
+
 static bool nvme_wait_ready(nvme_controller_t *ctrl, bool ready) {
     nvme_deadline_t dl;
     nvme_deadline_start(&dl, nvme_ctrl_timeout_ms(ctrl) + 500u);
@@ -589,9 +562,9 @@ static bool nvme_wait_ready(nvme_controller_t *ctrl, bool ready) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* DMA memory                                                          */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 static void *nvme_dma_alloc(uint64_t bytes, uint64_t *phys_out) {
     uint64_t pages = (bytes + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
@@ -614,9 +587,9 @@ static void nvme_dma_free(void *virt, uint64_t bytes) {
     pmm_free_frames(phys, pages);
 }
 
-/* ------------------------------------------------------------------ */
-/* interrupt vectors                                                   */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 static int nvme_vec_alloc(void) {
     for (uint32_t i = 0; i < NVME_IRQ_VECTOR_COUNT; i++) {
@@ -639,13 +612,13 @@ static uint32_t nvme_ctrl_irq_total(const nvme_controller_t *ctrl) {
     return (uint32_t)total;
 }
 
-/* ------------------------------------------------------------------ */
-/* queue core: post / reap / wait                                      */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 enum { NVME_POST_OK = 0, NVME_POST_BUSY = 1, NVME_POST_DOWN = 2 };
 
-/* q->lock must be held */
+ 
 static int nvme_post_locked(nvme_controller_t *ctrl, nvme_queue_t *q,
                             const nvme_sqe_t *sqe, bool aer,
                             uint16_t *cid_out) {
@@ -687,7 +660,7 @@ static int nvme_post_locked(nvme_controller_t *ctrl, nvme_queue_t *q,
     return NVME_POST_OK;
 }
 
-/* q->lock must be held (called from reap) */
+ 
 static void nvme_aer_complete(nvme_controller_t *ctrl, nvme_queue_t *q,
                               uint16_t cid) {
     nvme_request_t *r = &q->req[cid];
@@ -697,7 +670,7 @@ static void nvme_aer_complete(nvme_controller_t *ctrl, nvme_queue_t *q,
     __atomic_store_n(&r->state, (uint8_t)NVME_REQ_FREE, __ATOMIC_RELEASE);
 
     if (status != 0)
-        return;                          /* limit exceeded etc: do not loop */
+        return;                           
     ctrl->aer_event = result;
     __atomic_store_n(&ctrl->aer_pending, 1u, __ATOMIC_RELEASE);
 
@@ -713,7 +686,7 @@ static inline bool nvme_cq_peek(const nvme_queue_t *q) {
     return (cqe->status & 1u) == q->cq_phase;
 }
 
-/* Process every completed CQE. Safe from thread and interrupt context. */
+ 
 static uint32_t nvme_queue_reap(nvme_controller_t *ctrl, nvme_queue_t *q) {
     uint32_t reaped = 0;
     uint64_t flags = nvme_lock(&q->lock);
@@ -766,7 +739,7 @@ static uint32_t nvme_queue_reap(nvme_controller_t *ctrl, nvme_queue_t *q) {
     return reaped;
 }
 
-/* One handler serves all NVMe vectors: reap every queue bound to it. */
+ 
 static void nvme_interrupt_handler(uint64_t vector, uint64_t error,
                                    void *frame) {
     (void)error;
@@ -791,10 +764,10 @@ static void nvme_interrupt_handler(uint64_t vector, uint64_t error,
     }
 }
 
-/* Wait until request `cid` completes.  Returns 0 on success, otherwise the
- * NVMe status field (SC | SCT << 8 | M | DNR) or an NVME_SW_* code.  On
- * NVME_SW_TIMEOUT the request is left in flight and marked abandoned: the
- * caller MUST reset the controller before reusing its DMA memory. */
+ 
+
+
+
 static uint32_t nvme_wait_cid(nvme_controller_t *ctrl, nvme_queue_t *q,
                               uint16_t cid, uint32_t timeout_ms,
                               uint32_t *result) {
@@ -808,7 +781,7 @@ static uint32_t nvme_wait_cid(nvme_controller_t *ctrl, nvme_queue_t *q,
         if (sleepy) {
             nvme_idle_wait(&r->state);
             if (r->state != NVME_REQ_DONE && nvme_cq_peek(q)) {
-                /* a completion the ISR did not take: lost interrupt? */
+                 
                 if (nvme_queue_reap(ctrl, q)) {
                     ctrl->poll_rescues++;
                     if (ctrl->poll_rescues >= 16u
@@ -847,7 +820,7 @@ static uint32_t nvme_wait_cid(nvme_controller_t *ctrl, nvme_queue_t *q,
     return status;
 }
 
-/* Post a command; waits for a free CID / SQ entry if needed. */
+ 
 static uint32_t nvme_submit_async(nvme_controller_t *ctrl, nvme_queue_t *q,
                                   const nvme_sqe_t *sqe, uint32_t timeout_ms,
                                   uint16_t *cid_out) {
@@ -900,9 +873,9 @@ static bool nvme_admin_cmd(nvme_controller_t *ctrl, uint8_t opcode,
     return st == 0;
 }
 
-/* ------------------------------------------------------------------ */
-/* interrupt setup (MSI-X / MSI)                                       */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 static void nvme_irq_teardown(nvme_controller_t *ctrl) {
     if (ctrl->irq_mode == NVME_IRQ_MSIX && ctrl->msix_cap) {
@@ -960,7 +933,7 @@ static bool nvme_setup_msix(nvme_controller_t *ctrl) {
     if (!got)
         return false;
 
-    /* function masked + disabled while the table is written */
+     
     if (ctrl->msi_cap) {
         uint16_t c = nvme_pci_read16(b, d, f, (uint8_t)(ctrl->msi_cap + 2u));
         if (c & 1u)
@@ -976,11 +949,11 @@ static bool nvme_setup_msix(nvme_controller_t *ctrl) {
         uint64_t entry = table_phys + (uint64_t)i * 16u;
         uint8_t v = vectors[i < got ? i : i % got];
         ctrl->iv_vector[i] = v;
-        nvme_phys_write32(entry + 12, 1u);          /* masked */
+        nvme_phys_write32(entry + 12, 1u);           
         nvme_phys_write32(entry + 0, address);
         nvme_phys_write32(entry + 4, 0);
         nvme_phys_write32(entry + 8, v);
-        nvme_phys_write32(entry + 12, 0);           /* unmasked */
+        nvme_phys_write32(entry + 12, 0);            
     }
 
     nvme_pci_write16(b, d, f, (uint8_t)(cap + 2u),
@@ -1036,7 +1009,7 @@ static bool nvme_setup_msi(nvme_controller_t *ctrl) {
             nvme_pci_write32(b, d, f, (uint8_t)(cap + 12u), 0);
     }
 
-    control &= (uint16_t)~((7u << 4) | 1u);      /* one message, disabled */
+    control &= (uint16_t)~((7u << 4) | 1u);       
     control |= 1u;
     nvme_pci_write16(b, d, f, (uint8_t)(cap + 2u), control);
     if (!(nvme_pci_read16(b, d, f, (uint8_t)(cap + 2u)) & 1u)) {
@@ -1070,10 +1043,10 @@ static void nvme_irq_setup(nvme_controller_t *ctrl) {
         DBG_MSG("NVME", "IRQ handlers not registered; using polling");
     }
 
-    /* legacy INTx is never used: set PCI command.Interrupt Disable */
+     
     uint16_t cmd = nvme_pci_read16(ctrl->bus, ctrl->dev, ctrl->fn, 0x04);
     nvme_pci_write16(ctrl->bus, ctrl->dev, ctrl->fn, 0x04,
-                     (uint16_t)(cmd | 0x0406u));     /* mem + bus master + INTx off */
+                     (uint16_t)(cmd | 0x0406u));      
 }
 
 static uint16_t nvme_queue_iv(const nvme_controller_t *ctrl, uint16_t qid) {
@@ -1082,9 +1055,9 @@ static uint16_t nvme_queue_iv(const nvme_controller_t *ctrl, uint16_t qid) {
     return (uint16_t)(1u + (uint32_t)(qid - 1u) % (ctrl->n_iv - 1u));
 }
 
-/* ------------------------------------------------------------------ */
-/* controller memory                                                   */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 static bool nvme_queue_alloc(nvme_queue_t *q, uint16_t qid, uint16_t depth) {
     q->qid = qid;
@@ -1101,7 +1074,7 @@ static void nvme_queue_free(nvme_queue_t *q) {
     q->cq = NULL;
 }
 
-/* Controller must be disabled (no DMA).  Keeps the request table. */
+ 
 static void nvme_queue_reset_ring(nvme_queue_t *q) {
     q->sq_tail = 0;
     q->sq_head = 0;
@@ -1113,7 +1086,7 @@ static void nvme_queue_reset_ring(nvme_queue_t *q) {
     nvme_zero(q->cq, NVME_PAGE_SIZE);
 }
 
-/* Fail every outstanding request of a queue (controller already stopped). */
+ 
 static void nvme_queue_abort_requests(nvme_queue_t *q) {
     uint64_t flags = nvme_lock(&q->lock);
     for (uint32_t i = 0; i < NVME_IO_QUEUE_DEPTH; i++) {
@@ -1208,9 +1181,9 @@ static bool nvme_controller_alloc(nvme_controller_t *ctrl) {
     return nvme_slots_alloc(ctrl);
 }
 
-/* ------------------------------------------------------------------ */
-/* controller bring-up, reset, shutdown                                */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 static bool nvme_aer_start(nvme_controller_t *ctrl) {
     nvme_sqe_t sqe;
@@ -1223,7 +1196,7 @@ static bool nvme_aer_start(nvme_controller_t *ctrl) {
     return rc == NVME_POST_OK;
 }
 
-/* Preconditions: CC.EN == 0, queue memory allocated. */
+ 
 static bool nvme_hw_start(nvme_controller_t *ctrl) {
     nvme_queue_reset_ring(&ctrl->admin);
     for (uint32_t i = 0; i < ctrl->n_io_alloc; i++) {
@@ -1242,7 +1215,7 @@ static bool nvme_hw_start(nvme_controller_t *ctrl) {
     nvme_mmio_write64(ctrl, NVME_REG_ASQ, ctrl->admin.sq_phys);
     nvme_mmio_write64(ctrl, NVME_REG_ACQ, ctrl->admin.cq_phys);
 
-    /* pin-based / MSI masks (ignored by MSI-X) */
+     
     if (ctrl->irq_mode == NVME_IRQ_MSI)
         nvme_mmio_write32(ctrl, NVME_REG_INTMC, 0xFFFFFFFFu);
     else if (ctrl->irq_mode == NVME_IRQ_POLL)
@@ -1297,7 +1270,7 @@ static bool nvme_hw_start(nvme_controller_t *ctrl) {
     if (!ctrl->n_io)
         return false;
 
-    /* enable every SMART critical-warning event, ignore failure */
+     
     nvme_admin_cmd(ctrl, NVME_ADMIN_SET_FEAT, 0, 0,
                    NVME_FEAT_ASYNC_EVENT, 0xFFu, NULL);
     nvme_aer_start(ctrl);
@@ -1318,7 +1291,7 @@ static bool nvme_controller_recover(nvme_controller_t *ctrl) {
     ctrl->resets++;
     ctrl->state = NVME_STATE_RESETTING;
 
-    /* 1. no new commands, 2. stop the device, 3. fail what was in flight */
+     
     nvme_queue_deactivate(&ctrl->admin);
     for (uint32_t i = 0; i < ctrl->n_io_alloc; i++)
         nvme_queue_deactivate(&ctrl->io[i]);
@@ -1354,7 +1327,7 @@ static void nvme_controller_teardown(nvme_controller_t *ctrl) {
     nvme_irq_teardown(ctrl);
     ctrl->state = NVME_STATE_OFF;
     if (stopped)
-        nvme_controller_free_memory(ctrl);  /* else leak: device may DMA */
+        nvme_controller_free_memory(ctrl);   
 }
 
 static void nvme_controller_shutdown(nvme_controller_t *ctrl) {
@@ -1390,9 +1363,9 @@ static void nvme_controller_shutdown(nvme_controller_t *ctrl) {
     nvme_controller_teardown(ctrl);
 }
 
-/* ------------------------------------------------------------------ */
-/* multi-page DMA: PRP construction                                    */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 static bool nvme_map_page_phys(const nvme_dma_map_t *m, uint32_t index,
                                uint64_t *out) {
@@ -1423,12 +1396,12 @@ static bool nvme_map_page_phys(const nvme_dma_map_t *m, uint32_t index,
     return true;
 }
 
-/*
- * PRP rules: PRP1 may carry an offset inside its page; every further entry is
- * page aligned.  2 pages -> PRP2 is the second page.  3+ pages -> PRP2 points
- * to a PRP list; when a list page cannot hold the rest, its last entry is a
- * pointer to the next list page.
- */
+ 
+
+
+
+
+
 static bool nvme_build_prps(const nvme_dma_slot_t *slot,
                             const nvme_dma_map_t *m, uint32_t bytes,
                             uint64_t *prp1, uint64_t *prp2) {
@@ -1470,9 +1443,9 @@ static bool nvme_build_prps(const nvme_dma_slot_t *slot,
     return true;
 }
 
-/* Optional: lets the VMM tell us physical addresses of non-direct-map
- * buffers (user pages, vmalloc area, ...) so they can be DMA'd zero-copy.
- * The callback must return (uint64_t)-1 for unmapped addresses. */
+ 
+
+
 void nvme_set_virt_to_phys(uint64_t (*fn)(const void *virt)) {
     g_nvme_virt_to_phys = fn;
 }
@@ -1481,7 +1454,7 @@ static bool nvme_try_map_buffer(const void *buf, uint32_t bytes,
                                 nvme_dma_map_t *m) {
     uint64_t va = (uint64_t)(uintptr_t)buf;
     if (va & 3u)
-        return false;                    /* PRP1 must be dword aligned */
+        return false;                     
     if (va >= NVME_DIRECT_MAP_OFFSET
         && va - NVME_DIRECT_MAP_OFFSET + bytes <= NVME_DIRECT_MAP_SIZE) {
         m->translate = false;
@@ -1523,14 +1496,14 @@ static bool nvme_slot_ensure_bounce(nvme_controller_t *ctrl,
             slot->bounce_bytes = pages * NVME_PAGE_SIZE;
             return true;
         }
-        pages >>= 1;                     /* fragmented memory: go smaller */
+        pages >>= 1;                      
     }
     return false;
 }
 
-/* ------------------------------------------------------------------ */
-/* namespaces and block I/O                                            */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 typedef struct {
     nvme_dma_slot_t *slot;
@@ -1597,8 +1570,8 @@ static uint32_t nvme_issue_chunk(nvme_namespace_t *ns, nvme_chunk_t *ck,
     return 0;
 }
 
-/* One pass over the whole request.  Keeps up to NVME_DMA_SLOTS commands in
- * flight.  Always drains everything it started before returning. */
+ 
+
 static uint32_t nvme_rw_once(nvme_namespace_t *ns, uint64_t lba,
                              uint32_t count, uint8_t *user, bool write) {
     nvme_controller_t *ctrl = ns->controller;
@@ -1639,7 +1612,7 @@ static uint32_t nvme_rw_once(nvme_namespace_t *ns, uint64_t lba,
                 error = NVME_SW_NOTREADY;
                 break;
             }
-            nvme_relax();                /* all slots busy in other threads */
+            nvme_relax();                 
             continue;
         }
 
@@ -1648,7 +1621,7 @@ static uint32_t nvme_rw_once(nvme_namespace_t *ns, uint64_t lba,
                                     NVME_IO_TIMEOUT_MS, NULL);
         bool leak_slot = false;
         if (st == NVME_SW_TIMEOUT) {
-            /* the device may still own this slot's memory until reset */
+             
             if (!reset_done) {
                 reset_done = true;
                 nvme_controller_recover(ctrl);
@@ -1673,14 +1646,14 @@ static bool nvme_status_retryable(uint32_t st) {
         return true;
     if (st & NVME_SW_FLAG)
         return false;
-    if (st & 0x4000u)                    /* Do Not Retry */
+    if (st & 0x4000u)                     
         return false;
     uint32_t sct = (st >> 8) & 7u;
-    return sct == 0 || sct == 3;         /* generic / path related */
+    return sct == 0 || sct == 3;          
 }
 
 static void nvme_service_events(nvme_controller_t *ctrl) {
-    /* in polling mode nobody else looks at the admin CQ between commands */
+     
     if (ctrl->admin.active && nvme_cq_peek(&ctrl->admin))
         nvme_queue_reap(ctrl, &ctrl->admin);
     if (!__atomic_load_n(&ctrl->aer_pending, __ATOMIC_ACQUIRE))
@@ -1695,7 +1668,7 @@ static void nvme_service_events(nvme_controller_t *ctrl) {
         DBG_VAL("NVME", "async event type", type);
         DBG_VAL("NVME", "async event info", info);
         if (lid == 0x01u || lid == 0x02u || lid == 0x03u) {
-            /* reading the log page re-arms the event */
+             
             if (nvme_admin_cmd(ctrl, NVME_ADMIN_GET_LOG, 0xFFFFFFFFu,
                                ctrl->log_phys, lid | (127u << 16), 0, NULL)
                 && lid == 0x02u && ctrl->logbuf[0]) {
@@ -1752,7 +1725,7 @@ static int nvme_rw(blkdev_t *dev, uint64_t lba, uint32_t count,
         return VFS_ERR_IO;
     }
 
-    /* one flush per write request, and only if the cache is volatile */
+     
     if (write && ctrl->vwc)
         return nvme_ns_flush(ns);
     return VFS_OK;
@@ -1786,7 +1759,7 @@ static nvme_namespace_t *nvme_ns_from_dev(blkdev_t *dev) {
     return (nvme_namespace_t *)dev->priv;
 }
 
-/* ---- optional commands ---------------------------------------------- */
+ 
 
 int nvme_flush_drive(blkdev_t *dev) {
     nvme_namespace_t *ns = nvme_ns_from_dev(dev);
@@ -1795,7 +1768,7 @@ int nvme_flush_drive(blkdev_t *dev) {
     return nvme_ns_flush(ns);
 }
 
-/* Dataset Management / deallocate (TRIM) */
+ 
 int nvme_trim_drive(blkdev_t *dev, uint64_t lba, uint64_t count) {
     nvme_namespace_t *ns = nvme_ns_from_dev(dev);
     if (!ns)
@@ -1820,8 +1793,8 @@ int nvme_trim_drive(blkdev_t *dev, uint64_t lba, uint64_t count) {
     while (count && rc == VFS_OK) {
         uint32_t n = count > 65536u ? 65536u : (uint32_t)count;
         uint32_t *range = (uint32_t *)slot->bounce;
-        range[0] = 0;                    /* context attributes */
-        range[1] = n;                    /* length in blocks (not 0-based) */
+        range[0] = 0;                     
+        range[1] = n;                     
         range[2] = (uint32_t)lba;
         range[3] = (uint32_t)(lba >> 32);
 
@@ -1830,14 +1803,14 @@ int nvme_trim_drive(blkdev_t *dev, uint64_t lba, uint64_t count) {
         sqe.opcode = NVME_NVM_DSM;
         sqe.nsid = ns->nsid;
         sqe.prp1 = slot->bounce_phys;
-        sqe.cdw[0] = 0;                  /* one range */
-        sqe.cdw[1] = 1u << 2;            /* AD: deallocate */
+        sqe.cdw[0] = 0;                   
+        sqe.cdw[1] = 1u << 2;             
         uint32_t st = nvme_cmd_sync(ctrl, nvme_pick_io_queue(ctrl), &sqe,
                                     NVME_IO_TIMEOUT_MS, NULL);
         if (st == NVME_SW_TIMEOUT) {
             nvme_controller_recover(ctrl);
             if (ctrl->state != NVME_STATE_READY)
-                return VFS_ERR_IO;       /* slot leaked on purpose */
+                return VFS_ERR_IO;        
         }
         if (st)
             rc = VFS_ERR_IO;
@@ -1882,9 +1855,9 @@ int nvme_write_zeroes_drive(blkdev_t *dev, uint64_t lba, uint64_t count) {
     return VFS_OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* identify / probe                                                    */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 static void nvme_copy_ident_str(char *dst, const uint8_t *src, uint32_t len) {
     uint32_t n = 0;
@@ -1920,7 +1893,7 @@ static bool nvme_identify_controller(nvme_controller_t *ctrl) {
     ctrl->oncs = (uint16_t)(id[520] | (id[521] << 8));
     ctrl->vwc = (id[525] & 1u) != 0;
 
-    /* we need 64-byte SQEs and 16-byte CQEs */
+     
     uint8_t sqes = id[512], cqes = id[513];
     if ((sqes & 0xFu) > 6u || (sqes >> 4) < 6u
         || (cqes & 0xFu) > 4u || (cqes >> 4) < 4u) {
@@ -2039,7 +2012,7 @@ static bool nvme_probe_controller(uint8_t bus, uint8_t dev, uint8_t fn,
     ctrl->mmio_phys = mmio_phys;
     ctrl->state = NVME_STATE_INIT;
 
-    /* memory space + bus master now, the rest in nvme_irq_setup() */
+     
     uint16_t cmd = nvme_pci_read16(bus, dev, fn, 0x04);
     nvme_pci_write16(bus, dev, fn, 0x04, (uint16_t)(cmd | 0x06u));
 
@@ -2073,7 +2046,7 @@ static bool nvme_probe_controller(uint8_t bus, uint8_t dev, uint8_t fn,
         nvme_controller_teardown(ctrl);
         return false;
     }
-    /* before the real MDTS is known: at least one page, at most the cap */
+     
     ctrl->max_xfer_bytes = NVME_PAGE_SIZE;
 
     if (!nvme_hw_start(ctrl) || !nvme_identify_controller(ctrl)) {
@@ -2081,7 +2054,7 @@ static bool nvme_probe_controller(uint8_t bus, uint8_t dev, uint8_t fn,
         return false;
     }
 
-    /* up to NVME_MAX_NAMESPACES active namespaces */
+     
     uint32_t active_ns[NVME_MAX_NAMESPACES];
     uint32_t active_count = 0;
     nvme_zero(ctrl->ident, NVME_PAGE_SIZE);
@@ -2097,7 +2070,7 @@ static bool nvme_probe_controller(uint8_t bus, uint8_t dev, uint8_t fn,
             active_ns[active_count++] = id;
         }
     } else {
-        /* pre-1.1 controller: try the first namespaces blindly */
+         
         DBG_MSG("NVME", "no Active Namespace List; probing NSID 1..N");
         uint32_t limit = ctrl->nn < NVME_MAX_NAMESPACES
                        ? ctrl->nn : NVME_MAX_NAMESPACES;
@@ -2120,9 +2093,9 @@ static bool nvme_probe_controller(uint8_t bus, uint8_t dev, uint8_t fn,
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* public API                                                          */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 
 int nvme_init(void) {
     DBG_MSG("NVME", "=== nvme_init ===");
@@ -2134,7 +2107,7 @@ int nvme_init(void) {
                                        nvme_interrupt_handler) == 0)
             registered++;
         else
-            g_nvme_vec_used |= 1u << i;      /* never hand out this vector */
+            g_nvme_vec_used |= 1u << i;       
     }
     g_nvme_irq_registered = registered != 0;
     if (!g_nvme_irq_registered)
@@ -2193,7 +2166,7 @@ blkdev_t *nvme_find_drive(const char *name) {
     return NULL;
 }
 
-/* Call before poweroff / reboot: flushes, deletes queues, CC.SHN. */
+ 
 void nvme_shutdown(void) {
     for (int i = 0; i < g_nvme_controller_count; i++)
         nvme_controller_shutdown(&g_nvme_controllers[i]);
