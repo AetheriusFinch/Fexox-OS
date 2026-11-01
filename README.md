@@ -9,5 +9,4 @@ Fexox OS исходный код / Source Code
 -Планировщик задач: CFS-подобный (В будущем будет заменен на кастомный)
 -Стадия разработки: Alpha1
 
-TG: https://t.me/FexoxOS
 About Developer: известен под ником/псевдонимом на Reddit (u/BreakfastKitchen6249), (Aetherius Finch)
