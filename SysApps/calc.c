@@ -1,467 +1,336 @@
 /* Fexox OS Project, EULA GPLv2 */
- 
-
-
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <unistd.h>
+#include <math.h>
 
- 
+#include "font8x8.h"                                                                   
 
-
-
-
-
-#define SYS_EXIT          60
-#define SYS_SCHED_YIELD   24
-#define SYS_GET_FRAMEBUFFER 500
-#define SYS_WIN_CREATE    600
-#define SYS_WIN_CLOSE     601
-#define SYS_WIN_GET_RECT  603
-#define SYS_INPUT_POLL    604
+                                                                                
+#define FX_SYS_GET_FRAMEBUFFER 500
+#define FX_SYS_WIN_CREATE      600
+#define FX_SYS_WIN_GET_RECT    603
+#define FX_SYS_INPUT_POLL      604
+#define FX_SYS_KBD_READ_CHAR   605
 
 typedef struct {
-    uint64_t phys_addr;
-    uint64_t virt_addr;
-    uint32_t width;
-    uint32_t height;
-    uint32_t pitch;
-    uint32_t bpp;
-    uint8_t  mode;
-    uint8_t  r_shift, g_shift, b_shift;
-} sc_framebuffer_t;
+    uint64_t phys_addr, virt_addr;
+    uint32_t width, height, pitch, bpp;
+    uint8_t  mode, r_shift, g_shift, b_shift;
+} fx_fb_t;
 
-typedef struct {
-    int32_t  x, y;
-    uint32_t w, h;
-} sc_win_rect_t;
+typedef struct { int32_t x, y; uint32_t w, h, redraw_gen; } fx_rect_t;
+typedef struct { int32_t x, y; uint8_t buttons; }          fx_input_t;
 
-typedef struct {
-    int32_t x, y;
-    uint8_t buttons;
-} sc_input_t;
+                                                                                
+#define WIN_W      240
+#define WIN_H      320
+#define TITLEBAR_H 28                                                                             
+#define DISP_H     76
+#define MARGIN     10
+#define GAP        8
+#define COLS       4
+#define ROWS       5
 
- 
+#define RGB(r, g, b) (((uint32_t)(r) << 16) | ((uint32_t)(g) << 8) | (uint32_t)(b))
+#define C_BG        RGB(32, 33, 36)
+#define C_DISPLAY   RGB(24, 25, 28)
+#define C_TEXT      RGB(235, 235, 235)
+#define C_SUBTEXT   RGB(150, 155, 160)
+#define C_DIGIT     RGB(60, 64, 67)
+#define C_FUNC      RGB(84, 88, 92)
+#define C_OP        RGB(66, 92, 140)
+#define C_EQUALS    RGB(138, 180, 248)
+#define C_EQUALS_T  RGB(20, 24, 32)
+#define C_HOVER_ADD 18                                   
+#define C_PRESS_ADD 40                                   
 
+static fx_fb_t   g_fb;
+static fx_rect_t g_rect;
 
-
-static inline int64_t sys_call(int64_t nr, int64_t a1, int64_t a2,
-                               int64_t a3, int64_t a4, int64_t a5) {
-    int64_t ret;
-    register int64_t r10 __asm__("r10") = a4;
-    register int64_t r8  __asm__("r8")  = a5;
-    __asm__ volatile (
-        "syscall"
-        : "=a"(ret)
-        : "a"(nr), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8)
-        : "rcx", "r11", "memory"
-    );
-    return ret;
+                                                                                
+static inline uint32_t native(uint32_t rgb) {
+    uint32_t r = (rgb >> 16) & 0xFF, g = (rgb >> 8) & 0xFF, b = rgb & 0xFF;
+    return (r << g_fb.r_shift) | (g << g_fb.g_shift) | (b << g_fb.b_shift);
 }
 
-static void sys_exit(int code) {
-    sys_call(SYS_EXIT, code, 0, 0, 0, 0);
-    for (;;) { }
-}
-static void sys_yield(void) { sys_call(SYS_SCHED_YIELD, 0, 0, 0, 0, 0); }
-
-static int64_t sys_win_create(const char *title, uint32_t len, uint32_t w, uint32_t h) {
-    return sys_call(SYS_WIN_CREATE, (int64_t)(uintptr_t)title, (int64_t)len, (int64_t)w, (int64_t)h, 0);
-}
-static int64_t sys_win_get_rect(int win_id, sc_win_rect_t *out) {
-    return sys_call(SYS_WIN_GET_RECT, win_id, (int64_t)(uintptr_t)out, 0, 0, 0);
-}
-static int64_t sys_get_framebuffer(sc_framebuffer_t *out) {
-    return sys_call(SYS_GET_FRAMEBUFFER, (int64_t)(uintptr_t)out, 0, 0, 0, 0);
-}
-static int64_t sys_input_poll(sc_input_t *out) {
-    return sys_call(SYS_INPUT_POLL, (int64_t)(uintptr_t)out, 0, 0, 0, 0);
+static uint32_t lighten(uint32_t rgb, int add) {
+    int r = (int)((rgb >> 16) & 0xFF) + add, g = (int)((rgb >> 8) & 0xFF) + add, b = (int)(rgb & 0xFF) + add;
+    if (r > 255) r = 255;
+    if (g > 255) g = 255;
+    if (b > 255) b = 255;
+    return RGB(r, g, b);
 }
 
- 
+                                                                                          
+static void fill_rect(int x, int y, int w, int h, uint32_t rgb) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > WIN_W) w = WIN_W - x;
+    if (y + h > WIN_H) h = WIN_H - y;
+    if (w <= 0 || h <= 0) return;
 
-
-static uint64_t u64_strlen(const char *s) { uint64_t n = 0; while (s[n]) n++; return n; }
-
- 
-
-
-
-
-static sc_framebuffer_t g_fb;
-static sc_win_rect_t    g_rect;    
-
-static inline void put_px(int32_t x, int32_t y, uint8_t r, uint8_t g, uint8_t b) {
-     
-
-
-
-
-    int32_t ax = x + g_rect.x;
-    int32_t ay = y + g_rect.y;
-    if (ax < 0 || ay < 0 || (uint32_t)ax >= g_fb.width || (uint32_t)ay >= g_fb.height) return;
-    uint32_t native = ((uint32_t)r << g_fb.r_shift) |
-                      ((uint32_t)g << g_fb.g_shift) |
-                      ((uint32_t)b << g_fb.b_shift);
-    uint8_t *dst = (uint8_t *)(uintptr_t)g_fb.virt_addr +
-                   (uint64_t)ay * g_fb.pitch + (uint64_t)ax * (g_fb.bpp / 8u);
-     
-
-    *(volatile uint32_t *)dst = native;
-}
-
-static void fill_rect(int32_t x, int32_t y, uint32_t w, uint32_t h,
-                      uint8_t r, uint8_t g, uint8_t b) {
-    for (uint32_t row = 0; row < h; row++)
-        for (uint32_t col = 0; col < w; col++)
-            put_px(x + (int32_t)col, y + (int32_t)row, r, g, b);
-}
-
-static void draw_rect_outline(int32_t x, int32_t y, uint32_t w, uint32_t h,
-                              uint8_t r, uint8_t g, uint8_t b) {
-    fill_rect(x, y, w, 2, r, g, b);
-    fill_rect(x, y + (int32_t)h - 2, w, 2, r, g, b);
-    fill_rect(x, y, 2, h, r, g, b);
-    fill_rect(x + (int32_t)w - 2, y, 2, h, r, g, b);
-}
-
- 
-
-
-
-
-
-typedef struct { char c; uint8_t rows[7]; } glyph_t;
-
-static const glyph_t FONT[] = {
-    {'0', {0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}},
-    {'1', {0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}},
-    {'2', {0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}},
-    {'3', {0x1F,0x02,0x04,0x02,0x01,0x11,0x0E}},
-    {'4', {0x02,0x06,0x0A,0x12,0x1F,0x02,0x02}},
-    {'5', {0x1F,0x10,0x1E,0x01,0x01,0x11,0x0E}},
-    {'6', {0x06,0x08,0x10,0x1E,0x11,0x11,0x0E}},
-    {'7', {0x1F,0x01,0x02,0x04,0x08,0x08,0x08}},
-    {'8', {0x0E,0x11,0x11,0x0E,0x11,0x11,0x0E}},
-    {'9', {0x0E,0x11,0x11,0x0F,0x01,0x02,0x0C}},
-    {'+', {0x00,0x04,0x04,0x1F,0x04,0x04,0x00}},
-    {'-', {0x00,0x00,0x00,0x1F,0x00,0x00,0x00}},
-    {'=', {0x00,0x00,0x1F,0x00,0x1F,0x00,0x00}},
-    {'C', {0x0E,0x11,0x10,0x10,0x10,0x11,0x0E}},
-    {'E', {0x1F,0x10,0x1E,0x10,0x10,0x10,0x1F}},   
-    {'.', {0x00,0x00,0x00,0x00,0x00,0x0C,0x0C}},
-    {' ', {0,0,0,0,0,0,0}},
-};
-#define FONT_N ((int)(sizeof(FONT) / sizeof(FONT[0])))
-
-static const glyph_t *find_glyph(char c) {
-    for (int i = 0; i < FONT_N; i++)
-        if (FONT[i].c == c) return &FONT[i];
-    return &FONT[FONT_N - 1];  
-}
-
-static void draw_char(int32_t x, int32_t y, char c, uint8_t scale,
-                      uint8_t r, uint8_t g, uint8_t b) {
-    const glyph_t *gl = find_glyph(c);
-    for (int row = 0; row < 7; row++) {
-        uint8_t bits = gl->rows[row];
-        for (int col = 0; col < 5; col++) {
-            if (bits & (1 << (4 - col))) {
-                fill_rect(x + col * scale, y + row * scale, scale, scale, r, g, b);
-            }
-        }
+    uint32_t px = native(rgb);
+    for (int row = 0; row < h; row++) {
+        int ay = y + row + g_rect.y;
+        if (ay < 0 || (uint32_t)ay >= g_fb.height) continue;
+        int ax = x + g_rect.x;
+        int n  = w;
+        if (ax < 0) { n += ax; ax = 0; }
+        if (ax + n > (int)g_fb.width) n = (int)g_fb.width - ax;
+        if (n <= 0) continue;
+        volatile uint32_t *p = (volatile uint32_t *)(uintptr_t)(g_fb.virt_addr +
+                               (uint64_t)ay * g_fb.pitch + (uint64_t)ax * 4u);
+        while (n--) *p++ = px;
     }
 }
 
-static void draw_text(int32_t x, int32_t y, const char *s, uint8_t scale,
-                      uint8_t r, uint8_t g, uint8_t b) {
-    int32_t cx = x;
-    while (*s) {
-        draw_char(cx, y, *s, scale, r, g, b);
-        cx += (int32_t)(6 * scale);
-        s++;
-    }
+static void draw_char(int x, int y, char c, int scale, uint32_t rgb) {
+    if (c < 0x20 || c > 0x7E) return;
+    const unsigned char *gl = g_font8x8[c - 0x20];
+    for (int row = 0; row < 8; row++)
+        for (int col = 0; col < 8; col++)
+            if ((gl[row] >> col) & 1)
+                fill_rect(x + col * scale, y + row * scale, scale, scale, rgb);
 }
 
-static uint32_t text_width(const char *s, uint8_t scale) {
-    return (uint32_t)(u64_strlen(s) * 6u * scale);
+static int text_w(const char *s, int scale) { return (int)strlen(s) * 8 * scale; }
+
+static void draw_text(int x, int y, const char *s, int scale, uint32_t rgb) {
+    for (; *s; s++, x += 8 * scale) draw_char(x, y, *s, scale, rgb);
 }
 
- 
+                                                                                
+static double g_acc;                                                     
+static char   g_op;                                                      
+static char   g_entry[32];                                                
+static bool   g_typing;
+static bool   g_error;
 
-
-static int i64_to_str(int64_t v, char *out, int out_sz) {
-    char tmp[24];
-    int n = 0;
-    bool neg = v < 0;
-    uint64_t uv = neg ? (uint64_t)(-(v + 1)) + 1u : (uint64_t)v;
-
-    if (uv == 0) tmp[n++] = '0';
-    while (uv > 0 && n < (int)sizeof(tmp)) {
-        tmp[n++] = (char)('0' + (uv % 10));
-        uv /= 10;
-    }
-    if (neg && n < (int)sizeof(tmp)) tmp[n++] = '-';
-
-    int len = 0;
-    while (n > 0 && len < out_sz - 1) out[len++] = tmp[--n];
-    out[len] = '\0';
-    return len;
-}
-
- 
-
-
-#define WIN_W   220u
-#define WIN_H   300u
-#define DISP_H   50u
-#define BTN_GAP   6
-#define GRID_COLS 4
-#define GRID_ROWS 4
-
-typedef struct { char label; bool active; } btn_def_t;
-
-static const btn_def_t BTN_GRID[GRID_ROWS][GRID_COLS] = {
-    {{'7',true}, {'8',true}, {'9',true}, {'+',true}},
-    {{'4',true}, {'5',true}, {'6',true}, {'-',true}},
-    {{'1',true}, {'2',true}, {'3',true}, {'=',true}},
-    {{'C',true}, {'0',true}, {' ',false},{' ',false}},
-};
-
-static void btn_rect(int col, int row, int32_t *bx, int32_t *by, uint32_t *bw, uint32_t *bh) {
-    uint32_t grid_w = WIN_W - 2u * BTN_GAP;
-    uint32_t grid_h = WIN_H - DISP_H - (GRID_ROWS + 1) * BTN_GAP;
-    uint32_t cw = (grid_w - (GRID_COLS - 1) * BTN_GAP) / GRID_COLS;
-    uint32_t ch = grid_h / GRID_ROWS;
-
-    *bx = BTN_GAP + col * (int32_t)(cw + BTN_GAP);
-    *by = (int32_t)DISP_H + BTN_GAP + row * (int32_t)(ch + BTN_GAP);
-    *bw = cw;
-    *bh = ch;
-}
-
- 
-
-
-
-static int64_t g_acc = 0;       
-static int64_t g_cur = 0;       
-static char    g_pending_op = 0;
-static bool    g_typing = false;
-static bool    g_error = false;
-
-#define CUR_MAX  99999999LL    
-
-static int64_t apply_op(int64_t a, char op, int64_t b) {
-    switch (op) {
-        case '+': return a + b;
-        case '-': return a - b;
-        default:  return b;
-    }
+static void format_number(double v, char *out, size_t n) {
+    if (isnan(v) || isinf(v)) { snprintf(out, n, "Error"); return; }
+    snprintf(out, n, "%.10g", v);
+    if (strlen(out) > 12) snprintf(out, n, "%.5e", v);
 }
 
 static void calc_reset(void) {
-    g_acc = 0; g_cur = 0; g_pending_op = 0; g_typing = false; g_error = false;
+    g_acc = 0; g_op = 0; g_entry[0] = '\0'; g_typing = false; g_error = false;
 }
 
-static void calc_press(char label) {
-    if (g_error && label != 'C') return;    
+static double entry_value(void) { return strtod(g_entry, NULL); }
 
-    if (label >= '0' && label <= '9') {
-        if (!g_typing) { g_cur = 0; g_typing = true; }
-        if (g_cur <= (CUR_MAX - (label - '0')) / 10)
-            g_cur = g_cur * 10 + (label - '0');
+static void apply_pending(double rhs) {
+    switch (g_op) {
+    case '+': g_acc += rhs; break;
+    case '-': g_acc -= rhs; break;
+    case '*': g_acc *= rhs; break;
+    case '/': if (rhs == 0.0) g_error = true; else g_acc /= rhs; break;
+    default:  g_acc = rhs;  break;
+    }
+    if (isnan(g_acc) || isinf(g_acc)) g_error = true;
+}
+
+static void press(char key) {
+    if (g_error && key != 'C') return;
+
+    if ((key >= '0' && key <= '9') || key == '.') {
+        if (!g_typing) { g_entry[0] = '\0'; g_typing = true; if (!g_op) g_acc = 0; }
+        size_t len = strlen(g_entry);
+        if (key == '.') {
+            if (strchr(g_entry, '.')) return;
+            if (len == 0) { strcpy(g_entry, "0"); len = 1; }
+        } else if (len == 1 && g_entry[0] == '0') {
+            len = 0;                                                            
+        }
+        if (len >= 12) return;
+        g_entry[len] = key;
+        g_entry[len + 1] = '\0';
         return;
     }
 
-    switch (label) {
-        case 'C':
-            calc_reset();
-            return;
-        case '+':
-        case '-':
-            g_acc = g_pending_op ? apply_op(g_acc, g_pending_op, g_cur)
-                                  : (g_typing ? g_cur : g_acc);
-            g_pending_op = label;
+    switch (key) {
+    case 'C':
+        calc_reset();
+        return;
+    case '<':
+        if (g_typing) {
+            size_t len = strlen(g_entry);
+            if (len > 0) g_entry[len - 1] = '\0';
+            if (g_entry[0] == '\0') strcpy(g_entry, "0");
+        }
+        return;
+    case '+': case '-': case '*': case '/':
+        if (g_typing) {
+            double v = entry_value();
+            if (g_op) apply_pending(v); else g_acc = v;
             g_typing = false;
-            return;
-        case '=':
-            g_acc = g_pending_op ? apply_op(g_acc, g_pending_op, g_cur)
-                                  : (g_typing ? g_cur : g_acc);
-            g_pending_op = 0;
+        }
+        g_op = key;                                                                          
+        return;
+    case '=':
+        if (g_typing) {
+            double v = entry_value();
+            if (g_op) apply_pending(v); else g_acc = v;
             g_typing = false;
-            return;
-        default:
-            return;
+        }
+        g_op = 0;
+        return;
+    default:
+        return;
     }
 }
 
-static int64_t calc_display_value(void) {
-    return g_typing ? g_cur : g_acc;
+                                                                                
+enum { K_DIGIT, K_FUNC, K_OP, K_EQUALS };
+
+typedef struct { const char *label; char key; int col, row, cs, rs; int kind; } btn_t;
+
+static const btn_t BTNS[] = {
+    { "C", 'C', 0, 0, 1, 1, K_FUNC }, { "<", '<', 1, 0, 1, 1, K_FUNC },
+    { "/", '/', 2, 0, 1, 1, K_OP   }, { "*", '*', 3, 0, 1, 1, K_OP   },
+    { "7", '7', 0, 1, 1, 1, K_DIGIT}, { "8", '8', 1, 1, 1, 1, K_DIGIT},
+    { "9", '9', 2, 1, 1, 1, K_DIGIT}, { "-", '-', 3, 1, 1, 1, K_OP   },
+    { "4", '4', 0, 2, 1, 1, K_DIGIT}, { "5", '5', 1, 2, 1, 1, K_DIGIT},
+    { "6", '6', 2, 2, 1, 1, K_DIGIT}, { "+", '+', 3, 2, 1, 1, K_OP   },
+    { "1", '1', 0, 3, 1, 1, K_DIGIT}, { "2", '2', 1, 3, 1, 1, K_DIGIT},
+    { "3", '3', 2, 3, 1, 1, K_DIGIT}, { "=", '=', 3, 3, 1, 2, K_EQUALS},
+    { "0", '0', 0, 4, 2, 1, K_DIGIT}, { ".", '.', 2, 4, 1, 1, K_DIGIT},
+};
+#define NBTN ((int)(sizeof(BTNS) / sizeof(BTNS[0])))
+
+static void btn_rect(const btn_t *b, int *x, int *y, int *w, int *h) {
+    int cw = (WIN_W - 2 * MARGIN - (COLS - 1) * GAP) / COLS;
+    int ch = (WIN_H - DISP_H - 2 * MARGIN - (ROWS - 1) * GAP) / ROWS;
+    *x = MARGIN + b->col * (cw + GAP);
+    *y = DISP_H + MARGIN + b->row * (ch + GAP);
+    *w = b->cs * cw + (b->cs - 1) * GAP;
+    *h = b->rs * ch + (b->rs - 1) * GAP;
 }
 
- 
+static int hit_test(int lx, int ly) {
+    for (int i = 0; i < NBTN; i++) {
+        int x, y, w, h;
+        btn_rect(&BTNS[i], &x, &y, &w, &h);
+        if (lx >= x && ly >= y && lx < x + w && ly < y + h) return i;
+    }
+    return -1;
+}
 
-
+                                                                                
 static void draw_display(void) {
-    fill_rect(0, 0, WIN_W, DISP_H, 20, 20, 24);
-    draw_rect_outline(0, 0, WIN_W, DISP_H, 60, 60, 68);
+    fill_rect(0, 0, WIN_W, DISP_H, C_DISPLAY);
 
-    char buf[24];
-    if (g_error) {
-        buf[0] = 'E'; buf[1] = '\0';
-    } else {
-        i64_to_str(calc_display_value(), buf, sizeof(buf));
+    char main_txt[40], sub[48] = "";
+    if (g_error)        snprintf(main_txt, sizeof main_txt, "Error");
+    else if (g_typing)  snprintf(main_txt, sizeof main_txt, "%s", g_entry);
+    else                format_number(g_acc, main_txt, sizeof main_txt);
+
+    if (g_op && !g_error) {                                                 
+        char a[32];
+        format_number(g_acc, a, sizeof a);
+        snprintf(sub, sizeof sub, "%s %c", a, g_op);
     }
+    if (sub[0]) draw_text(WIN_W - MARGIN - text_w(sub, 1), 10, sub, 1, C_SUBTEXT);
 
-    uint8_t scale = 4;
-    uint32_t tw = text_width(buf, scale);
-    int32_t tx = (int32_t)WIN_W - (int32_t)tw - 14;
-    if (tx < 6) tx = 6;
-    int32_t ty = (int32_t)(DISP_H - 7u * scale) / 2;
-    draw_text(tx, ty, buf, scale, 235, 235, 235);
+    int scale = (text_w(main_txt, 3) <= WIN_W - 2 * MARGIN) ? 3 : 2;
+    draw_text(WIN_W - MARGIN - text_w(main_txt, scale), DISP_H - 16 - 8 * scale, main_txt, scale, C_TEXT);
 }
 
-static void draw_button(int col, int row, bool pressed) {
-    const btn_def_t *b = &BTN_GRID[row][col];
-    if (!b->active) return;
+static void draw_button(int i, int hover, int pressed) {
+    const btn_t *b = &BTNS[i];
+    int x, y, w, h;
+    btn_rect(b, &x, &y, &w, &h);
 
-    int32_t bx, by; uint32_t bw, bh;
-    btn_rect(col, row, &bx, &by, &bw, &bh);
+    uint32_t bg, fg = C_TEXT;
+    switch (b->kind) {
+    case K_FUNC:   bg = C_FUNC;  break;
+    case K_OP:     bg = C_OP;    break;
+    case K_EQUALS: bg = C_EQUALS; fg = C_EQUALS_T; break;
+    default:       bg = C_DIGIT; break;
+    }
+    if (i == pressed)    bg = lighten(bg, C_PRESS_ADD);
+    else if (i == hover) bg = lighten(bg, C_HOVER_ADD);
 
-    bool is_op = (b->label == '+' || b->label == '-' || b->label == '=');
-    bool is_c  = (b->label == 'C');
-
-    uint8_t br, bg, bb;
-    if (pressed)      { br = 90;  bg = 140; bb = 220; }
-    else if (is_op)    { br = 60;  bg = 90;  bb = 160; }
-    else if (is_c)     { br = 160; bg = 60;  bb = 60;  }
-    else                { br = 55;  bg = 55;  bb = 60;  }
-
-    fill_rect(bx, by, bw, bh, br, bg, bb);
-    draw_rect_outline(bx, by, bw, bh, 20, 20, 24);
-
-    uint8_t scale = 3;
-    char s[2] = { b->label, '\0' };
-    uint32_t tw = text_width(s, scale);
-    int32_t tx = bx + (int32_t)((bw - tw) / 2u);
-    int32_t ty = by + (int32_t)((bh - 7u * scale) / 2u);
-    draw_text(tx, ty, s, scale, 240, 240, 240);
+    fill_rect(x, y, w, h, bg);
+    draw_text(x + (w - text_w(b->label, 2)) / 2, y + (h - 16) / 2, b->label, 2, fg);
 }
 
-static void draw_all(int pressed_col, int pressed_row) {
+static void draw_all(int hover, int pressed) {
+    fill_rect(0, 0, WIN_W, WIN_H, C_BG);
     draw_display();
-    for (int row = 0; row < GRID_ROWS; row++)
-        for (int col = 0; col < GRID_COLS; col++)
-            draw_button(col, row, (col == pressed_col && row == pressed_row));
+    for (int i = 0; i < NBTN; i++) draw_button(i, hover, pressed);
 }
 
- 
+                                                                                
+static char map_key(char c) {
+    if ((c >= '0' && c <= '9') || c == '.' || c == '+' || c == '-' || c == '*' || c == '/') return c;
+    if (c == '=' || c == '\r' || c == '\n') return '=';
+    if (c == 8 || c == 127) return '<';
+    if (c == 27 || c == 'c' || c == 'C') return 'C';
+    if (c == 'x' || c == 'X') return '*';
+    return 0;
+}
 
-
- 
-
-
-
-
-
-
-__attribute__((used))
-void calc_main(void) {
+int main(void) {
     const char title[] = "Calculator";
-     
+    long win = syscall(FX_SYS_WIN_CREATE, title, (long)strlen(title), (long)WIN_W, (long)(WIN_H + TITLEBAR_H));
+    if (win < 0) { printf("[calc] cannot create window\n"); return 1; }
 
-
-
-
-
-    #define WIN_TITLEBAR_H 28u
-    int64_t win_id = sys_win_create(title, (uint32_t)u64_strlen(title), WIN_W, WIN_H + WIN_TITLEBAR_H);
-    if (win_id < 0) sys_exit(1);
-
-    if (sys_win_get_rect((int)win_id, &g_rect) < 0) sys_exit(1);
-    if (sys_get_framebuffer(&g_fb) < 0) sys_exit(1);
+    if (syscall(FX_SYS_WIN_GET_RECT, win, &g_rect) < 0) return 1;
+    if (syscall(FX_SYS_GET_FRAMEBUFFER, &g_fb) < 0 || g_fb.mode != 1 || g_fb.bpp != 32) {
+        printf("[calc] need a 32-bit linear framebuffer\n");
+        return 1;
+    }
 
     calc_reset();
-    draw_all(-1, -1);
-
-    sc_input_t in;
+    int hover = -1, pressed = -1;
     bool prev_lmb = false;
-    int  active_col = -1;
-
-     
-
-
-
-
-
-
-
-    int32_t last_rx = g_rect.x, last_ry = g_rect.y;
+    int32_t last_x = g_rect.x, last_y = g_rect.y;
+    uint32_t last_gen = g_rect.redraw_gen;
+    draw_all(hover, pressed);
 
     for (;;) {
-         
-
-
-
-        if (sys_win_get_rect((int)win_id, &g_rect) < 0) {
-             
-            sys_exit(0);
+        if (syscall(FX_SYS_WIN_GET_RECT, win, &g_rect) < 0) break;                           
+        bool dirty = false;
+        if (g_rect.x != last_x || g_rect.y != last_y || g_rect.redraw_gen != last_gen) {
+            last_x = g_rect.x; last_y = g_rect.y; last_gen = g_rect.redraw_gen;
+            dirty = true;                                                                             
         }
 
-        if (g_rect.x != last_rx || g_rect.y != last_ry) {
-             
-
-
-            last_rx = g_rect.x;
-            last_ry = g_rect.y;
-            draw_all(-1, -1);
+                                                                            
+        for (int n = 0; n < 8; n++) {
+            char ch = 0;
+            if (syscall(FX_SYS_KBD_READ_CHAR, &ch) != 1) break;
+            char k = map_key(ch);
+            if (k) { press(k); dirty = true; }
         }
 
-        if (sys_input_poll(&in) < 0) { sys_yield(); continue; }
+                   
+        fx_input_t in;
+        if (syscall(FX_SYS_INPUT_POLL, &in) == 0) {
+            int lx = in.x - g_rect.x, ly = in.y - g_rect.y;
+            bool inside = lx >= 0 && ly >= 0 && lx < WIN_W && ly < WIN_H;
+            bool lmb = (in.buttons & 1) != 0;
 
-        int32_t lx = in.x - g_rect.x;
-        int32_t ly = in.y - g_rect.y;
-        bool inside = lx >= 0 && ly >= 0 && (uint32_t)lx < g_rect.w && (uint32_t)ly < g_rect.h;
-        bool lmb = (in.buttons & 0x01) != 0;
-        bool click_edge = lmb && !prev_lmb;    
+            int h = inside ? hit_test(lx, ly) : -1;
+            if (h != hover) { hover = h; dirty = true; }
 
-        if (inside && click_edge) {
-            for (int row = 0; row < GRID_ROWS && active_col < 0; row++) {
-                for (int col = 0; col < GRID_COLS; col++) {
-                    if (!BTN_GRID[row][col].active) continue;
-                    int32_t bx, by; uint32_t bw, bh;
-                    btn_rect(col, row, &bx, &by, &bw, &bh);
-                    if (lx >= bx && ly >= by && lx < bx + (int32_t)bw && ly < by + (int32_t)bh) {
-                        active_col = col;
-                        calc_press(BTN_GRID[row][col].label);
-                        draw_all(col, row);
-                        break;
-                    }
-                }
+            if (lmb && !prev_lmb && h >= 0) {                                         
+                pressed = h;
+                press(BTNS[h].key);
+                dirty = true;
+            } else if (!lmb && pressed >= 0) {
+                pressed = -1;
+                dirty = true;
             }
-        } else if (!lmb && active_col >= 0) {
-             
-            draw_all(-1, -1);
-            active_col = -1;
+            prev_lmb = lmb;
         }
 
-        prev_lmb = lmb;
-        sys_yield();
+        if (dirty) draw_all(hover, pressed);
+        usleep(10000);                                                                             
     }
+    return 0;
 }
-
- 
-
-
-
-
-
-__asm__(
-    ".global _start\n"
-    "_start:\n"
-    "    call calc_main\n"
-    "    mov $60, %rax\n"    
-    "    xor %rdi, %rdi\n"
-    "    syscall\n"
-    "1:  jmp 1b\n"
-);

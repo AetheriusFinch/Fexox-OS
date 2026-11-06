@@ -18,19 +18,23 @@ Build Order
 
 Run the following scripts from the repository root, in this order:
 
-1. ./Compile.sh
+1. ./build_musl.sh
+
+   Builds the musl C library required by the calculator and MuslTest applications. It creates Resources/musl/out with the headers, static library, and startup objects. Run this before Compile.sh.
+
+2. ./Compile.sh
 
    Compiles and links the kernel, user applications, and UEFI loader. It creates build/kernel.bin, build/bootloader.efi, and the user application binaries. When mtools is available, it also creates build/esp.img and build/data.img for QEMU VirtIO testing.
 
-2. ./build_bios.sh
+3. ./build_bios.sh
 
    Builds the legacy BIOS boot stages. It creates build/bios/stage1.bin and build/bios/stage2.bin. The first stage must fit within the 446-byte MBR boot-code area, and the second stage must fit within 40 KiB.
 
-3. ./make_usb_image.sh
+4. ./make_usb_image.sh
 
    Creates build/usb.img, a FAT32 superfloppy image without an MBR or a partition table. This image contains the UEFI loader, kernel, and available UI and application files. It is an intermediate USB image and is not the universal BIOS and UEFI image.
 
-4. ./make_bios_image.sh
+5. ./make_bios_image.sh
 
    Packages the BIOS boot stages, UEFI loader, kernel, and available UI and application files into build/usb_bios.img. This step requires the outputs from the previous scripts.
 

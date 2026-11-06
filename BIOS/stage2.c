@@ -210,9 +210,11 @@ static void edid_native(u32 *w, u32 *h) {
     if ((r.eax & 0xFFFFu) != 0x004F) return;
     static const u8 hdr[8] = { 0, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0 };
     for (int i = 0; i < 8; i++) if (ed[i] != hdr[i]) return;
+    { u8 sum = 0; for (int i = 0; i < 128; i++) sum = (u8)(sum + ed[i]); if (sum != 0) return; }
     if (!(ed[54] | ed[55])) return;                        
     *w = ((u32)(ed[58] & 0xF0) << 4) | ed[56];
     *h = ((u32)(ed[61] & 0xF0) << 4) | ed[59];
+    if (*w < 640 || *h < 480 || *w > 4096 || *h > 4096) *w = *h = 0;
 }
 
  

@@ -353,14 +353,22 @@ static int vbe_pick(const vbe_mode_t *m, int n, u32 want_w, u32 want_h, u32 nat_
     }
      
     static const u32 EXACT_WANT = 0x40000000u, EXACT_NAT = 0x20000000u;
+    static const u32 BELOW_NAT  = 0x10000000u, SAFE_BONUS = 0x01000000u;
     u32 score[128];
     for (int k = 0; k < cnt; k++) {
         const vbe_mode_t *v = &m[order[k]];
         u32 area = (u32)v->w * v->h;
         u32 s = 0;
-        if (want_w && v->w == want_w && v->h == want_h) s = EXACT_WANT;
-        else if (nat_w && v->w == nat_w && v->h == nat_h) s = EXACT_NAT;
-        else if (v->w <= 1920 && v->h <= 1200) s = area >> 4;
+        if (want_w && v->w == want_w && v->h == want_h)       s = EXACT_WANT;
+        else if (nat_w && v->w == nat_w && v->h == nat_h)     s = EXACT_NAT;
+        else if (nat_w) {
+                                                                                                    
+            if (v->w <= nat_w && v->h <= nat_h) s = BELOW_NAT + (area >> 4);
+        } else {
+                                                                              
+            if (v->w <= 1280 && v->h <= 1024)       s = SAFE_BONUS + (area >> 4);
+            else if (v->w <= 1920 && v->h <= 1200)  s = area >> 4;
+        }
         score[k] = s;
     }
     int best = -1;
