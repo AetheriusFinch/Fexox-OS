@@ -7,6 +7,7 @@ Fexox OS исходный код / Source Code
 -Архитектура x86_64 (64 bit)
 -ФС: FAT32 (В будущем будет заменена на собственную более современную)
 -Планировщик задач: CFS-подобный (В будущем будет заменен на кастомный)
--Стадия разработки: Alpha1
+-library c: Musl (usermode), klibc (kernel mode)
+-Стадия разработки: Alpha2
 
-About Developer: известен под ником/псевдонимом на Reddit (u/BreakfastKitchen6249), (Aetherius Finch)
+About Developer: известен под ником/псевдонимом на Reddit (u/BreakfastKitchen6249), (Aetherius Finch). !ИСПОЛЬЗУЕТСЯ БИБЛИОТЕКА LIBC MUSL ПОД РАЗРЕШИТЕЛЬНОЙ ЛИЦЕНЗИЕЙ MIT, АВТОР БИБЛИОТЕКИ: Rich Felker!
