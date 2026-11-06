@@ -369,12 +369,12 @@ void usb_hid_set_int_ep(uint8_t addr, uint8_t iface, uint8_t ep_addr, uint16_t m
     for (int i = 0; i < g_hid_count; i++) {
         usb_hid_dev_t *d = &g_hid[i];
         if (!d->used || d->addr != addr || d->iface_num != iface) continue;
-        if (d->protocol != USB_HID_PROTO_KEYBOARD || d->int_ep != 0) return;
+        if (d->int_ep != 0) return;
         d->int_ep    = ep_addr;
         d->int_maxp  = maxp ? maxp : 8;
         d->int_toggle = 0;
         d->use_int   = (d->hcd && d->hcd->ops && d->hcd->ops->int_in_poll) ? true : false;
-        dbg_puts("[HID] kbd interrupt-IN ep=0x"); dbg_hex64(ep_addr);
+        dbg_puts(d->protocol == USB_HID_PROTO_MOUSE ? "[HID] mouse interrupt-IN ep=0x" : "[HID] kbd interrupt-IN ep=0x"); dbg_hex64(ep_addr);
         dbg_puts(" maxp="); dbg_dec64(d->int_maxp);
         dbg_puts(d->use_int ? " -> polling via interrupt-IN\n" : " (HCD has no int_in_poll, GET_REPORT)\n");
         return;
@@ -470,8 +470,9 @@ void usb_hid_poll_all(void) {
         memset(report, 0, sizeof(report));
 
          
-        if (d->protocol == USB_HID_PROTO_KEYBOARD && d->use_int) {
-            for (int burst = 0; burst < 4; burst++) {    
+        if (d->use_int) {
+            const bool is_mouse = (d->protocol == USB_HID_PROTO_MOUSE);
+            for (int burst = 0; burst < (is_mouse ? 8 : 4); burst++) {    
                 memset(report, 0, sizeof(report));
                 uint32_t want = d->int_maxp < 8 ? d->int_maxp : 8;
                 int n = d->hcd->ops->int_in_poll(d->hcd, d->addr, d->speed, d->int_ep,
@@ -483,9 +484,10 @@ void usb_hid_poll_all(void) {
                     d->polls_ok++;
                     if (!d->logged_first) {
                         d->logged_first = true;
-                        DBG_VAL("HID", "first keyboard report via interrupt-IN, addr", d->addr);
+                        DBG_VAL("HID", "first report via interrupt-IN, addr", d->addr);
                     }
-                    usb_hid_handle_kbd_report(d, report);
+                    if (is_mouse) usb_hid_handle_mouse_report(d, report);
+                    else          usb_hid_handle_kbd_report(d, report);
                     continue;                          
                 }
                 if (n == 0) break;                     
@@ -493,9 +495,9 @@ void usb_hid_poll_all(void) {
                 d->total_fail++;
                 if (++d->int_err >= 5) {
                     d->use_int = false;                
-                    DBG_MSG("HID", "keyboard interrupt-IN not working -> falling back to GET_REPORT");
+                    DBG_MSG("HID", "interrupt-IN not working -> falling back to GET_REPORT");
                 }
-                if (d->total_fail <= 3) DBG_RC("HID", "kbd interrupt-IN error rc", n);
+                if (d->total_fail <= 3) DBG_RC("HID", "interrupt-IN error rc", n);
                 break;
             }
              
@@ -514,7 +516,7 @@ void usb_hid_poll_all(void) {
             static bool s_hybrid_logged = false;
             if (!s_hybrid_logged) {
                 s_hybrid_logged = true;
-                DBG_MSG("HID", "kbd: no interrupt-IN reports yet -> also polling GET_REPORT (hybrid)");
+                DBG_MSG("HID", "no interrupt-IN reports yet -> also polling GET_REPORT (hybrid)");
             }
         }
 

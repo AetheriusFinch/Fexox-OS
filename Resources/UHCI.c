@@ -453,10 +453,75 @@ static int uhci_bulk_transfer(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
     return rc;
 }
 
+                                                                             
+                                                                              
+                                                
+static int uhci_int_in_poll_impl(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                                 uint8_t ep_addr, uint16_t max_packet,
+                                 void *data, uint32_t len, uint8_t *toggle_inout,
+                                 uint32_t timeout_us) {
+    uhci_ctrl_t *c = (uhci_ctrl_t *)hcd->priv;
+    if (!(ep_addr & 0x80u) || !data || len == 0) return -1;
+    if (max_packet == 0) max_packet = 8;
+    if (len > max_packet) len = max_packet;
+    if (len > 64) len = 64;
+
+    uint8_t  toggle = toggle_inout ? (uint8_t)(*toggle_inout & 1u) : 0;
+    uint32_t base_flags = (speed == USB_SPEED_LOW ? UHCI_TD_LS : 0) |
+                          (3u << UHCI_TD_CERR_SHIFT) | UHCI_TD_STATUS_ACTIVE;
+    uhci_td_t *td = &c->td_pool[0];
+    uhci_td_fill(td, UHCI_PID_IN, dev_addr, (uint8_t)(ep_addr & 0x0Fu), toggle,
+                 (uint16_t)len, c->bulk_buf_phys, base_flags, true);
+    td->link = UHCI_PTR_TERMINATE;
+    __asm__ volatile ("" ::: "memory");
+    c->ctrl_qh->element = (uint32_t)c->td_pool_phys;
+
+    uint64_t per_ms = usb_tsc_per_ms();
+    if (!per_ms) per_ms = 3000000ULL;
+    if (timeout_us < 2500u) timeout_us = 2500u;
+    uint64_t deadline = uhci_rdtsc() + per_ms * timeout_us / 1000u;
+
+    int result = 0;                                                       
+    for (;;) {
+        uint32_t st = td->status;
+        if (!(st & UHCI_TD_STATUS_ACTIVE)) {
+            result = (st & UHCI_TD_STATUS_ANY_ERROR) ? -2 : 1;
+            break;
+        }
+        if (uhci_rdtsc() > deadline) break;
+        __asm__ volatile ("pause" ::: "memory");
+    }
+    c->ctrl_qh->element = UHCI_PTR_TERMINATE;                  
+    if (result == 0) {                                                             
+        uint32_t st = td->status;
+        if (!(st & UHCI_TD_STATUS_ACTIVE))
+            result = (st & UHCI_TD_STATUS_ANY_ERROR) ? -2 : 1;
+    }
+    if (result <= 0) return result;
+
+    uint32_t got = (td->status + 1u) & 0x7FFu;                                         
+    if (got > len) got = len;
+    memcpy(data, c->bulk_buf, got);
+    if (toggle_inout) *toggle_inout = (uint8_t)(toggle ^ 1u);
+    return (int)got;
+}
+
+static int uhci_int_in_poll(usb_hcd_t *hcd, uint8_t dev_addr, uint8_t speed,
+                            uint8_t ep_addr, uint16_t max_packet,
+                            void *data, uint32_t len, uint8_t *toggle_inout,
+                            uint32_t timeout_us) {
+    uint64_t fl = usb_irq_save();
+    int rc = uhci_int_in_poll_impl(hcd, dev_addr, speed, ep_addr, max_packet,
+                                   data, len, toggle_inout, timeout_us);
+    usb_irq_restore(fl);
+    return rc;
+}
+
 static const usb_hcd_ops_t g_uhci_ops = {
     .control_transfer = uhci_control_transfer,
     .port_reset       = uhci_port_reset,
     .bulk_transfer    = uhci_bulk_transfer,
+    .int_in_poll      = uhci_int_in_poll,
     .supports_hubs    = true,
 };
 
@@ -579,7 +644,7 @@ void uhci_pci_scan(void) {
                  
                 uint32_t bar4 = pci_read32((uint8_t)bus, dev, fn, 0x20);
                 if (!(bar4 & 1)) {
-                    DBG_MSG("UHCI", "BAR4 is not I/O space — skip (не соответствует спеке)");
+                    DBG_MSG("UHCI", "BAR4 is not I/O space — skip");
                     continue;
                 }
                 uint16_t io_base = (uint16_t)(bar4 & 0xFFFCu);
