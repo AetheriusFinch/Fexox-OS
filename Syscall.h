@@ -22,9 +22,9 @@
 #define SYS_MPROTECT      10
 #define SYS_MUNMAP        11
 #define SYS_BRK           12
-#define SYS_GETPID        20
+#define SYS_GETPID        39                                            
 #define SYS_SCHED_YIELD   24
-#define SYS_GETPID2       39    
+#define SYS_GETPID2       SYS_GETPID
 #define SYS_CLONE         56
 #define SYS_FORK          57
 #define SYS_EXECVE        59
@@ -37,10 +37,11 @@
 #define SYS_RMDIR         84
 #define SYS_UNLINK        87
 #define SYS_READDIR       89
-#define SYS_FTRUNCATE     91
+#define SYS_FTRUNCATE     77                                            
 #define SYS_ARCH_PRCTL    158
 #define SYS_GET_FRAMEBUFFER 500   
-#define SYS_PIPE          502
+#define SYS_PIPE          22                   
+#define SYS_PIPE_LEGACY   502                                         
 #define SYS_SHM_GET       503
 #define SYS_SHM_AT        504
 #define SYS_SHM_DETACH    505
@@ -83,7 +84,173 @@
 #define SYS_GETDENTS64    217   
 #define SYS_CLOCK_GETTIME 228   
 #define SYS_GETRANDOM     318   
-#define SYS_WRITEV        506   
+#define SYS_WRITEV        20                   
+#define SYS_WRITEV_LEGACY 506                                         
+
+                                                                             
+#define SYS_STAT_FEX      510                                                   
+#define SYS_FSTAT_FEX     511
+#define SYS_LSTAT         6
+#define SYS_POLL          7
+#define SYS_RT_SIGACTION  13
+#define SYS_RT_SIGPROCMASK 14
+#define SYS_IOCTL         16
+#define SYS_UMASK         95
+#define SYS_GETRLIMIT     97
+#define SYS_READLINK      89                                                               
+#define SYS_FSYNC         74
+#define SYS_FDATASYNC     75
+#define SYS_FCHDIR        81
+#define SYS_CHMOD         90
+#define SYS_FCHMOD        91
+#define SYS_CHOWN         92
+#define SYS_FCHOWN        93
+#define SYS_LCHOWN        94
+#define SYS_GETUID        102
+#define SYS_GETGID        104
+#define SYS_GETEUID       107
+#define SYS_GETEGID       108
+#define SYS_SETPGID       109
+#define SYS_GETPGRP       111
+#define SYS_SETSID        112
+#define SYS_GETPGID       121
+#define SYS_GETSID        124
+#define SYS_SIGALTSTACK   131
+#define SYS_PRCTL         157
+#define SYS_SYNC          162
+#define SYS_KILL          62
+#define SYS_FUTEX         202
+#define SYS_TKILL         200
+#define SYS_SET_TID_ADDRESS 218
+#define SYS_FADVISE64     221
+#define SYS_TGKILL        234
+#define SYS_OPENAT        257
+#define SYS_MKDIRAT       258
+#define SYS_NEWFSTATAT    262
+#define SYS_UNLINKAT      263
+#define SYS_RENAMEAT      264
+#define SYS_READLINKAT    267
+#define SYS_FCHMODAT      268
+#define SYS_FACCESSAT     269
+#define SYS_DUP3          292
+#define SYS_PIPE2         293
+#define SYS_PRLIMIT64     302
+#define SYS_RENAMEAT2     316
+#define SYS_FACCESSAT2    439
+
+#define AT_FDCWD            (-100)
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR        0x200
+#define AT_EMPTY_PATH       0x1000
+
+                                                                                    
+#define LX_O_EXCL      0x0080
+#define LX_O_NONBLOCK  0x0800
+#define LX_O_DIRECTORY 0x10000
+#define LX_O_CLOEXEC   0x80000
+
+#define SC_S_IFMT   0170000
+#define SC_S_IFDIR  0040000
+#define SC_S_IFCHR  0020000
+#define SC_S_IFREG  0100000
+#define SC_S_IFIFO  0010000
+
+                                                                 
+typedef struct {
+    uint64_t st_dev, st_ino, st_nlink;
+    uint32_t st_mode, st_uid, st_gid, __pad0;
+    uint64_t st_rdev;
+    int64_t  st_size, st_blksize, st_blocks;
+    int64_t  st_atime_sec, st_atime_nsec;
+    int64_t  st_mtime_sec, st_mtime_nsec;
+    int64_t  st_ctime_sec, st_ctime_nsec;
+    int64_t  __unused[3];
+} sc_kstat_t;
+
+                    
+#define SC_TCGETS     0x5401
+#define SC_TCSETS     0x5402
+#define SC_TCSETSW    0x5403
+#define SC_TCSETSF    0x5404
+#define SC_TIOCGPGRP  0x540F
+#define SC_TIOCSPGRP  0x5410
+#define SC_TIOCGWINSZ 0x5413
+#define SC_TIOCSWINSZ 0x5414
+#define SC_FIONREAD   0x541B
+#define SC_FIONBIO    0x5421
+#define SC_FIONCLEX   0x5450
+#define SC_FIOCLEX    0x5451
+
+          
+#define SC_POLLIN   0x001
+#define SC_POLLOUT  0x004
+#define SC_POLLERR  0x008
+#define SC_POLLHUP  0x010
+#define SC_POLLNVAL 0x020
+typedef struct { int32_t fd; int16_t events; int16_t revents; } sc_pollfd_t;
+
+                                
+#define SC_NSIG     65
+#define SC_SIGHUP   1
+#define SC_SIGINT   2
+#define SC_SIGQUIT  3
+#define SC_SIGKILL  9
+#define SC_SIGUSR1  10
+#define SC_SIGSEGV  11
+#define SC_SIGUSR2  12
+#define SC_SIGPIPE  13
+#define SC_SIGALRM  14
+#define SC_SIGTERM  15
+#define SC_SIGCHLD  17
+#define SC_SIGCONT  18
+#define SC_SIGSTOP  19
+#define SC_SIGURG   23
+#define SC_SIGWINCH 28
+#define SC_SIG_DFL  0ULL
+#define SC_SIG_IGN  1ULL
+#define SC_SIG_BLOCK   0
+#define SC_SIG_UNBLOCK 1
+#define SC_SIG_SETMASK 2
+typedef struct { uint64_t handler, flags, restorer, mask; } sc_ksigaction_t;
+typedef struct { uint64_t ss_sp; int32_t ss_flags; int32_t pad; uint64_t ss_size; } sc_stack_t;
+
+           
+#define SC_FUTEX_WAIT          0
+#define SC_FUTEX_WAKE          1
+#define SC_FUTEX_REQUEUE       3
+#define SC_FUTEX_CMP_REQUEUE   4
+#define SC_FUTEX_WAIT_BITSET   9
+#define SC_FUTEX_WAKE_BITSET   10
+
+            
+#define SC_RLIMIT_CPU    0
+#define SC_RLIMIT_DATA   2
+#define SC_RLIMIT_STACK  3
+#define SC_RLIMIT_NOFILE 7
+#define SC_RLIMIT_AS     9
+#define SC_RLIM_INFINITY (~0ULL)
+typedef struct { uint64_t rlim_cur, rlim_max; } sc_rlimit_t;
+
+                       
+#define CLONE_SIGHAND  0x00000800
+#define CLONE_VFORK    0x00004000
+#define CLONE_SETTLS   0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_CHILD_SETTID   0x01000000
+
+                                                                              
+#define SYS_VFORK         58                                                    
+#define SYS_GETRUSAGE     98
+#define SYS_TIMES         100
+#define SYS_GETPPID       110
+#define SYS_SETTIMEOFDAY  164
+#define SYS_GETTID        186
+#define SYS_TIME          201
+#define SYS_CLOCK_SETTIME 227
+#define SYS_CLOCK_GETRES  229
+#define SYS_CLOCK_NANOSLEEP 230
+#define SYS_EXIT_GROUP    231
 
  
 
@@ -95,6 +262,7 @@
 #define EIO       5    
 #define EBADF     9    
 #define ECHILD    10   
+#define EAGAIN    11   
 #define ENOMEM    12   
 #define EACCES    13   
 #define EFAULT    14   
@@ -268,6 +436,25 @@ typedef struct { int64_t tv_sec; int64_t tv_usec; } sc_timeval_t;
 #define SC_CLOCK_MONOTONIC_RAW       4
 #define SC_CLOCK_BOOTTIME            7
 
+#define SC_TIMER_ABSTIME             1                              
+#define SC_WNOHANG                   1                      
+#define SC_TICKS_PER_SEC             100                                           
+
+#define SC_RUSAGE_SELF       0
+#define SC_RUSAGE_CHILDREN   (-1)
+#define SC_RUSAGE_THREAD     1
+
+             
+typedef struct { int64_t tms_utime, tms_stime, tms_cutime, tms_cstime; } sc_tms_t;
+
+                                                                                
+typedef struct {
+    sc_timeval_t ru_utime;
+    sc_timeval_t ru_stime;
+    int64_t ru_maxrss, ru_ixrss, ru_idrss, ru_isrss, ru_minflt, ru_majflt, ru_nswap;
+    int64_t ru_inblock, ru_oublock, ru_msgsnd, ru_msgrcv, ru_nsignals, ru_nvcsw, ru_nivcsw;
+} sc_rusage_t;
+
  
 #define SC_UTS_LEN 65
 typedef struct {
@@ -339,7 +526,7 @@ void syscall_init(void);
 
 int64_t syscall_dispatch(uint64_t nr,
                          uint64_t a1, uint64_t a2, uint64_t a3,
-                         uint64_t a4, uint64_t a5);
+                         uint64_t a4, uint64_t a5, uint64_t a6);
 
  
 

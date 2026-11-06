@@ -92,6 +92,18 @@ typedef struct task {
      
     uint64_t        total_runtime;   
     uint64_t        switches;        
+
+                                                               
+                                                                           
+                                                                                  
+                                                                                  
+    uint64_t        fs_base;
+    uint8_t         fpu_valid;
+    uint8_t         fpu_raw[528];
+
+                                                                                     
+                                                                                       
+    uint64_t        wake_tsc;
 } task_t;
 
  
@@ -133,5 +145,21 @@ uint64_t sched_tick(uint64_t frame_rsp);
 
  
 uint32_t sched_task_count(void);
+
+                                      
+                                                                                   
+int sched_kill(uint32_t tid);
+
+                                              
+bool sched_task_alive(uint32_t tid);
+
+                                                                          
+                                                                                  
+void sched_arch_fork_state(task_t *child);
+
+                                                                                     
+                                                                                    
+                                                                                       
+int sched_pml4_ref(uint64_t pml4_phys);
 
 #endif  

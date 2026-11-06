@@ -247,10 +247,15 @@ static int panic_append_ctx(char *dst, int pos, const cpu_frame_t *f) {
 
 
 
+                                                                                    
+extern int vmm_handle_page_fault(uint64_t fault_va, uint64_t err_code);
+
 __attribute__((used))
 static void page_fault_handler_c(uint8_t num, uint64_t err, cpu_frame_t *frame) {
     (void)num;
     uint64_t cr2 = read_cr2();
+                                                                                                  
+    if (vmm_handle_page_fault(cr2, err)) return;
     char addr_buf[20], err_buf[20], rip_buf[20], cs_buf[20], rsp_buf[20];
     format_hex(cr2, addr_buf);
     format_hex(err, err_buf);
@@ -654,7 +659,7 @@ ISR_STUB_IRQ(irq_12, 0x2C, irq_dispatch)
 ISR_STUB_IRQ(irq_13, 0x2D, irq_dispatch)
 ISR_STUB_IRQ(irq_14, 0x2E, irq_dispatch)
 ISR_STUB_IRQ(irq_15, 0x2F, irq_dispatch)
-/* NVMe: 16 vectors 0x50..0x5F (MSI-X, one per queue) */
+                                                        
 ISR_STUB_IRQ(irq_nvme_0, 0x50, irq_dispatch)
 ISR_STUB_IRQ(irq_nvme_1, 0x51, irq_dispatch)
 ISR_STUB_IRQ(irq_nvme_2, 0x52, irq_dispatch)

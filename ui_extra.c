@@ -135,6 +135,11 @@ int ui_extra_init(void) {
 }
 
 void ui_set_mouse_pos(int32_t x, int32_t y) {
+    int32_t mw = (int32_t)fb_width(), mh = (int32_t)fb_height();
+    if (mw > 0 && x > mw - 1) x = mw - 1;
+    if (mh > 0 && y > mh - 1) y = mh - 1;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
     g_mouse_x = x;
     g_mouse_y = y;
 }

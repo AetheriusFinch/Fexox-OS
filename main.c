@@ -671,42 +671,63 @@ static inline uint64_t rdmsr(uint32_t msr) {
 
 __attribute__((naked))
 static void syscall_entry_stub(void) {
-     
-
-
-
-
-
-
-
-
-
-
-
-
-
+                                                                              
+                                                                                
+                                                                              
+                                                                          
+      
+                                                                         
+                                                 
+                                                        
+                                                                               
     __asm__ volatile (
-        "mov %%rsp, fexox_os_percpu(%%rip)\n\t"         
-        "mov fexox_os_percpu+8(%%rip), %%rsp\n\t"       
+        "mov %%rsp, fexox_os_percpu(%%rip)\n\t"
+        "mov fexox_os_percpu+8(%%rip), %%rsp\n\t"
+        "cld\n\t"
 
-        "push %%r11\n\t"                    
-        "push %%rcx\n\t"                    
-        "push fexox_os_percpu(%%rip)\n\t"      
+        "push %%r11\n\t"
+        "push %%rcx\n\t"
+        "push fexox_os_percpu(%%rip)\n\t"
+        "push %%rbx\n\t"
+        "push %%rbp\n\t"
+        "push %%r12\n\t"
+        "push %%r13\n\t"
+        "push %%r14\n\t"
+        "push %%r15\n\t"
+        "push %%r10\n\t"
+        "push %%r9\n\t"
+        "push %%r8\n\t"
+        "push %%rdx\n\t"
+        "push %%rsi\n\t"
+        "push %%rdi\n\t"
 
-        "push %%rdi\n\t"                    
-        "mov %%rax, %%rdi\n\t"              
-        "mov %%r8,  %%r9\n\t"               
-        "mov %%r10, %%r8\n\t"               
-        "mov %%rdx, %%rcx\n\t"              
-        "mov %%rsi, %%rdx\n\t"              
-        "pop %%rsi\n\t"                     
+        "push %%r9\n\t"                                                                       
+                                                                        
+        "mov %%r8,  %%r9\n\t"
+        "mov %%r10, %%r8\n\t"
+        "mov %%rdx, %%rcx\n\t"
+        "mov %%rsi, %%rdx\n\t"
+        "mov %%rdi, %%rsi\n\t"
+        "mov %%rax, %%rdi\n\t"
 
         "call syscall_dispatch\n\t"
+        "add $8, %%rsp\n\t"
 
-        "pop %%r10\n\t"                     
-        "pop %%rcx\n\t"                     
-        "pop %%r11\n\t"                     
-        "mov %%r10, %%rsp\n\t"
+        "pop %%rdi\n\t"
+        "pop %%rsi\n\t"
+        "pop %%rdx\n\t"
+        "pop %%r8\n\t"
+        "pop %%r9\n\t"
+        "pop %%r10\n\t"
+        "pop %%r15\n\t"
+        "pop %%r14\n\t"
+        "pop %%r13\n\t"
+        "pop %%r12\n\t"
+        "pop %%rbp\n\t"
+        "pop %%rbx\n\t"
+        "mov 8(%%rsp),  %%rcx\n\t"                         
+        "mov 16(%%rsp), %%r11\n\t"                         
+        "mov (%%rsp),   %%rsp\n\t"                                                   
         "sysretq\n\t"
         ::: "memory"
     );
@@ -758,6 +779,24 @@ void syscall_set_kstack(uint64_t rsp0) {
 
 static void usermode_init(void) {
     DBG_MSG("KR", "usermode_init: setup GDT+TSS+SYSCALL");
+
+                                                                              
+                                                                         
+                                        
+    {
+        uint64_t cr0, cr4;
+        __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+        cr0 &= ~(1ULL << 2);                           
+        cr0 |=  (1ULL << 1);                           
+        cr0 &= ~(1ULL << 3);                           
+        __asm__ volatile ("mov %0, %%cr0" :: "r"(cr0) : "memory");
+        __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1ULL << 9) | (1ULL << 10);                            
+        __asm__ volatile ("mov %0, %%cr4" :: "r"(cr4) : "memory");
+        __asm__ volatile ("fninit");
+        uint32_t mxcsr = 0x1F80;
+        __asm__ volatile ("ldmxcsr %0" :: "m"(mxcsr));
+    }
 
      
     uint64_t kstack_top = (uint64_t)(uintptr_t)

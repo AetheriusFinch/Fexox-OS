@@ -144,6 +144,7 @@ static pmm_t g_pmm;
 
 
 static bool g_pmm_low4g_only = false;
+static size_t g_pmm_ram_frames = 0;                                                     
 
 #define WORD_IDX(idx) ((idx) >> 6)
 #define BIT_IDX(idx)  ((idx) & 63)
@@ -251,6 +252,8 @@ int pmm_init_from_efi(const efi_memory_desc_t *map, size_t map_size, size_t desc
         if (d->type == EFI_USABLE) {
             size_t start_idx = d->physical_start >> PAGE_SHIFT;
             size_t count = d->num_pages;
+            if (start_idx + count > g_pmm_ram_frames && start_idx + count <= total_frames)
+                g_pmm_ram_frames = start_idx + count;
             if (start_idx + count <= total_frames) {
                 phys_addr_t bm_end = bm_pa + (bm_pages << PAGE_SHIFT);
                 for (size_t p = 0; p < count; p++) {
@@ -740,6 +743,12 @@ phys_addr_t vmm_virt_to_phys(virt_addr_t va) {
 void vmm_activate(void) {
     phys_addr_t cr3_pa = (phys_addr_t)(uintptr_t)g_vmm.kernel_pml4;
     vmm_load_cr3(cr3_pa);
+    {                                                                                            
+        uint64_t cr0;
+        __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+        cr0 |= (1ULL << 16);
+        __asm__ volatile ("mov %0, %%cr0" :: "r"(cr0) : "memory");
+    }
     g_vmm.kernel_pml4 = (pte_t *)phys_to_kvirt(cr3_pa);
     g_pmm.words = (uint64_t *)phys_to_kvirt(g_pmm.bitmap_phys);
 }
@@ -1095,6 +1104,7 @@ int kmalloc_init(void) {
 
 
 
+static void cow_init(void);
 static void boot_delay_spin(void) {
     for (volatile uint64_t i = 0; i < 150000000ULL; i++) { }
 }
@@ -1146,6 +1156,7 @@ int mem_control_init(const void *efi_map, uint64_t map_size, uint64_t desc_size,
      
     mc_beacon(fb_phys, fb_w, fb_h, fb_pitch, fb_mode, 3, 0x00FF0000u, true);   
 
+    cow_init();                                                                            
     DBG_MSG("KR", "12e mem done");
     return 0;
 }
@@ -1218,40 +1229,283 @@ void vmm_free_user_pml4(phys_addr_t pml4_phys) {
 
 
 
+                                                      
+int vmm_map_user_in_ex(phys_addr_t pml4_phys, virt_addr_t va, phys_addr_t pa, bool rw, bool exec, int kind);
 int vmm_map_user_in(phys_addr_t pml4_phys, virt_addr_t va, phys_addr_t pa, bool rw, bool exec) {
-    if (va > USER_VIRT_LIMIT) return -1;
-    if ((va & ~PAGE_MASK) || (pa & ~PAGE_MASK)) return -1;
-    if (pml4_phys == (phys_addr_t)-1 || !pa_in_ram(pml4_phys)) return -1;
-
-    uint64_t flags = PTE_P | PTE_U;
-    if (rw) flags |= PTE_W;
-    if (!exec) flags |= PTE_NX;
-
-    spinlock_acquire(&g_vmm.lock);
-    pte_t *pml4 = (pte_t *)phys_access(pml4_phys);
-    pte_t *entry = vmm_walk_table(pml4, va, true);
-    if (!entry) { spinlock_release(&g_vmm.lock); return -2; }
-    *entry = pte_make(pa, flags);
-     
-
-
-    if (g_vmm.paging_active) cpu_invlpg(va);
-    spinlock_release(&g_vmm.lock);
-    return 0;
+    return vmm_map_user_in_ex(pml4_phys, va, pa, rw, exec, 0);
 }
-
- 
-
-
-
-
-
-
 
 int vmm_map_user(virt_addr_t va, phys_addr_t pa, bool rw, bool exec) {
     uint64_t cur = sched_current_pml4_phys();
     phys_addr_t target = cur ? (phys_addr_t)cur : g_kernel_pml4_phys;
     return vmm_map_user_in(target, va, pa, rw, exec);
+}
+
+
+                                                                         
+                                
+  
+                                           
+                                                                          
+                                                                            
+                                                                              
+                                                                           
+  
+                                                                          
+                                                                            
+#define PTE_COW      (1ULL << 9)
+#define PTE_SHARED   (1ULL << 10)
+#define PTE_FOREIGN  (1ULL << 11)
+
+#define VMM_PAGE_OWNED    0                             
+#define VMM_PAGE_SHARED   1                                             
+#define VMM_PAGE_FOREIGN  2                                 
+
+static uint16_t *g_pg_ref = NULL;
+
+static void cow_init(void) {
+    if (g_pg_ref || g_pmm_ram_frames == 0) return;
+    g_pg_ref = (uint16_t *)kmalloc(g_pmm_ram_frames * sizeof(uint16_t));
+    if (g_pg_ref) kmemset(g_pg_ref, 0, g_pmm_ram_frames * sizeof(uint16_t));
+    else DBG_MSG("VMM", "cow_init: kmalloc failed, fork disabled");
+}
+
+int vmm_cow_ready(void) { return g_pg_ref != NULL; }
+
+static inline bool pg_tracked(phys_addr_t pa) {
+    return g_pg_ref && (pa >> PAGE_SHIFT) < g_pmm_ram_frames;
+}
+static void pg_ref_inc(phys_addr_t pa) {
+    if (!pg_tracked(pa)) return;
+    size_t i = (size_t)(pa >> PAGE_SHIFT);
+    if (g_pg_ref[i] == 0) g_pg_ref[i] = 2;
+    else if (g_pg_ref[i] < 0xFFFF) g_pg_ref[i]++;
+}
+static inline bool pg_is_shared(phys_addr_t pa) {
+    return pg_tracked(pa) && g_pg_ref[pa >> PAGE_SHIFT] > 1;
+}
+                                                                 
+static void pg_put(phys_addr_t pa) {
+    if (!pg_tracked(pa)) { pmm_free_frame(pa); return; }
+    size_t i = (size_t)(pa >> PAGE_SHIFT);
+    if (g_pg_ref[i] > 1) { g_pg_ref[i]--; return; }
+    g_pg_ref[i] = 0;
+    pmm_free_frame(pa);
+}
+                                                                            
+static phys_addr_t vmm_alloc_low_frame(void) {
+    phys_addr_t pa = pmm_alloc_frames_range(1, 1, 0, (4ULL << 30));
+    if (pa == (phys_addr_t)-1) pa = pmm_alloc_frame();
+    return pa;
+}
+
+int vmm_map_user_in_ex(phys_addr_t pml4_phys, virt_addr_t va, phys_addr_t pa, bool rw, bool exec, int kind) {
+    if (va > USER_VIRT_LIMIT) return -1;
+    if ((va & ~PAGE_MASK) || (pa & ~PAGE_MASK)) return -1;
+    if (pml4_phys == (phys_addr_t)-1 || !pa_in_ram(pml4_phys)) return -1;
+    uint64_t flags = PTE_P | PTE_U;
+    if (rw)    flags |= PTE_W;
+    if (!exec) flags |= PTE_NX;
+    if (kind == VMM_PAGE_SHARED)  flags |= PTE_SHARED;
+    if (kind == VMM_PAGE_FOREIGN) flags |= PTE_FOREIGN;
+    spinlock_acquire(&g_vmm.lock);
+    pte_t *pml4 = (pte_t *)phys_access(pml4_phys);
+    pte_t *entry = vmm_walk_table(pml4, va, true);
+    if (!entry) { spinlock_release(&g_vmm.lock); return -2; }
+                                                                            
+    if ((*entry & PTE_P) && !(*entry & PTE_FOREIGN) && (*entry & PTE_ADDR_MASK) != pa)
+        pg_put(*entry & PTE_ADDR_MASK);
+    *entry = pte_make(pa, flags);
+    if (g_vmm.paging_active) cpu_invlpg(va);
+    spinlock_release(&g_vmm.lock);
+    return 0;
+}
+
+int vmm_map_user_ex(virt_addr_t va, phys_addr_t pa, bool rw, bool exec, int kind) {
+    uint64_t cur = sched_current_pml4_phys();
+    phys_addr_t target = cur ? (phys_addr_t)cur : g_kernel_pml4_phys;
+    return vmm_map_user_in_ex(target, va, pa, rw, exec, kind);
+}
+
+static inline phys_addr_t cow_cur_cr3(void) {
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    return (phys_addr_t)(cr3 & PTE_ADDR_MASK);
+}
+
+                                                                
+                                                                      
+int vmm_cow_break_in(phys_addr_t pml4_phys, virt_addr_t va) {
+    va &= PAGE_MASK;
+    if (va > USER_VIRT_LIMIT) return -1;
+    spinlock_acquire(&g_vmm.lock);
+    pte_t *e = vmm_walk_table((pte_t *)phys_access(pml4_phys), va, false);
+    if (!e || !(*e & PTE_P)) { spinlock_release(&g_vmm.lock); return -1; }
+    if (*e & PTE_W)          { spinlock_release(&g_vmm.lock); return 0; }
+    if (!(*e & PTE_COW))     { spinlock_release(&g_vmm.lock); return -1; }
+
+    phys_addr_t old_pa = *e & PTE_ADDR_MASK;
+    if (!pg_is_shared(old_pa)) {
+                                                                  
+        *e = (*e & ~PTE_COW) | PTE_W;
+        cpu_invlpg(va);
+        spinlock_release(&g_vmm.lock);
+        return 0;
+    }
+    phys_addr_t new_pa = vmm_alloc_low_frame();
+    if (new_pa == (phys_addr_t)-1 || !pa_in_ram(new_pa)) {
+        spinlock_release(&g_vmm.lock);
+        return -2;
+    }
+    kmemcpy(phys_access(new_pa), phys_access(old_pa), PAGE_SIZE);
+    uint64_t keep = *e & ~(PTE_ADDR_MASK | PTE_COW);
+    *e = (new_pa & PTE_ADDR_MASK) | keep | PTE_W;
+    pg_put(old_pa);                                                
+    cpu_invlpg(va);
+    spinlock_release(&g_vmm.lock);
+    return 0;
+}
+int vmm_cow_break(virt_addr_t va) { return vmm_cow_break_in(cow_cur_cr3(), va); }
+
+                                                                               
+                                                                             
+                                                                        
+int vmm_handle_page_fault(uint64_t fault_va, uint64_t err_code) {
+    if ((err_code & 0x3) != 0x3) return 0;                                 
+    if (fault_va > USER_VIRT_LIMIT) return 0;
+    return vmm_cow_break(fault_va) == 0 ? 1 : 0;
+}
+
+                                                                                    
+int vmm_cow_prepare_range(virt_addr_t va, uint64_t len) {
+    if (len == 0) return 0;
+    virt_addr_t end = (va + len - 1) & PAGE_MASK;
+    for (virt_addr_t p = va & PAGE_MASK; ; p += PAGE_SIZE) {
+        int r = vmm_cow_break(p);
+        if (r == -2) return -2;
+        if (p >= end) break;
+    }
+    return 0;
+}
+
+                                                                          
+                                           
+int vmm_user_release_page(virt_addr_t va) {
+    va &= PAGE_MASK;
+    if (va > USER_VIRT_LIMIT) return 0;
+    spinlock_acquire(&g_vmm.lock);
+    pte_t *e = vmm_walk_table((pte_t *)phys_access(cow_cur_cr3()), va, false);
+    if (!e || !(*e & PTE_P)) { spinlock_release(&g_vmm.lock); return 0; }
+    pte_t old = *e;
+    *e = 0;
+    cpu_invlpg(va);
+    if (!(old & PTE_FOREIGN)) pg_put(old & PTE_ADDR_MASK);
+    spinlock_release(&g_vmm.lock);
+    return 1;
+}
+
+                                                                      
+                                                                      
+void vmm_destroy_user_space(phys_addr_t pml4_phys) {
+    if (!pml4_phys || pml4_phys == (phys_addr_t)-1) return;
+    spinlock_acquire(&g_vmm.lock);
+    pte_t *p4 = (pte_t *)phys_access(pml4_phys);
+    for (size_t i4 = 0; i4 < 256; i4++) {
+        if (!(p4[i4] & PTE_P)) continue;
+        phys_addr_t p3pa = p4[i4] & PTE_ADDR_MASK;
+        pte_t *p3 = (pte_t *)phys_access(p3pa);
+        for (size_t i3 = 0; i3 < 512; i3++) {
+            if (!(p3[i3] & PTE_P) || (p3[i3] & PTE_PAT)) continue;
+            phys_addr_t p2pa = p3[i3] & PTE_ADDR_MASK;
+            pte_t *p2 = (pte_t *)phys_access(p2pa);
+            for (size_t i2 = 0; i2 < 512; i2++) {
+                if (!(p2[i2] & PTE_P) || (p2[i2] & PTE_PAT)) continue;
+                phys_addr_t p1pa = p2[i2] & PTE_ADDR_MASK;
+                pte_t *p1 = (pte_t *)phys_access(p1pa);
+                for (size_t i1 = 0; i1 < 512; i1++) {
+                    pte_t e = p1[i1];
+                    if ((e & PTE_P) && !(e & PTE_FOREIGN)) pg_put(e & PTE_ADDR_MASK);
+                }
+                pmm_free_frame(p1pa);
+            }
+            pmm_free_frame(p2pa);
+        }
+        pmm_free_frame(p3pa);
+    }
+    spinlock_release(&g_vmm.lock);
+    pmm_free_frame(pml4_phys);
+}
+
+static phys_addr_t vmm_alloc_table_zeroed(void) {
+    phys_addr_t pa = vmm_alloc_low_frame();
+    if (pa == (phys_addr_t)-1 || !pa_in_ram(pa)) return (phys_addr_t)-1;
+    kmemset(phys_access(pa), 0, PAGE_SIZE);
+    return pa;
+}
+
+                                                         
+                                                                            
+                                                                           
+phys_addr_t vmm_fork_user_space(phys_addr_t src_pml4_phys) {
+    if (!g_pg_ref) return (phys_addr_t)-1;
+    phys_addr_t dst_pml4_phys = vmm_create_user_pml4();
+    if (dst_pml4_phys == (phys_addr_t)-1) return (phys_addr_t)-1;
+
+    bool ok = true;
+    spinlock_acquire(&g_vmm.lock);
+    pte_t *s4 = (pte_t *)phys_access(src_pml4_phys);
+    pte_t *d4 = (pte_t *)phys_access(dst_pml4_phys);
+    for (size_t i4 = 0; i4 < 256 && ok; i4++) {
+        if (!(s4[i4] & PTE_P)) continue;
+        pte_t *s3 = (pte_t *)phys_access(s4[i4] & PTE_ADDR_MASK);
+        phys_addr_t d3pa = vmm_alloc_table_zeroed();
+        if (d3pa == (phys_addr_t)-1) { ok = false; break; }
+        d4[i4] = pte_make(d3pa, PTE_P | PTE_W | PTE_U);
+        pte_t *d3 = (pte_t *)phys_access(d3pa);
+        for (size_t i3 = 0; i3 < 512 && ok; i3++) {
+            if (!(s3[i3] & PTE_P)) continue;
+            if (s3[i3] & PTE_PAT) { ok = false; break; }                                                
+            pte_t *s2 = (pte_t *)phys_access(s3[i3] & PTE_ADDR_MASK);
+            phys_addr_t d2pa = vmm_alloc_table_zeroed();
+            if (d2pa == (phys_addr_t)-1) { ok = false; break; }
+            d3[i3] = pte_make(d2pa, PTE_P | PTE_W | PTE_U);
+            pte_t *d2 = (pte_t *)phys_access(d2pa);
+            for (size_t i2 = 0; i2 < 512 && ok; i2++) {
+                if (!(s2[i2] & PTE_P)) continue;
+                if (s2[i2] & PTE_PAT) { ok = false; break; }                                            
+                pte_t *s1 = (pte_t *)phys_access(s2[i2] & PTE_ADDR_MASK);
+                phys_addr_t d1pa = vmm_alloc_table_zeroed();
+                if (d1pa == (phys_addr_t)-1) { ok = false; break; }
+                d2[i2] = pte_make(d1pa, PTE_P | PTE_W | PTE_U);
+                pte_t *d1 = (pte_t *)phys_access(d1pa);
+                for (size_t i1 = 0; i1 < 512; i1++) {
+                    pte_t e = s1[i1];
+                    if (!(e & PTE_P)) continue;
+                    if (!(e & PTE_FOREIGN)) {
+                        pg_ref_inc(e & PTE_ADDR_MASK);
+                        if (!(e & PTE_SHARED) && (e & PTE_W)) {
+                            e = (e & ~PTE_W) | PTE_COW;                                        
+                            s1[i1] = e;
+                        }
+                    }
+                    d1[i1] = e;
+                }
+            }
+        }
+    }
+    spinlock_release(&g_vmm.lock);
+
+    if (!ok) {
+        vmm_destroy_user_space(dst_pml4_phys);
+                                                                            
+                                                                    
+    }
+                                                                                     
+    if (cow_cur_cr3() == (src_pml4_phys & PTE_ADDR_MASK)) {
+        uint64_t cr3;
+        __asm__ volatile ("mov %%cr3, %0\n\tmov %0, %%cr3" : "=r"(cr3) :: "memory");
+    }
+    return ok ? dst_pml4_phys : (phys_addr_t)-1;
 }
 
 #ifdef __cplusplus

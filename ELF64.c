@@ -42,7 +42,7 @@ extern void     vmm_free_user_pml4(uint64_t pml4_phys);
 
  
 #define USER_STACK_TOP      0x00007FFF00000000ULL
-#define USER_STACK_PAGES    64       
+#define USER_STACK_PAGES    128                   
 
  
 
@@ -54,6 +54,10 @@ extern void     vmm_free_user_pml4(uint64_t pml4_phys);
 
  
 #define ELF_MAX_SEG_BYTES   (128ULL * 1024 * 1024)
+
+#ifndef ELF_DIRECT_MAP_OFFSET
+#define ELF_DIRECT_MAP_OFFSET 0xFFFF880000000000ULL
+#endif
 
  
 
@@ -123,10 +127,136 @@ extern void *memset(void *dst, int c, size_t n);
 extern void *memcpy(void *dst, const void *src, size_t n);
 extern size_t strlen(const char *s);
 
+                                                                         
+                                                            
+  
+                                                          
+                                          
+                                                        
+                                          
+                                            
+                                                       
+                                          
+                                                       
+                                          
+                                                           
+                                          
+  
+                                                                          
+                                                        
+                                                                            
+#define AT_NULL    0
+#define AT_PHDR    3
+#define AT_PHENT   4
+#define AT_PHNUM   5
+#define AT_PAGESZ  6
+#define AT_BASE    7
+#define AT_FLAGS   8
+#define AT_ENTRY   9
+#define AT_UID     11
+#define AT_EUID    12
+#define AT_GID     13
+#define AT_EGID    14
+#define AT_HWCAP   16
+#define AT_CLKTCK  17
+#define AT_SECURE  23
+#define AT_RANDOM  25
+
+static uint64_t g_rand_state;
+
+static uint64_t stack_rand64(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t x = ((uint64_t)hi << 32) | lo;
+    g_rand_state += x + 0x9E3779B97F4A7C15ULL;
+    uint64_t z = g_rand_state;                                       
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL;
+    return z ^ (z >> 31);
+}
+
+static void build_user_stack(elf64_image_t *img, const char *prog,
+                             const char *const *argv, const char *const *envp)
+{
+    uint8_t *kbase = (uint8_t *)(uintptr_t)(img->stack_phys + ELF_DIRECT_MAP_OFFSET);
+    uint64_t va_base = USER_STACK_TOP - (img->stack_pages << PAGE_SHIFT);
+    uint64_t sp = USER_STACK_TOP;
+    #define KP(va) (kbase + ((va) - va_base))
+
+    const char *def_argv[2] = { prog, NULL };
+    if (!argv || !argv[0]) argv = def_argv;
+
+    size_t argc = 0, envc = 0;
+    while (argv[argc] && argc < ELF_ARG_MAX_COUNT) argc++;
+    if (envp) while (envp[envc] && envc < ELF_ARG_MAX_COUNT) envc++;
+
+                                                                                
+    uint64_t arg_va[ELF_ARG_MAX_COUNT];
+    uint64_t env_va[ELF_ARG_MAX_COUNT];
+
+    size_t budget = ELF_ARG_MAX_BYTES;
+    for (size_t i = envc; i-- > 0; ) {
+        size_t n = strlen(envp[i]) + 1;
+        if (n > budget) { envc = 0; break; }
+        budget -= n;
+        sp -= n; memcpy(KP(sp), envp[i], n); env_va[i] = sp;
+    }
+    for (size_t i = argc; i-- > 0; ) {
+        size_t n = strlen(argv[i]) + 1;
+        if (n > budget) { argc = i + 1; continue; }
+        budget -= n;
+        sp -= n; memcpy(KP(sp), argv[i], n); arg_va[i] = sp;
+    }
+
+    sp -= 16;                                                             
+    {
+        uint64_t *r = (uint64_t *)KP(sp);
+        r[0] = stack_rand64();
+        r[1] = stack_rand64();
+    }
+    uint64_t rnd_va = sp;
+    sp &= ~0xFULL;
+
+    uint64_t aux[][2] = {
+        { AT_PHDR,   img->phdr_va },
+        { AT_PHENT,  sizeof(Elf64_Phdr) },
+        { AT_PHNUM,  img->phnum },
+        { AT_PAGESZ, PAGE_SIZE },
+        { AT_BASE,   0 },
+        { AT_FLAGS,  0 },
+        { AT_ENTRY,  img->entry },
+        { AT_UID, 0 }, { AT_EUID, 0 }, { AT_GID, 0 }, { AT_EGID, 0 },
+        { AT_CLKTCK, 100 },
+        { AT_SECURE, 0 },
+        { AT_RANDOM, rnd_va },
+        { AT_NULL,   0 },
+    };
+    size_t naux   = sizeof(aux) / sizeof(aux[0]);
+    size_t nwords = 1 + (argc + 1) + (envc + 1) + naux * 2;
+
+    sp -= nwords * 8;
+    sp &= ~0xFULL;                                                                        
+
+    uint64_t *w = (uint64_t *)KP(sp);
+    size_t k = 0;
+    w[k++] = argc;
+    for (size_t i = 0; i < argc; i++) w[k++] = arg_va[i];
+    w[k++] = 0;
+    for (size_t i = 0; i < envc; i++) w[k++] = env_va[i];
+    w[k++] = 0;
+    for (size_t i = 0; i < naux; i++) { w[k++] = aux[i][0]; w[k++] = aux[i][1]; }
+
+    img->stack_top = sp;
+    #undef KP
+}
+
+
+
  
 
 
-int elf64_load(const char *path, elf64_image_t *out) {
+int elf64_load_ex(const char *path, const char *const *argv, const char *const *envp,
+                  elf64_image_t *out) {
     if (!path || !out) return ELF_ERR_INVAL;
 
      
@@ -229,6 +359,7 @@ int elf64_load(const char *path, elf64_image_t *out) {
     out->load_base = load_base;
     out->entry     = ehdr.e_entry + load_base;
 
+    out->phnum = ehdr.e_phnum;
     DBG_VAL("ELF", "load_base",  load_base);
     DBG_VAL("ELF", "entry_virt", out->entry);
 
@@ -246,6 +377,9 @@ int elf64_load(const char *path, elf64_image_t *out) {
         }
 
         if (ph->p_memsz == 0) continue;
+
+        if (ehdr.e_phoff >= ph->p_offset && ehdr.e_phoff < ph->p_offset + ph->p_filesz)
+            out->phdr_va = ph->p_vaddr + load_base + (ehdr.e_phoff - ph->p_offset);
 
          
         if (ph->p_memsz > ELF_MAX_SEG_BYTES || ph->p_filesz > ph->p_memsz) {
@@ -270,7 +404,6 @@ int elf64_load(const char *path, elf64_image_t *out) {
 
          
 
-        #define ELF_DIRECT_MAP_OFFSET 0xFFFF880000000000ULL
         uint8_t *kva = (uint8_t *)(uintptr_t)(phys + ELF_DIRECT_MAP_OFFSET);
 
          
@@ -368,10 +501,9 @@ int elf64_load(const char *path, elf64_image_t *out) {
 
          
 
-
-        out->stack_top   = (USER_STACK_TOP - 8ULL) & ~0xFULL;
         out->stack_pages = stack_pages;
         out->stack_phys  = stack_phys;
+        build_user_stack(out, path, argv, envp);
 
         DBG_VAL("ELF", "stack_top",  out->stack_top);
     }
@@ -390,6 +522,10 @@ err_free_segs:
 
  
 
+
+int elf64_load(const char *path, elf64_image_t *out) {
+    return elf64_load_ex(path, NULL, NULL, out);
+}
 
 void elf64_free(elf64_image_t *img) {
     if (!img) return;
@@ -499,6 +635,11 @@ static void user_entry_trampoline(void *arg) {
 
 
 int elf64_spawn(const char *path, const char *name, int prio) {
+    return elf64_spawn_ex(path, name, prio, NULL, NULL);
+}
+
+int elf64_spawn_ex(const char *path, const char *name, int prio,
+                   const char *const *argv, const char *const *envp) {
     if (!path || !name) return ELF_ERR_INVAL;
 
     dbg_puts("[ELF] elf64_spawn: loading '"); dbg_puts(path);
@@ -513,7 +654,7 @@ int elf64_spawn(const char *path, const char *name, int prio) {
     memset(sa, 0, sizeof(elf64_spawn_arg_t));
 
      
-    int r = elf64_load(path, &sa->image);
+    int r = elf64_load_ex(path, argv, envp, &sa->image);
     if (r != ELF_OK) {
         DBG_RC("ELF", "elf64_spawn: elf64_load failed, rc", r);
         kfree(sa);
@@ -523,8 +664,13 @@ int elf64_spawn(const char *path, const char *name, int prio) {
     DBG_VAL("ELF", "spawn entry", sa->image.entry);
 
      
+                                                                          
+                                                                                      
+    uint64_t irq_fl;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(irq_fl) :: "memory");
     int tid = sched_create_kthread(user_entry_trampoline, sa, name, prio);
     if (tid < 0) {
+        if (irq_fl & 0x200) __asm__ volatile ("sti" ::: "memory");
         DBG_MSG("ELF", "elf64_spawn: sched_create_kthread failed");
         elf64_free(&sa->image);
         kfree(sa);
@@ -543,7 +689,9 @@ int elf64_spawn(const char *path, const char *name, int prio) {
     task_t *t = sched_find((uint32_t)tid);
     if (t) {
         t->pml4_phys = sa->image.pml4_phys;
+        if (irq_fl & 0x200) __asm__ volatile ("sti" ::: "memory");
     } else {
+        if (irq_fl & 0x200) __asm__ volatile ("sti" ::: "memory");
          
 
 

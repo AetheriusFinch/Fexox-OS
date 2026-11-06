@@ -29,9 +29,46 @@ extern void  *kmalloc(uint64_t size);
 extern void   kfree(void *ptr);
 extern void   pmm_free_frames(uint64_t pa, uint64_t count);
 extern uint64_t vmm_kernel_pml4_phys(void);
+extern void   vmm_destroy_user_space(uint64_t pml4_phys);                                            
 extern void   interrupt_set_scheduler_tick(uint64_t (*fn)(uint64_t frame_rsp));
 
 static uint64_t g_active_pml4_phys = 0;
+
+                                                                               
+#define SCHED_VM_MAX 128
+static struct { uint64_t pml4; uint32_t refs; } g_vm_refs[SCHED_VM_MAX];
+
+static inline uint64_t sched_vm_irq_save(void) {
+    uint64_t f; __asm__ volatile ("pushfq; popq %0; cli" : "=r"(f) :: "memory"); return f;
+}
+static inline void sched_vm_irq_restore(uint64_t f) {
+    if (f & 0x200) __asm__ volatile ("sti" ::: "memory");
+}
+int sched_pml4_ref(uint64_t pml4) {
+    if (!pml4) return -1;
+    uint64_t fl = sched_vm_irq_save();
+    int rc = -1, freei = -1;
+    for (int i = 0; i < SCHED_VM_MAX; i++) {
+        if (g_vm_refs[i].refs && g_vm_refs[i].pml4 == pml4) { g_vm_refs[i].refs++; rc = 0; break; }
+        if (!g_vm_refs[i].refs && freei < 0) freei = i;
+    }
+    if (rc < 0 && freei >= 0) { g_vm_refs[freei].pml4 = pml4; g_vm_refs[freei].refs = 2; rc = 0; }
+    sched_vm_irq_restore(fl);
+    return rc;
+}
+                                                                         
+static bool sched_pml4_put(uint64_t pml4) {
+    uint64_t fl = sched_vm_irq_save();
+    bool last = true;
+    for (int i = 0; i < SCHED_VM_MAX; i++) {
+        if (g_vm_refs[i].refs && g_vm_refs[i].pml4 == pml4) {
+            if (--g_vm_refs[i].refs == 0) g_vm_refs[i].pml4 = 0; else last = false;
+            break;
+        }
+    }
+    sched_vm_irq_restore(fl);
+    return last;
+}
 
 
 
@@ -513,6 +550,46 @@ int sched_create_kthread(void (*fn)(void *), void *arg,
 extern void tss_set_rsp0(uint64_t rsp0);
 extern void syscall_set_kstack(uint64_t rsp0);   
 
+                                                                         
+                                                                    
+                                                                            
+                                                                             
+                                                                            
+#define SCHED_MSR_FS_BASE 0xC0000100u
+
+static uint8_t g_fpu_default[512] __attribute__((aligned(16))) = {
+    [0] = 0x7F, [1] = 0x03,                                    
+    [24] = 0x80, [25] = 0x1F,                                   
+};
+
+static inline uint8_t *task_fpu(task_t *t) {
+    return (uint8_t *)(((uintptr_t)t->fpu_raw + 15u) & ~(uintptr_t)15u);
+}
+static inline uint64_t sched_rdfsbase(void) {
+    uint32_t lo, hi;
+    __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(SCHED_MSR_FS_BASE));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void sched_wrfsbase(uint64_t v) {
+    __asm__ volatile ("wrmsr" :: "c"(SCHED_MSR_FS_BASE),
+                      "a"((uint32_t)v), "d"((uint32_t)(v >> 32)) : "memory");
+}
+static void arch_state_save(task_t *t) {
+    if (t->pml4_phys) t->fs_base = sched_rdfsbase();
+    __asm__ volatile ("fxsave (%0)" :: "r"(task_fpu(t)) : "memory");
+    t->fpu_valid = 1;
+}
+static void arch_state_restore(task_t *t) {
+    if (t->pml4_phys) sched_wrfsbase(t->fs_base);
+    __asm__ volatile ("fxrstor (%0)" :: "r"(t->fpu_valid ? task_fpu(t) : g_fpu_default) : "memory");
+}
+void sched_arch_fork_state(task_t *child) {
+    if (!child) return;
+    __asm__ volatile ("fxsave (%0)" :: "r"(task_fpu(child)) : "memory");
+    child->fpu_valid = 1;
+    child->fs_base   = sched_rdfsbase();
+}
+
 static uint64_t context_switch(uint64_t frame_rsp) {
     task_t *prev = g_sched.current;
     uint64_t now_tsc = rdtsc();
@@ -540,6 +617,8 @@ static uint64_t context_switch(uint64_t frame_rsp) {
         }
          
     }
+
+    if (prev && prev->state != TASK_ZOMBIE) arch_state_save(prev);
 
      
     task_t *next = rq_pop(&g_sched.rq);
@@ -608,7 +687,10 @@ static uint64_t context_switch(uint64_t frame_rsp) {
             prev->kstack_base = NULL;
         }
         if (prev->pml4_phys) {
-            pmm_free_frames(prev->pml4_phys, 1);
+                                                                                 
+                                                                                
+            if (sched_pml4_put(prev->pml4_phys))
+                vmm_destroy_user_space(prev->pml4_phys);
             prev->pml4_phys = 0;
         }
         kfree(prev);
@@ -635,6 +717,7 @@ static uint64_t context_switch(uint64_t frame_rsp) {
 
     tss_set_rsp0(next->kstack_top);
     syscall_set_kstack(next->kstack_top);
+    arch_state_restore(next);
 
      
 
@@ -682,8 +765,8 @@ int sched_kill(uint32_t tid) {
 
     t->state = TASK_ZOMBIE;
     if (t->kstack_base) { kfree(t->kstack_base); t->kstack_base = NULL; }
-    if (t->pml4_phys && t->pml4_phys != g_active_pml4_phys) {
-        pmm_free_frames(t->pml4_phys, 1);
+    if (t->pml4_phys && sched_pml4_put(t->pml4_phys) && t->pml4_phys != g_active_pml4_phys) {
+        vmm_destroy_user_space(t->pml4_phys);
         t->pml4_phys = 0;
     }
     kfree(t);
@@ -697,6 +780,34 @@ int sched_kill(uint32_t tid) {
 
 
 
+
+extern uint64_t usb_tsc_per_ms(void);                                                               
+
+static uint64_t ns_to_tsc(uint64_t ns) {
+    uint64_t per_ms = usb_tsc_per_ms();
+    if (per_ms == 0) per_ms = 3000000ULL;
+    if (ns > 3600ULL * 1000000000ULL) ns = 3600ULL * 1000000000ULL;                             
+    return (ns / 1000000ULL) * per_ms + ((ns % 1000000ULL) * per_ms) / 1000000ULL;
+}
+
+                               
+static void sched_make_runnable(task_t *t) {
+    t->state    = TASK_RUNNABLE;
+    t->wake_tsc = 0;
+    update_min_vruntime();
+    if (t->vruntime < g_sched.min_vruntime)
+        t->vruntime = g_sched.min_vruntime;
+    rq_push(&g_sched.rq, t);
+}
+
+                                                                             
+static void sched_wake_expired(void) {
+    uint64_t now = rdtsc();
+    for (task_t *t = g_sched.all_head; t; t = t->next_all) {
+        if (t->state == TASK_SLEEPING && t->wake_tsc && now >= t->wake_tsc && t->heap_idx < 0)
+            sched_make_runnable(t);
+    }
+}
 
 uint64_t sched_tick(uint64_t frame_rsp) {
     if (!g_sched.ready) return frame_rsp;
@@ -755,6 +866,7 @@ uint64_t sched_tick(uint64_t frame_rsp) {
     }
 
     spinlock_acquire(&g_sched.lock);
+    sched_wake_expired();
 
     task_t *cur = g_sched.current;
 
@@ -841,12 +953,11 @@ void sched_exit(void) {
 
 
 void sched_sleep_ns(uint64_t ns) {
+    if (ns == 0) { sched_yield(); return; }
     spinlock_acquire(&g_sched.lock);
     task_t *t = g_sched.current;
+    t->wake_tsc = rdtsc() + ns_to_tsc(ns);                                                
     t->state = TASK_SLEEPING;
-     
-     
-    (void)ns;
     g_sched.yield_req = true;
     spinlock_release(&g_sched.lock);
      
@@ -863,12 +974,7 @@ void sched_wake(uint32_t tid) {
     task_t *t = g_sched.all_head;
     while (t) {
         if (t->tid == tid && t->state == TASK_SLEEPING) {
-            t->state = TASK_RUNNABLE;
-             
-            update_min_vruntime();
-            if (t->vruntime < g_sched.min_vruntime)
-                t->vruntime = g_sched.min_vruntime;
-            rq_push(&g_sched.rq, t);
+            if (t->heap_idx < 0) sched_make_runnable(t);
             break;
         }
         t = t->next_all;

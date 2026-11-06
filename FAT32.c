@@ -189,6 +189,7 @@ typedef struct {
     uint8_t  *fat_cache;          
     uint32_t  fat_cache_sectors;  
     bool      fat_cache_dirty;
+    uint32_t  fat_dirty_lo, fat_dirty_hi;                                            
 
      
     uint32_t free_cluster_count;
@@ -327,6 +328,16 @@ static uint32_t fat_get_entry(fat32_priv_t *fat, uint32_t cluster) {
     return val;
 }
 
+static void fat_mark_dirty(fat32_priv_t *fat, uint32_t byte_off) {
+    uint32_t sec = byte_off / fat->bytes_per_sector;
+    if (!fat->fat_cache_dirty) { fat->fat_dirty_lo = sec; fat->fat_dirty_hi = sec; }
+    else {
+        if (sec < fat->fat_dirty_lo) fat->fat_dirty_lo = sec;
+        if (sec > fat->fat_dirty_hi) fat->fat_dirty_hi = sec;
+    }
+    fat->fat_cache_dirty = true;
+}
+
 static int fat_set_entry(fat32_priv_t *fat, uint32_t cluster, uint32_t value) {
     if (fat->readonly) return VFS_ERR_ROFS;
 
@@ -334,7 +345,7 @@ static int fat_set_entry(fat32_priv_t *fat, uint32_t cluster, uint32_t value) {
         if (fat->fat_cache) {
             uint32_t *table = (uint32_t *)fat->fat_cache;
             table[cluster] = (table[cluster] & ~FAT32_MASK) | (value & FAT32_MASK);
-            fat->fat_cache_dirty = true;
+            fat_mark_dirty(fat, cluster * 4);
             return VFS_OK;
         }
         uint32_t offset = cluster * 4;
@@ -354,7 +365,7 @@ static int fat_set_entry(fat32_priv_t *fat, uint32_t cluster, uint32_t value) {
         if (fat->fat_cache) {
             uint16_t *table = (uint16_t *)fat->fat_cache;
             table[cluster] = v16;
-            fat->fat_cache_dirty = true;
+            fat_mark_dirty(fat, cluster * 2);
             return VFS_OK;
         }
         uint32_t offset = cluster * 2;
@@ -384,14 +395,18 @@ static int fat_set_entry(fat32_priv_t *fat, uint32_t cluster, uint32_t value) {
  
 static int fat_flush_fat(fat32_priv_t *fat) {
     if (!fat->fat_cache_dirty) return VFS_OK;
-    int r = blkdev_write(fat->dev, fat->first_fat_sector,
-                         fat->fat_cache_sectors, fat->fat_cache);
+                                                                                   
+    uint32_t lo = fat->fat_dirty_lo, hi = fat->fat_dirty_hi;
+    if (lo > hi || hi >= fat->fat_cache_sectors) { lo = 0; hi = fat->fat_cache_sectors - 1; }
+    uint32_t cnt = hi - lo + 1;
+    const uint8_t *src = fat->fat_cache + (uint64_t)lo * fat->bytes_per_sector;
+    int r = blkdev_write(fat->dev, fat->first_fat_sector + lo, cnt, src);
     if (r != VFS_OK) return r;
      
     if (fat->num_fats >= 2) {
         r = blkdev_write(fat->dev,
-                         fat->first_fat_sector + fat->fat_size,
-                         fat->fat_cache_sectors, fat->fat_cache);
+                         fat->first_fat_sector + fat->fat_size + lo,
+                         cnt, src);
     }
     fat->fat_cache_dirty = false;
     return r;
@@ -582,6 +597,12 @@ typedef struct {
     uint8_t       sector_buf[4096];  
     bool          buf_valid;
     uint32_t      buf_cluster;
+                                                                               
+                                                                                 
+    bool          hit_end;
+    uint32_t      end_lba, end_eis, end_left;
+                                                                                
+    bool          exhausted;
 } fat_dir_iter_t;
 
 static void fat_dir_iter_init(fat_dir_iter_t *it, fat32_priv_t *fat, uint32_t cluster) {
@@ -592,6 +613,9 @@ static void fat_dir_iter_init(fat_dir_iter_t *it, fat32_priv_t *fat, uint32_t cl
     it->global_entry_idx = 0;
     it->buf_valid = false;
     it->buf_cluster = 0;
+    it->hit_end = false;
+    it->end_lba = it->end_eis = it->end_left = 0;
+    it->exhausted = false;
 
      
     it->is_root_fat16 = (fat->fat_type != FAT_TYPE_32 && cluster == 0);
@@ -611,6 +635,7 @@ static int fat_dir_read_entry(fat_dir_iter_t *it, fat_dir_entry_t *entry,
     uint32_t eps = fat->bytes_per_sector / sizeof(fat_dir_entry_t);  
 
     while (1) {
+        if (it->exhausted) return VFS_ERR_NOENT;
          
         if (!it->buf_valid || it->buf_cluster != it->cluster) {
             if (it->is_root_fat16) {
@@ -647,7 +672,14 @@ static int fat_dir_read_entry(fat_dir_iter_t *it, fat_dir_entry_t *entry,
         uint32_t eis = it->entry_in_sector;
 
          
-        if (e->name[0] == FAT_ENTRY_END) return VFS_ERR_NOENT;
+        if (e->name[0] == FAT_ENTRY_END) {
+            uint32_t spc_e = it->is_root_fat16 ? 1 : fat->sectors_per_cluster32;
+            it->hit_end  = true;
+            it->end_lba  = lba;
+            it->end_eis  = eis;
+            it->end_left = eps * spc_e - (it->sector_in_cluster * eps + eis);
+            return VFS_ERR_NOENT;
+        }
 
          
         it->entry_in_sector++;
@@ -661,13 +693,14 @@ static int fat_dir_read_entry(fat_dir_iter_t *it, fat_dir_entry_t *entry,
             if (it->sector_in_cluster >= spc) {
                 it->sector_in_cluster = 0;
                 if (it->is_root_fat16) {
-                     
-                    return VFS_ERR_NOENT;
+                    it->exhausted = true;                                             
+                } else {
+                    uint32_t next = fat_get_entry(fat, it->cluster);
+                    if (next >= FAT32_EOC || next == FAT32_FREE)
+                        it->exhausted = true;                                         
+                    else
+                        it->cluster = next;
                 }
-                uint32_t next = fat_get_entry(fat, it->cluster);
-                if (next >= FAT32_EOC || next == FAT32_FREE)
-                    return VFS_ERR_NOENT;
-                it->cluster = next;
             }
         }
 
@@ -881,6 +914,23 @@ static __attribute__((unused)) bool fat_is_valid_83(const char *name) {
 
  
 
+                                                                               
+                                                                                 
+static void fat_dir_mark_tail_free(fat32_priv_t *fat, uint32_t lba, uint32_t eis,
+                                   uint32_t count) {
+    uint32_t eps = fat->bytes_per_sector / sizeof(fat_dir_entry_t);
+    uint8_t tmp[512];
+    while (count) {
+        if (blkdev_read(fat->dev, lba, 1, tmp) != VFS_OK) return;
+        while (count && eis < eps) {
+            tmp[eis * sizeof(fat_dir_entry_t)] = FAT_ENTRY_FREE;
+            eis++; count--;
+        }
+        blkdev_write(fat->dev, lba, 1, tmp);
+        eis = 0; lba++;
+    }
+}
+
 static int fat_dir_add_entry(fat32_priv_t *fat, uint32_t dir_cluster,
                               const char *name, uint8_t attr,
                               uint32_t first_cluster, uint32_t file_size,
@@ -934,7 +984,13 @@ static int fat_dir_add_entry(fat32_priv_t *fat, uint32_t dir_cluster,
     while (1) {
         int r = fat_dir_read_entry(&it, &entry, &lba, &eis);
         if (r == VFS_ERR_NOENT) {
-             
+                                                                                   
+                                                                           
+            if (it.hit_end && it.end_left >= (uint32_t)total_entries) {
+                free_run_start_lba = it.end_lba;
+                free_run_start_eis = it.end_eis;
+                found_slot = true;
+            }
             break;
         }
         if (r != VFS_OK) return r;
@@ -957,6 +1013,9 @@ static int fat_dir_add_entry(fat32_priv_t *fat, uint32_t dir_cluster,
 
      
     if (!found_slot) {
+                                                                                  
+        if (it.hit_end && it.end_left)
+            fat_dir_mark_tail_free(fat, it.end_lba, it.end_eis, it.end_left);
          
         uint32_t last_c = dir_cluster;
         uint32_t cur = dir_cluster;
@@ -1668,6 +1727,7 @@ static vfs_node_t *fat_mount(blkdev_t *dev, uint32_t flags) {
                             fat_size, fat->fat_cache) == VFS_OK) {
                 fat->fat_cache_sectors = fat_size;
                 fat->fat_cache_dirty   = false;
+                fat->fat_dirty_lo = 0xFFFFFFFFu; fat->fat_dirty_hi = 0;
                 DBG_VAL("FAT", "FAT cached sectors", fat_size);
             } else {
                 kfree(fat->fat_cache);

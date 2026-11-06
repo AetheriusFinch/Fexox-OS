@@ -111,10 +111,27 @@ $LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
     build/cdc_ecm.o         \
     build/cdc_ncm.o
 
-echo "[*] Калькулятор (userspace, отдельно от ядра)..."
-$CC $CFLAGS_USER -c SysApps/calc.c -o build/calc.o
-$LD_KERN $LDFLAGS_USER -o build/calc.elf build/calc.o
-ls -lh build/calc.elf
+                                                                         
+MUSL_OUT="Resources/musl/out"
+CFLAGS_MUSL="-target x86_64-linux-musl -nostdinc -isystem $MUSL_OUT/include -fno-stack-protector -fno-pic -fno-pie -O2 -g -Wall -std=gnu11"
+LDFLAGS_MUSL="-m elf_x86_64 -static -nostdlib -z max-page-size=4096 -z separate-code -z norelro"
+
+rm -f build/calc.elf
+if [ -f "$MUSL_OUT/lib/libc.a" ]; then
+    echo "[*] Калькулятор (userspace, musl libc)..."
+    $CC $CFLAGS_MUSL -c SysApps/calc.c -o build/calc.o
+    $LD_KERN $LDFLAGS_MUSL -o build/calc.elf \
+        $MUSL_OUT/lib/crt1.o $MUSL_OUT/lib/crti.o build/calc.o \
+        $MUSL_OUT/lib/libc.a $MUSL_OUT/lib/crtn.o
+    ls -lh build/calc.elf
+elif [ -f SysApps/calc_bare.c ]; then
+    echo "[!] musl не собран - собираю старый калькулятор без libc (SysApps/calc_bare.c)"
+    $CC $CFLAGS_USER -c SysApps/calc_bare.c -o build/calc.o
+    $LD_KERN $LDFLAGS_USER -o build/calc.elf build/calc.o
+    ls -lh build/calc.elf
+else
+    echo "[!] musl не собран ($MUSL_OUT/lib/libc.a) - запусти ./build_musl.sh, калькулятор пропущен"
+fi
 
 echo "[*] SysLogs (userspace, отдельно от ядра)..."
 $CC $CFLAGS_USER -c SysApps/SysLogsApp.c -o build/syslogs.o
@@ -125,6 +142,26 @@ echo "[*] Browser (userspace, отдельно от ядра)..."
 $CC $CFLAGS_USER -c SysApps/BrowserApp.c -o build/browser.o
 $LD_KERN $LDFLAGS_USER -o build/browser.elf build/browser.o
 ls -lh build/browser.elf
+
+                                                                             
+                                                           
+                                                                         
+                                                                             
+MUSL_OUT="Resources/musl/out"
+CFLAGS_MUSL="-target x86_64-linux-musl -nostdinc -isystem $MUSL_OUT/include -fno-stack-protector -fno-pic -fno-pie -O2 -g -Wall -std=gnu11"
+LDFLAGS_MUSL="-m elf_x86_64 -static -nostdlib -z max-page-size=4096 -z separate-code -z norelro"
+MUSL_OK=0
+if [ -f "$MUSL_OUT/lib/libc.a" ]; then
+    echo "[*] MuslTest (userspace, musl libc)..."
+    $CC $CFLAGS_MUSL -c SysApps/MuslTest.c -o build/musltest.o
+    $LD_KERN $LDFLAGS_MUSL -o build/musltest.elf \
+        $MUSL_OUT/lib/crt1.o $MUSL_OUT/lib/crti.o build/musltest.o \
+        $MUSL_OUT/lib/libc.a $MUSL_OUT/lib/crtn.o
+    ls -lh build/musltest.elf
+    MUSL_OK=1
+else
+    echo "[!] musl не собран ($MUSL_OUT/lib/libc.a) - запусти ./build_musl.sh, MuslTest пропущен"
+fi
 
 echo "[*] Загрузчик UEFI..."
 $MGW $CFLAGS_BOOT -c bootloader.c -o build/bootloader.o
@@ -201,14 +238,21 @@ if command -v mformat >/dev/null; then
 
 
     mmd -i build/data.img ::APPS 2>/dev/null || true
-    mcopy -i build/data.img build/calc.elf ::APPS/calc.elf
-    echo "[OK] build/calc.elf -> ::APPS/calc.elf"
+    if [ -f build/calc.elf ]; then
+        mcopy -o -i build/data.img build/calc.elf ::APPS/calc.elf
+        echo "[OK] build/calc.elf -> ::APPS/calc.elf"
+    fi
 
     mcopy -i build/data.img build/syslogs.elf ::APPS/syslogs.elf
     echo "[OK] build/syslogs.elf -> ::APPS/syslogs.elf"
 
     mcopy -i build/data.img build/browser.elf ::APPS/browser.elf
     echo "[OK] build/browser.elf -> ::APPS/browser.elf"
+
+    if [ "$MUSL_OK" = "1" ]; then
+        mcopy -i build/data.img build/musltest.elf ::APPS/musltest.elf
+        echo "[OK] build/musltest.elf -> ::APPS/musltest.elf"
+    fi
 else
     echo "[!] mtools нет — pacman -S mingw-w64-ucrt-x86_64-mtools"
 fi

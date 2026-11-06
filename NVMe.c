@@ -1,4 +1,4 @@
-/* Fexox OS, EULA GPLv2 */
+                          
 
 #include "VFS.h"
 #include "debug_out.h"

@@ -1055,10 +1055,21 @@ static fb_color_t *g_browser_icon_clean_bg = NULL;
 static bool         g_browser_icon_hover = false;
 static int32_t      g_browser_running_tid = -1;   
 
+                                                                                    
+static png_image_t g_musl_icon_img;
+static int          g_musl_icon_loaded = 0;
+static char g_musl_title[FXAPP_NAME_MAX] = "Musl Test";
+static char g_musl_icon_rel[FXAPP_ICON_MAX] = "libcmuslstart.png";
+static char g_musl_elf_path[FXAPP_PATH_MAX] = "/APPS/musltest.elf";
+static fb_color_t *g_musl_icon_clean_bg = NULL;
+static bool         g_musl_icon_hover = false;
+static int32_t      g_musl_running_tid = -1;
+
 static void icon_rect(int32_t *ix, int32_t *iy);
 static void calc_icon_rect(int32_t *ix, int32_t *iy);
 static void syslogs_icon_rect(int32_t *ix, int32_t *iy);
 static void browser_icon_rect(int32_t *ix, int32_t *iy);
+static void musl_icon_rect(int32_t *ix, int32_t *iy);
 static void fxapp_ensure_assets_loaded(void);
 static void fxapp_capture_icon_bg(void);
 static void fxapp_draw_icon(bool hovered);
@@ -1067,6 +1078,8 @@ static void calc_draw_icon(bool hovered);
 static void syslogs_capture_icon_bg(void);
 static void syslogs_draw_icon(bool hovered);
 static void browser_draw_icon(bool hovered);
+static void musl_capture_icon_bg(void);
+static void musl_draw_icon(bool hovered);
 
  
 
@@ -1649,6 +1662,13 @@ static void browser_icon_rect(int32_t *ix, int32_t *iy) {
     *iy = sy + (int32_t)FXAPP_ICON_H + 40;
 }
 
+static void musl_icon_rect(int32_t *ix, int32_t *iy) {
+    int32_t bx, by;
+    browser_icon_rect(&bx, &by);
+    *ix = bx;
+    *iy = by + (int32_t)FXAPP_ICON_H + 40;
+}
+
  
 
 
@@ -1679,6 +1699,13 @@ static bool ui_point_over_any_desktop_icon(int32_t x, int32_t y) {
         return true;
 
     browser_icon_rect(&icx, &icy);
+    if (point_in_rect(x, y,
+                       icx - FXAPP_ICON_HALO_PAD, icy - FXAPP_ICON_HALO_PAD,
+                       FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD,
+                       FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD))
+        return true;
+
+    musl_icon_rect(&icx, &icy);
     if (point_in_rect(x, y,
                        icx - FXAPP_ICON_HALO_PAD, icy - FXAPP_ICON_HALO_PAD,
                        FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD,
@@ -1867,6 +1894,11 @@ static void fxapp_ensure_assets_loaded(void) {
     g_browser_icon_img.pixels = NULL;
     if (fxapp_load_png_asset(g_browser_icon_rel, FXAPP_ICON_W, FXAPP_ICON_H, &g_browser_icon_img))
         g_browser_icon_loaded = 1;
+
+                                                    
+    g_musl_icon_img.pixels = NULL;
+    if (fxapp_load_png_asset(g_musl_icon_rel, FXAPP_ICON_W, FXAPP_ICON_H, &g_musl_icon_img))
+        g_musl_icon_loaded = 1;
 }
 
  
@@ -2011,6 +2043,19 @@ static void browser_draw_icon(bool hovered) {
 
     fxapp_draw_icon_generic(icx, icy, g_browser_icon_clean_bg, hovered,
                             g_browser_icon_loaded, &g_browser_icon_img, "WWW", "");
+}
+
+static void musl_capture_icon_bg(void) {
+    int32_t icx, icy;
+    musl_icon_rect(&icx, &icy);
+    fxapp_capture_icon_bg_generic(icx, icy, &g_musl_icon_clean_bg);
+}
+
+static void musl_draw_icon(bool hovered) {
+    int32_t icx, icy;
+    musl_icon_rect(&icx, &icy);
+    fxapp_draw_icon_generic(icx, icy, g_musl_icon_clean_bg, hovered,
+                            g_musl_icon_loaded, &g_musl_icon_img, "LIBC", g_musl_title);
 }
 
  
@@ -4301,6 +4346,37 @@ void ui_desktop_handle_mouse(int32_t x, int32_t y, uint8_t buttons) {
         g_browser_icon_hover = false;
     }
 
+    if (!cursor_over_window) {
+        int32_t icx, icy;
+        musl_icon_rect(&icx, &icy);
+        int32_t  hx = icx - FXAPP_ICON_HALO_PAD;
+        int32_t  hy = icy - FXAPP_ICON_HALO_PAD;
+        uint32_t hw = FXAPP_ICON_W + 2u * FXAPP_ICON_HALO_PAD;
+        uint32_t hh = FXAPP_ICON_H + 2u * FXAPP_ICON_HALO_PAD;
+
+        bool now_hover = point_in_rect(x, y, hx, hy, hw, hh);
+        if (now_hover != g_musl_icon_hover) {
+            g_musl_icon_hover = now_hover;
+            musl_draw_icon(g_musl_icon_hover);
+        }
+
+        if (left_click && now_hover) {
+            if (g_musl_running_tid >= 0 && sched_task_alive((uint32_t)g_musl_running_tid)) {
+                DBG_MSG("FXA", "musltest: already running, repeated spawn skipped");
+            } else {
+                dbg_puts("[FXA] click on icon 'musltest' -> spawn\n");
+                uint64_t spawn_flags = fm_io_cli();
+                int tid = elf64_spawn(g_musl_elf_path, g_musl_title, 0);
+                fm_io_sti(spawn_flags);
+                g_musl_running_tid = tid;
+                fexox_os_dbg_spawn_rc = tid;
+                DBG_RC("FXA", "musltest: elf64_spawn rc", tid);
+            }
+        }
+    } else if (g_musl_icon_hover) {
+        g_musl_icon_hover = false;
+    }
+
      
 
 
@@ -4520,6 +4596,9 @@ void ui_draw_desktop(void) {
      
     browser_capture_icon_bg();
     browser_draw_icon(g_browser_icon_hover);
+
+    musl_capture_icon_bg();
+    musl_draw_icon(g_musl_icon_hover);
 
      
 

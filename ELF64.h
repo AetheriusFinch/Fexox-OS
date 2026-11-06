@@ -139,6 +139,10 @@ typedef struct {
 
     uint64_t    pml4_phys;
 
+                                                                                
+    Elf64_Addr  phdr_va;
+    uint16_t    phnum;
+
     uint32_t    nseg;
     elf64_seg_t segs[ELF64_MAX_SEGS];
 } elf64_image_t;
@@ -182,6 +186,18 @@ void elf64_free(elf64_image_t *img);
 
 
 int elf64_spawn(const char *path, const char *name, int prio);
+
+                                                                
+                                                                                               
+                                                                                        
+                                               
+int elf64_load_ex(const char *path, const char *const *argv, const char *const *envp,
+                  elf64_image_t *out);
+int elf64_spawn_ex(const char *path, const char *name, int prio,
+                   const char *const *argv, const char *const *envp);
+
+#define ELF_ARG_MAX_BYTES  (64 * 1024)                                          
+#define ELF_ARG_MAX_COUNT  256                                                                               
 
  
 

@@ -67,6 +67,16 @@ extern uint64_t usb_tsc_per_ms(void);
 extern void     pmm_get_stats(uint64_t *total_frames, uint64_t *free_frames);    
 extern uint64_t sched_current_pml4_phys(void);   
 extern uint64_t vmm_kernel_pml4_phys(void);      
+                           
+extern int      vmm_map_user_ex(uint64_t va, uint64_t pa, bool rw, bool exec, int kind);
+extern uint64_t vmm_fork_user_space(uint64_t src_pml4_phys);
+extern void     vmm_destroy_user_space(uint64_t pml4_phys);
+extern int      vmm_cow_ready(void);
+extern int      vmm_cow_break(uint64_t va);
+extern int      vmm_user_release_page(uint64_t va);
+#define VMM_PAGE_OWNED    0
+#define VMM_PAGE_SHARED   1
+#define VMM_PAGE_FOREIGN  2
 extern void     kmalloc_get_diag(uint32_t *fails, uint64_t *last_fail_size, uint64_t *heap_used);
 
  
@@ -136,7 +146,200 @@ typedef struct {
     uint32_t dir_pos;   
 } sc_file_t;
 
-static sc_file_t g_files[SC_FD_MAX];
+                                                                         
+                                                                           
+                                                                         
+                                                                         
+                                                                            
+#define SC_VMA_MAX        64
+#define SC_VMA_ANON       1
+#define SC_VMA_FILECOPY   2
+
+typedef struct {
+    bool     used;
+    uint8_t  kind;
+    bool     rw, exec;
+    uint64_t va;
+    uint64_t pa;                                                                                  
+    uint64_t npages;
+} sc_vma_t;
+
+#define SC_PROC_MAX     256
+#define SC_PROC_FREE    0
+#define SC_PROC_RUN     1
+#define SC_PROC_ZOMBIE  2
+#define SC_NO_TID       0xFFFFFFFFu
+
+typedef struct sc_proc {
+    int      state;
+    uint32_t pid, ppid, tid;                                                                
+    int      exit_code;
+    uint64_t cpu_ns;                                                
+    uint64_t child_cpu_ns;                                                           
+    uint64_t brk_current, brk_mapped, mmap_next;
+    sc_vma_t vma[SC_VMA_MAX];
+    char     cwd[VFS_MAX_PATH];
+    sc_file_t files[SC_FD_MAX];
+
+                                          
+    int             term_sig;                                                          
+    uint32_t        umask_val;
+    uint64_t        sigmask, sigpending;                                               
+    sc_ksigaction_t sigact[SC_NSIG];
+    sc_stack_t      altstack;
+    uint64_t        clear_child_tid;                                                       
+
+                                                                                         
+                                                                                        
+                                                                                          
+    struct sc_proc *leader;
+    bool            exit_set;                                                                        
+    uint32_t        vm_owner;                                                                          
+} sc_proc_t;
+
+static sc_proc_t *g_procs[SC_PROC_MAX];
+static sc_proc_t  g_proc0;                                                  
+static sc_proc_t *g_cur_cache     = NULL;
+static uint32_t   g_cur_cache_tid = SC_NO_TID;
+
+static sc_proc_t *sc_cur(void);
+static sc_proc_t *sc_thr(void);
+#define g_files       (sc_cur()->files)
+#define g_vma         (sc_cur()->vma)
+#define g_brk_current (sc_cur()->brk_current)
+#define g_brk_mapped  (sc_cur()->brk_mapped)
+#define g_mmap_next   (sc_cur()->mmap_next)
+#define g_cwd         (sc_cur()->cwd)
+
+static inline uint64_t sc_irq_save(void) {
+    uint64_t f;
+    __asm__ volatile ("pushfq; popq %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void sc_irq_restore(uint64_t f) {
+    if (f & 0x200) __asm__ volatile ("sti" ::: "memory");
+}
+
+static bool sc_task_alive(uint32_t tid) {
+    task_t *t = sched_find(tid);
+    return t && t->state != TASK_ZOMBIE;
+}
+
+                                                                 
+static bool sc_group_alive(const sc_proc_t *L) {
+    if (sc_task_alive(L->tid)) return true;
+    for (int i = 0; i < SC_PROC_MAX; i++) {
+        const sc_proc_t *r = g_procs[i];
+        if (r && r->leader == L && sc_task_alive(r->tid)) return true;
+    }
+    return false;
+}
+static bool sc_group_others_alive(const sc_proc_t *L, uint32_t my_tid) {
+    if (L->tid != my_tid && sc_task_alive(L->tid)) return true;
+    for (int i = 0; i < SC_PROC_MAX; i++) {
+        const sc_proc_t *r = g_procs[i];
+        if (r && r->leader == L && r->tid != my_tid && sc_task_alive(r->tid)) return true;
+    }
+    return false;
+}
+
+static void sc_proc_defaults(sc_proc_t *p) {
+    memset(p, 0, sizeof(*p));
+    p->state       = SC_PROC_RUN;
+    p->brk_current = p->brk_mapped = USER_HEAP_BASE;
+    p->mmap_next   = USER_MMAP_BASE;
+    p->cwd[0]      = '/';
+    p->umask_val   = 022;
+    for (int i = 0; i < 3; i++) {
+        p->files[i].open     = true;
+        p->files[i].vfs_fd   = -1;
+        p->files[i].pipe_idx = -1;
+        p->files[i].flags    = (i == 0) ? O_RDONLY : O_WRONLY;
+    }
+}
+
+static sc_proc_t *sc_proc_find_tid(uint32_t tid) {
+    for (int i = 0; i < SC_PROC_MAX; i++)
+        if (g_procs[i] && g_procs[i]->state != SC_PROC_FREE && g_procs[i]->tid == tid)
+            return g_procs[i];
+    return NULL;
+}
+static sc_proc_t *sc_proc_find_pid(uint32_t pid) {
+    for (int i = 0; i < SC_PROC_MAX; i++)
+        if (g_procs[i] && g_procs[i]->state != SC_PROC_FREE && !g_procs[i]->leader && g_procs[i]->pid == pid)
+            return g_procs[i];
+    return NULL;
+}
+
+static void sc_proc_free(sc_proc_t *p) {
+    uint64_t fl = sc_irq_save();
+    if (g_cur_cache == p) { g_cur_cache = NULL; g_cur_cache_tid = SC_NO_TID; }
+    for (int i = 0; i < SC_PROC_MAX; i++) {
+        if (g_procs[i] == p) { g_procs[i] = NULL; break; }
+    }
+    sc_irq_restore(fl);
+    if (p != &g_proc0) kfree(p);
+}
+
+                                                                                 
+static void sc_proc_gc(void) {
+    for (int i = 0; i < SC_PROC_MAX; i++) {
+        sc_proc_t *p = g_procs[i];
+        if (!p || p->tid == SC_NO_TID || sc_task_alive(p->tid)) continue;
+        if (p->leader) { sc_proc_free(p); continue; }                               
+        if (sc_group_alive(p)) continue;                                                           
+        sc_proc_t *par = p->ppid ? sc_proc_find_pid(p->ppid) : NULL;
+        if (par && sc_task_alive(par->tid)) continue;                                      
+        sc_proc_free(p);
+    }
+}
+
+                                                                                       
+static sc_proc_t *sc_proc_alloc(void) {
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < SC_PROC_MAX; i++) {
+            if (g_procs[i]) continue;
+            sc_proc_t *p = (sc_proc_t *)kmalloc(sizeof(sc_proc_t));
+            if (!p) return NULL;
+            memset(p, 0, sizeof(*p));
+            p->state = SC_PROC_RUN;
+            p->tid = SC_NO_TID;
+            g_procs[i] = p;
+            return p;
+        }
+        if (pass == 0) sc_proc_gc();
+    }
+    return NULL;
+}
+
+static sc_proc_t *sc_thr(void) {
+    task_t  *t   = sched_current();
+    uint32_t tid = t ? t->tid : 0;
+    if (g_cur_cache && g_cur_cache_tid == tid) return g_cur_cache;
+    sc_proc_t *p = sc_proc_find_tid(tid);
+    if (!p) {                                                                                
+        p = sc_proc_alloc();
+        if (p) {
+            sc_proc_defaults(p);
+            p->pid = p->tid = tid;
+        } else {
+            p = &g_proc0;
+            if (g_proc0.state == SC_PROC_FREE) { sc_proc_defaults(&g_proc0); g_proc0.pid = g_proc0.tid = 0; }
+        }
+    }
+    uint64_t fl = sc_irq_save();
+    g_cur_cache = p; g_cur_cache_tid = tid;
+    sc_irq_restore(fl);
+    return p;
+}
+
+                                                                                          
+static sc_proc_t *sc_cur(void) {
+    sc_proc_t *t = sc_thr();
+    return t->leader ? t->leader : t;
+}
+
+static sc_file_t *sc_get_file(int fd);
 
  
 static int sc_alloc_fd(void) {
@@ -243,7 +446,6 @@ static int shm_alloc_slot(void) {
 
 
 
-static uint64_t g_mmap_next = USER_MMAP_BASE;
 
 static uint64_t mmap_bump_alloc(uint64_t size) {
     uint64_t addr = g_mmap_next;
@@ -264,20 +466,6 @@ static uint64_t mmap_bump_alloc(uint64_t size) {
 
 
 
-#define SC_VMA_MAX        64
-#define SC_VMA_ANON       1
-#define SC_VMA_FILECOPY   2
-
-typedef struct {
-    bool     used;
-    uint8_t  kind;
-    bool     rw, exec;
-    uint64_t va;         
-    uint64_t pa;         
-    uint64_t npages;
-} sc_vma_t;
-
-static sc_vma_t g_vma[SC_VMA_MAX];
 
 static void sc_vma_record(uint8_t kind, uint64_t va, uint64_t pa, uint64_t npages, bool rw, bool exec) {
     for (int i = 0; i < SC_VMA_MAX; i++) {
@@ -348,8 +536,6 @@ static bool sc_user_unmap_page(uint64_t va) {
  
 
 
-static uint64_t g_brk_current = USER_HEAP_BASE;
-static uint64_t g_brk_mapped  = USER_HEAP_BASE;
 
  
 
@@ -387,6 +573,116 @@ static int64_t sc_copy_string(const char *user_ptr, char *kbuf, size_t kbuf_size
 
 
 
+                                                                             
+                                                                           
+                                                                             
+static int sc_copy_path(const char *user_ptr, char *kbuf, size_t kbuf_size) {
+    if (!syscall_validate_ptr(user_ptr, 1)) return -1;
+    char *tmp = (char *)kmalloc(2 * VFS_MAX_PATH);
+    if (!tmp) return -1;
+    char *raw = tmp + VFS_MAX_PATH;
+    size_t i = 0;
+    for (;;) {                                                                          
+        char ch = user_ptr[i];
+        if (i >= VFS_MAX_PATH - 1) { kfree(tmp); return -1; }
+        raw[i] = ch;
+        if (ch == '\0') break;
+        i++;
+    }
+    size_t n = 0;
+    if (raw[0] != '/') {
+        const char *cwd = g_cwd;
+        size_t cl = strlen(cwd);
+        if (cl + 1 + i + 1 > VFS_MAX_PATH) { kfree(tmp); return -1; }
+        memcpy(tmp, cwd, cl); n = cl;
+        if (n == 0 || tmp[n - 1] != '/') tmp[n++] = '/';
+    }
+    memcpy(tmp + n, raw, i + 1);
+
+    size_t o = 0;
+    if (kbuf_size < 2) { kfree(tmp); return -1; }
+    kbuf[o++] = '/';
+    const char *p = tmp;
+    while (*p) {
+        while (*p == '/') p++;
+        if (!*p) break;
+        const char *c = p;
+        while (*p && *p != '/') p++;
+        size_t l = (size_t)(p - c);
+        if (l == 1 && c[0] == '.') continue;
+        if (l == 2 && c[0] == '.' && c[1] == '.') {
+            while (o > 1 && kbuf[o - 1] != '/') o--;
+            if (o > 1) o--;
+            continue;
+        }
+        if (o + l + 2 > kbuf_size) { kfree(tmp); return -1; }
+        if (o > 1) kbuf[o++] = '/';
+        memcpy(kbuf + o, c, l); o += l;
+    }
+    kbuf[o] = '\0';
+    kfree(tmp);
+    return (int)o;
+}
+
+static void    sc_raise_self(int sig);
+static void    sc_futex_cleanup(uint32_t pid);
+static void    sc_exit_clear_tid(sc_proc_t *p);
+static int64_t sc_vfs_errno(int r);
+
+                                                                         
+static void sc_files_addref(sc_proc_t *p) {
+    for (int fd = 0; fd < SC_FD_MAX; fd++) {
+        sc_file_t *f = &p->files[fd];
+        if (!f->open) continue;
+        if (f->is_pipe_read || f->is_pipe_write) {
+            if (f->pipe_idx < 0 || f->pipe_idx >= PIPE_MAX) continue;
+            pipe_t *pp = &g_pipes[f->pipe_idx];
+            if (f->is_pipe_write && pp->wr_refs < 255) pp->wr_refs++;
+            if (f->is_pipe_read  && pp->rd_refs < 255) pp->rd_refs++;
+        } else if (f->vfs_fd >= 0 && f->vfs_fd < VFS_MAX_FD) {
+            if (g_vfs_refs[f->vfs_fd] < 255) g_vfs_refs[f->vfs_fd]++;
+        }
+    }
+}
+static void sc_files_close_all(sc_proc_t *p) {
+    for (int fd = 0; fd < SC_FD_MAX; fd++) {
+        if (!p->files[fd].open) continue;
+        sc_release_file(&p->files[fd]);
+        p->files[fd].open = false;
+    }
+}
+                                                                                       
+static void sc_group_kill_others(sc_proc_t *L, uint32_t my_tid) {
+    for (int i = 0; i < SC_PROC_MAX; i++) {
+        sc_proc_t *r = g_procs[i];
+        if (!r || (r != L && r->leader != L)) continue;
+        if (r->tid == my_tid || r->tid == SC_NO_TID || !sc_task_alive(r->tid)) continue;
+        ui_win_close_all_owned_by((int32_t)r->tid);
+        sc_futex_cleanup(r->tid);
+        sched_kill(r->tid);
+    }
+}
+
+                                                                               
+                                                                  
+static void sc_proc_on_exit(uint64_t code) {
+    sc_proc_t *th = sc_thr();
+    sc_proc_t *p  = sc_cur();
+    task_t *t = sched_current();
+    uint32_t my_tid = t ? t->tid : th->tid;
+    p->cpu_ns += t ? t->total_runtime : 0;
+    sc_exit_clear_tid(th);                                           
+    sc_futex_cleanup(my_tid);
+    if (th != p) th->state = SC_PROC_ZOMBIE;
+    if (!sc_group_others_alive(p, my_tid)) {
+        if (!p->exit_set) p->exit_code = (int)(code & 0xFF);
+        sc_files_close_all(p);
+        for (int i = 0; i < SC_PROC_MAX; i++)
+            if (g_procs[i] && g_procs[i] != p && !g_procs[i]->leader && g_procs[i]->ppid == p->pid) g_procs[i]->ppid = 0;
+        p->state = SC_PROC_ZOMBIE;
+    }
+}
+
 static int64_t sc_exit(uint64_t code);
 
  
@@ -409,8 +705,19 @@ static int64_t sc_exit(uint64_t code) {
         ui_win_close_all_owned_by((int32_t)t->tid);
     }
 
+    sc_proc_on_exit(code);
     sched_exit();             
     __builtin_unreachable();
+}
+
+                                                         
+static int64_t sc_exit_group(uint64_t code) {
+    sc_proc_t *p = sc_cur();
+    task_t *t = sched_current();
+    p->exit_code = (int)(code & 0xFF);
+    p->exit_set  = true;
+    sc_group_kill_others(p, t ? t->tid : SC_NO_TID);
+    return sc_exit(code);
 }
 
  
@@ -419,7 +726,12 @@ static int64_t sc_exit(uint64_t code) {
 static int64_t sc_getpid(void) {
     task_t *t = sched_current();
     if (!t) return 1;
-    return (int64_t)(uint32_t)t->tid;
+    return (int64_t)sc_cur()->pid;
+}
+static int64_t sc_getppid(void) { return (int64_t)sc_cur()->ppid; }
+static int64_t sc_gettid(void) {
+    task_t *t = sched_current();
+    return t ? (int64_t)t->tid : 1;
 }
 
  
@@ -443,111 +755,202 @@ static int64_t sc_sched_yield(void) {
 
 
 
-static int64_t sc_fork(void) {
-     
-
-
-
-
-
-
-
-
-
-    DBG_MSG("SC", "sys_fork: not fully implemented (no per-process PML4)");
-    return -(int64_t)ENOSYS;
-}
-
- 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+                                                                       
+                                                                            
+                                                                           
+                                                               
+                                                                          
+                                                         
+                                                                                      
 typedef struct {
-    uint64_t entry_rip;     
-    uint64_t user_rsp;      
-    uint64_t tls_base;      
-} clone_arg_t;
+    uint64_t rip, rsp, rflags, rbx, rbp, r12, r13, r14, r15, fs_base;
+    uint64_t r8, r9, r10, rdx, rsi, rdi;                                                                       
+    uint64_t set_tid_ptr;                                            
+} fork_ctx_t;
 
-static void clone_trampoline(void *arg) {
-    clone_arg_t *ca = (clone_arg_t *)arg;
-    uint64_t rip = ca->entry_rip;
-    uint64_t rsp = ca->user_rsp;
-    uint64_t tls = ca->tls_base;
-    kfree(ca);
+#define SC_MSR_FS_BASE 0xC0000100U
 
-     
-    if (tls != 0) {
-        __asm__ volatile ("wrfsbase %0" :: "r"(tls));
+static void fork_child_trampoline(void *arg) {
+    fork_ctx_t c = *(fork_ctx_t *)arg;
+    kfree(arg);
+    if (c.fs_base)
+        __asm__ volatile ("wrmsr" :: "c"(SC_MSR_FS_BASE), "a"((uint32_t)c.fs_base),
+                                     "d"((uint32_t)(c.fs_base >> 32)) : "memory");
+    if (c.set_tid_ptr && sc_user_page_present(c.set_tid_ptr, NULL)) {
+        task_t *me = sched_current();
+        if (me) *(uint32_t *)(uintptr_t)c.set_tid_ptr = me->tid;
     }
-
-     
     __asm__ volatile (
-        "push $0x23\n\t"
-        "push %[rsp]\n\t"
-        "pushfq\n\t"
-        "pop %%rax\n\t"
-        "or $0x200, %%rax\n\t"
-        "push %%rax\n\t"
-        "push $0x1B\n\t"
-        "push %[rip]\n\t"
-        "xor %%rax, %%rax\n\t"    
-        "xor %%rbx, %%rbx\n\t"
-        "xor %%rcx, %%rcx\n\t"
-        "xor %%rdx, %%rdx\n\t"
-        "xor %%rsi, %%rsi\n\t"
-        "xor %%rdi, %%rdi\n\t"
-        "xor %%r8,  %%r8\n\t"
-        "xor %%r9,  %%r9\n\t"
-        "xor %%r10, %%r10\n\t"
-        "xor %%r11, %%r11\n\t"
-        "xor %%r12, %%r12\n\t"
-        "xor %%r13, %%r13\n\t"
-        "xor %%r14, %%r14\n\t"
-        "xor %%r15, %%r15\n\t"
-        "xor %%rbp, %%rbp\n\t"
+        "pushq $0x23\n\t"                                  
+        "pushq 8(%%rax)\n\t"                               
+        "pushq 16(%%rax)\n\t"                              
+        "pushq $0x2B\n\t"                                   
+        "pushq 0(%%rax)\n\t"                               
+        "movq 24(%%rax), %%rbx\n\t"
+        "movq 32(%%rax), %%rbp\n\t"
+        "movq 40(%%rax), %%r12\n\t"
+        "movq 48(%%rax), %%r13\n\t"
+        "movq 56(%%rax), %%r14\n\t"
+        "movq 64(%%rax), %%r15\n\t"
+        "movq 80(%%rax), %%r8\n\t"
+        "movq 88(%%rax), %%r9\n\t"
+        "movq 96(%%rax), %%r10\n\t"
+        "movq 104(%%rax), %%rdx\n\t"
+        "movq 112(%%rax), %%rsi\n\t"
+        "movq 120(%%rax), %%rdi\n\t"
+        "xorl %%ecx, %%ecx\n\t"
+        "xorq %%r11, %%r11\n\t"
+        "xorl %%eax, %%eax\n\t"                                                
         "iretq\n\t"
         :
-        : [rip] "r"(rip), [rsp] "r"(rsp)
-        : "rax", "memory"
+        : "a"(&c)
+        : "memory"
     );
     __builtin_unreachable();
 }
 
- 
+static int64_t sc_fork_ex(uint64_t flags, uint64_t child_stack, uint64_t ptid, uint64_t ctid, uint64_t tls) {
+    task_t *cur = sched_current();
+    if (!cur || !cur->pml4_phys) {
+        DBG_MSG("SC", "sys_fork: caller has no user address space");
+        return -(int64_t)ENOSYS;
+    }
+    if (!vmm_cow_ready()) {
+        DBG_MSG("SC", "sys_fork: COW refcount table missing");
+        return -(int64_t)ENOSYS;
+    }
+    sc_proc_t *pp = sc_cur();
+    sc_proc_t *cp = sc_proc_alloc();
+    if (!cp) return -(int64_t)EAGAIN;
 
-static int64_t sc_clone(uint64_t flags, uint64_t child_stack,
-                        uint64_t user_rip, uint64_t tls) {
-    (void)flags;  
+    fork_ctx_t *fc = (fork_ctx_t *)kmalloc(sizeof(fork_ctx_t));
+    if (!fc) { sc_proc_free(cp); return -(int64_t)ENOMEM; }
+    const uint64_t *fr = (const uint64_t *)(uintptr_t)cur->kstack_top;
+    fc->rflags = (fr[-1] | 0x200ULL) & ~0x100ULL;                           
+    fc->rip = fr[-2]; fc->rsp = child_stack ? child_stack : fr[-3];
+    fc->r10 = fr[-10]; fc->r9 = fr[-11]; fc->r8 = fr[-12];
+    fc->rdx = fr[-13]; fc->rsi = fr[-14]; fc->rdi = fr[-15];
+    fc->set_tid_ptr = (flags & CLONE_CHILD_SETTID) ? ctid : 0;
+    fc->rbx = fr[-4]; fc->rbp = fr[-5];
+    fc->r12 = fr[-6]; fc->r13 = fr[-7]; fc->r14 = fr[-8]; fc->r15 = fr[-9];
+    {
+        uint32_t lo, hi;
+        __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(SC_MSR_FS_BASE));
+        fc->fs_base = ((uint64_t)hi << 32) | lo;
+    }
+    if (flags & CLONE_SETTLS) fc->fs_base = tls;
+    uint64_t child_fs = fc->fs_base;
 
-    if (child_stack == 0 || !syscall_validate_ptr((void*)child_stack, 8))
-        return -(int64_t)EINVAL;
-    if (!syscall_validate_ptr((void*)user_rip, 1))
-        return -(int64_t)EINVAL;
-
-    clone_arg_t *ca = (clone_arg_t *)kmalloc(sizeof(clone_arg_t));
-    if (!ca) return -(int64_t)ENOMEM;
-    ca->entry_rip = user_rip;
-    ca->user_rsp  = child_stack;
-    ca->tls_base  = tls;
-
-    int tid = sched_create_kthread(clone_trampoline, ca, "clone_thread", 0);
-    if (tid < 0) {
-        kfree(ca);
+    uint64_t child_pml4 = vmm_fork_user_space(cur->pml4_phys);
+    if (child_pml4 == (uint64_t)-1) {
+        DBG_MSG("SC", "sys_fork: vmm_fork_user_space failed (OOM)");
+        kfree(fc); sc_proc_free(cp);
         return -(int64_t)ENOMEM;
     }
-    DBG_VAL("SC", "sys_clone tid", (uint64_t)(uint32_t)tid);
+
+                                                                        
+    memcpy(cp, pp, sizeof(*cp));
+    cp->state = SC_PROC_RUN; cp->ppid = pp->pid; cp->tid = SC_NO_TID;
+    cp->exit_code = 0; cp->cpu_ns = 0; cp->child_cpu_ns = 0;
+    cp->term_sig = 0; cp->sigpending = 0;
+    cp->leader = NULL; cp->exit_set = false; cp->vm_owner = 0;
+    cp->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
+    sc_files_addref(cp);
+
+                                                                               
+    uint64_t fl = sc_irq_save();
+    int tid = sched_create_kthread(fork_child_trampoline, fc, cur->name, cur->priority);
+    task_t *ct = (tid >= 0) ? sched_find((uint32_t)tid) : NULL;
+    if (!ct) {
+        sc_irq_restore(fl);
+        if (tid >= 0) sched_kill((uint32_t)tid);
+        vmm_destroy_user_space(child_pml4);
+        sc_files_close_all(cp);
+        if (tid < 0) kfree(fc);
+        sc_proc_free(cp);
+        return -(int64_t)ENOMEM;
+    }
+    ct->pml4_phys = child_pml4;
+    sched_arch_fork_state(ct);                                                        
+    ct->fs_base = child_fs;                                              
+    cp->pid = cp->tid = (uint32_t)tid;
+    sc_irq_restore(fl);
+
+    DBG_VAL("SC", "sys_fork child tid", (uint64_t)(uint32_t)tid);
+    if ((flags & CLONE_PARENT_SETTID) && ptid && syscall_validate_ptr((void *)(uintptr_t)ptid, 4))
+        *(uint32_t *)(uintptr_t)ptid = (uint32_t)tid;
+    if (flags & CLONE_VFORK) {                                                                
+        while (sc_task_alive((uint32_t)tid)) { sc_check_exit_request(); sched_yield(); }
+    }
     return (int64_t)(uint32_t)tid;
+}
+
+static int64_t sc_fork(void) { return sc_fork_ex(0, 0, 0, 0, 0); }
+
+                                                                                      
+                                                                                
+                                                                                      
+static int64_t sc_clone_thread(uint64_t flags, uint64_t child_stack, uint64_t ptid,
+                               uint64_t ctid, uint64_t tls) {
+    task_t *cur = sched_current();
+    if (!cur || !cur->pml4_phys) return -(int64_t)ENOSYS;
+    if (!child_stack) return -(int64_t)EINVAL;
+    if ((flags & (CLONE_VM | CLONE_SIGHAND | CLONE_FILES)) != (CLONE_VM | CLONE_SIGHAND | CLONE_FILES))
+        return -(int64_t)EINVAL;
+    sc_proc_t *L  = sc_cur();
+    sc_proc_t *th = sc_proc_alloc();
+    if (!th) return -(int64_t)EAGAIN;
+    fork_ctx_t *fc = (fork_ctx_t *)kmalloc(sizeof(fork_ctx_t));
+    if (!fc) { sc_proc_free(th); return -(int64_t)ENOMEM; }
+
+    const uint64_t *fr = (const uint64_t *)(uintptr_t)cur->kstack_top;
+    fc->rflags = (fr[-1] | 0x200ULL) & ~0x100ULL;
+    fc->rip = fr[-2]; fc->rsp = child_stack;
+    fc->r10 = fr[-10]; fc->r9 = fr[-11]; fc->r8 = fr[-12];
+    fc->rdx = fr[-13]; fc->rsi = fr[-14]; fc->rdi = fr[-15];
+    fc->rbx = fr[-4]; fc->rbp = fr[-5];
+    fc->r12 = fr[-6]; fc->r13 = fr[-7]; fc->r14 = fr[-8]; fc->r15 = fr[-9];
+    fc->set_tid_ptr = (flags & CLONE_CHILD_SETTID) ? ctid : 0;
+    {
+        uint32_t lo, hi;
+        __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(SC_MSR_FS_BASE));
+        fc->fs_base = ((uint64_t)hi << 32) | lo;
+    }
+    if (flags & CLONE_SETTLS) fc->fs_base = tls;
+    uint64_t child_fs = fc->fs_base;
+
+    th->leader = L; th->pid = L->pid; th->ppid = 0; th->state = SC_PROC_RUN;
+    th->clear_child_tid = (flags & CLONE_CHILD_CLEARTID) ? ctid : 0;
+
+    uint64_t fl = sc_irq_save();                                                                        
+    int tid = sched_create_kthread(fork_child_trampoline, fc, cur->name, cur->priority);
+    task_t *ct = (tid >= 0) ? sched_find((uint32_t)tid) : NULL;
+    if (!ct || sched_pml4_ref(cur->pml4_phys) != 0) {
+        sc_irq_restore(fl);
+        if (tid >= 0) sched_kill((uint32_t)tid);
+        if (tid < 0) kfree(fc);
+        sc_proc_free(th);
+        return -(int64_t)(ct ? EAGAIN : ENOMEM);
+    }
+    ct->pml4_phys = cur->pml4_phys;                                       
+    sched_arch_fork_state(ct);
+    ct->fs_base = child_fs;
+    th->tid = (uint32_t)tid;
+    if ((flags & CLONE_PARENT_SETTID) && ptid && syscall_validate_ptr((void *)(uintptr_t)ptid, 4))
+        *(uint32_t *)(uintptr_t)ptid = (uint32_t)tid;                                                         
+    sc_irq_restore(fl);
+    DBG_VAL("SC", "sys_clone thread tid", (uint64_t)(uint32_t)tid);
+    return (int64_t)(uint32_t)tid;
+}
+
+                                                                                      
+                                                                                         
+static int64_t sc_clone_lx(uint64_t flags, uint64_t child_stack, uint64_t ptid,
+                           uint64_t ctid, uint64_t tls) {
+    if (child_stack && !syscall_validate_ptr((void *)(uintptr_t)child_stack, 8))
+        return -(int64_t)EINVAL;
+    if (flags & CLONE_THREAD) return sc_clone_thread(flags, child_stack, ptid, ctid, tls);
+    return sc_fork_ex(flags, child_stack, ptid, ctid, tls);
 }
 
  
@@ -561,26 +964,112 @@ static int64_t sc_clone(uint64_t flags, uint64_t child_stack,
 
 
 
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+#define SC_EXEC_E2BIG   (-1000)
+#define SC_EXEC_EFAULT  (-1001)
+
+                                                              
+static int sc_exec_spawn(const char *path, uint64_t argv_ptr, uint64_t envp_ptr) {
+    char        *pool = (char *)kmalloc(ELF_ARG_MAX_BYTES);
+    const char **vec  = (const char **)kmalloc(2 * (ELF_ARG_MAX_COUNT + 1) * sizeof(char *));
+    if (!pool || !vec) { if (pool) kfree(pool); if (vec) kfree(vec); return ELF_ERR_NOMEM; }
+    const char **argv = vec, **envp = vec + (ELF_ARG_MAX_COUNT + 1);
+    size_t used = 0;
+    int rc = 0;
+
+    for (int pass = 0; pass < 2 && rc == 0; pass++) {
+        uint64_t uvec = pass ? envp_ptr : argv_ptr;
+        const char **dst = pass ? envp : argv;
+        int n = 0;
+        if (uvec) {
+            for (;; n++) {
+                if (n >= ELF_ARG_MAX_COUNT) { rc = SC_EXEC_E2BIG; break; }
+                if (!syscall_validate_ptr((void *)(uintptr_t)(uvec + (uint64_t)n * 8), 8)) { rc = SC_EXEC_EFAULT; break; }
+                uint64_t up = ((const uint64_t *)(uintptr_t)uvec)[n];
+                if (!up) break;
+                if (used + 1 >= ELF_ARG_MAX_BYTES) { rc = SC_EXEC_E2BIG; break; }
+                int64_t l = sc_copy_string((const char *)(uintptr_t)up, pool + used, ELF_ARG_MAX_BYTES - used);
+                if (l < 0) { rc = SC_EXEC_EFAULT; break; }
+                if (used + (size_t)l + 1 >= ELF_ARG_MAX_BYTES) { rc = SC_EXEC_E2BIG; break; }
+                dst[n] = pool + used;
+                used += (size_t)l + 1;
+            }
+        }
+        dst[n] = NULL;
+    }
+
+    int tid = rc;
+    if (rc == 0) {
+        const char *base = path;
+        for (const char *q = path; *q; q++) if (*q == '/') base = q + 1;
+        char name[32];
+        strncpy(name, base, sizeof(name) - 1);
+        name[sizeof(name) - 1] = '\0';
+        tid = elf64_spawn_ex(path, name, 0, argv, envp);
+    }
+    kfree(pool);
+    kfree(vec);
+    return tid;
+}
+
 static int64_t sc_execve(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr) {
-    (void)argv_ptr; (void)envp_ptr;
-
     char path[VFS_MAX_PATH];
-    if (sc_copy_string((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
         return -(int64_t)EFAULT;
-
     DBG_MSG("SC", "sys_execve");
     DBG_VAL("SC", "execve path ptr", path_ptr);
-
-    int tid = elf64_spawn(path, "execve", 0);
+    int tid = sc_exec_spawn(path, argv_ptr, envp_ptr);
     if (tid < 0) {
+        if (tid == SC_EXEC_E2BIG)  return -(int64_t)7;                 
+        if (tid == SC_EXEC_EFAULT) return -(int64_t)EFAULT;
+        if (tid == ELF_ERR_INTERP) return -(int64_t)8;                                                    
         if (tid == ELF_ERR_IO)    return -(int64_t)ENOENT;
         if (tid == ELF_ERR_NOMEM) return -(int64_t)ENOMEM;
         if (tid == ELF_ERR_MAGIC || tid == ELF_ERR_CLASS ||
             tid == ELF_ERR_ARCH)  return -(int64_t)EACCES;
         return -(int64_t)EINVAL;
     }
-
-     
+                                                                              
+                                                                                          
+    sc_proc_t *p = sc_cur();
+    {                                                                    
+        task_t *self = sched_current();
+        sc_group_kill_others(p, self ? self->tid : SC_NO_TID);
+        sc_thr()->clear_child_tid = 0;
+        p->exit_set = false; p->vm_owner = 0;
+    }
+    for (int fd = 0; fd < SC_FD_MAX; fd++) {
+        if (p->files[fd].open && (p->files[fd].fd_flags & FD_CLOEXEC)) {
+            sc_release_file(&p->files[fd]);
+            p->files[fd].open = false;
+        }
+    }
+    for (int sg = 1; sg < SC_NSIG; sg++)                                                               
+        if (p->sigact[sg].handler != SC_SIG_IGN) memset(&p->sigact[sg], 0, sizeof(p->sigact[sg]));
+    p->sigpending = 0; p->term_sig = 0; p->clear_child_tid = 0;
+    memset(&p->altstack, 0, sizeof(p->altstack));
+    memset(p->vma, 0, sizeof(p->vma));
+    p->brk_current = p->brk_mapped = USER_HEAP_BASE;
+    p->mmap_next   = USER_MMAP_BASE;
+    uint64_t fl = sc_irq_save();
+    p->tid = (uint32_t)tid;
+    g_cur_cache = NULL; g_cur_cache_tid = SC_NO_TID;
+    sc_irq_restore(fl);
     sched_exit();
     __builtin_unreachable();
 }
@@ -595,38 +1084,63 @@ static int64_t sc_execve(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
 
 
 
-static int64_t sc_wait4(uint64_t tid_arg, uint64_t wstatus_ptr, uint64_t options) {
-    (void)options;
+                                                     
+static int64_t sc_reap_child(sc_proc_t *par, sc_proc_t *c, uint64_t wstatus_ptr) {
+    int32_t status = c->term_sig ? (c->term_sig & 0x7F)
+                   : (c->state == SC_PROC_ZOMBIE) ? ((c->exit_code & 0xFF) << 8) : 9;                   
+    uint32_t pid = c->pid;
+    if (wstatus_ptr) *(int32_t *)(uintptr_t)wstatus_ptr = status;
+    par->child_cpu_ns += c->cpu_ns + c->child_cpu_ns;
+    sc_proc_free(c);
+    return (int64_t)pid;
+}
+static bool sc_child_done(const sc_proc_t *c) {
+    return c->state == SC_PROC_ZOMBIE || !sc_group_alive(c);
+}
 
+static int64_t sc_wait4(uint64_t tid_arg, uint64_t wstatus_ptr, uint64_t options) {
     if (wstatus_ptr != 0 && !syscall_validate_ptr((void*)wstatus_ptr, 4))
         return -(int64_t)EFAULT;
+    bool nohang = (options & SC_WNOHANG) != 0;
+    sc_proc_t *me = sc_cur();
 
-    if (tid_arg == (uint64_t)-1) {
-         
-        return -(int64_t)ECHILD;
+    if (tid_arg == (uint64_t)-1 || (int64_t)tid_arg == 0) {                         
+        for (;;) {
+            bool have_child = false;
+            for (int i = 0; i < SC_PROC_MAX; i++) {
+                sc_proc_t *c = g_procs[i];
+                if (!c || c == me || c->leader || c->ppid != me->pid) continue;
+                have_child = true;
+                if (sc_child_done(c)) return sc_reap_child(me, c, wstatus_ptr);
+            }
+            if (!have_child) return -(int64_t)ECHILD;
+            if (nohang) return 0;
+            sc_check_exit_request();
+            sched_yield();
+        }
     }
 
-    uint32_t tid = (uint32_t)tid_arg;
+    uint32_t pid = (uint32_t)tid_arg;
+    sc_proc_t *c = sc_proc_find_pid(pid);
+    if (c && c != me && c->ppid == me->pid) {                                          
+        for (;;) {
+            if (sc_child_done(c)) return sc_reap_child(me, c, wstatus_ptr);
+            if (nohang) return 0;
+            sc_check_exit_request();
+            sched_yield();
+        }
+    }
 
-     
-    uint32_t spin = 0;
-    while (1) {
-        task_t *t = sched_find(tid);
-        if (!t) {
-             
-            if (wstatus_ptr)
-                *(int32_t *)(uintptr_t)wstatus_ptr = 0;
-            return (int64_t)(uint32_t)tid;
+                                                                                        
+    for (;;) {
+        task_t *t = sched_find(pid);
+        if (!t || t->state == TASK_ZOMBIE) {
+            if (wstatus_ptr) *(int32_t *)(uintptr_t)wstatus_ptr = 0;
+            return (int64_t)pid;
         }
-        if (t->state == TASK_ZOMBIE) {
-            if (wstatus_ptr)
-                *(int32_t *)(uintptr_t)wstatus_ptr = 0;
-            return (int64_t)(uint32_t)tid;
-        }
-         
+        if (nohang) return 0;
+        sc_check_exit_request();
         sched_yield();
-        spin++;
-        if (spin > 100000) return -(int64_t)ECHILD;  
     }
 }
 
@@ -635,14 +1149,26 @@ static int64_t sc_wait4(uint64_t tid_arg, uint64_t wstatus_ptr, uint64_t options
 
 
 
-static int64_t sc_open(uint64_t path_ptr, uint64_t flags) {
+static int64_t sc_open(uint64_t path_ptr, uint64_t flags_arg) {
     char path[VFS_MAX_PATH];
-    if (sc_copy_string((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
         return -(int64_t)EFAULT;
 
-    int vfd = vfs_open(path, (int)flags);
+    int lx = (int)flags_arg;                                                     
+    int vf = lx & (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND);
+    if (lx & LX_O_DIRECTORY) vf |= O_DIRECTORY;                                       
+
+    if ((lx & O_CREAT) && (lx & LX_O_EXCL)) {
+        vfs_stat_t ex;
+        if (vfs_stat(path, &ex) == VFS_OK) return -(int64_t)EEXIST;
+    }
+
+    int vfd = vfs_open(path, vf);
+    if (vfd == VFS_ERR_ISDIR && (lx & O_ACCMODE) == O_RDONLY)                                        
+        vfd = vfs_open(path, vf | O_DIRECTORY);
     if (vfd < 0) {
         if (vfd == VFS_ERR_NOENT)  return -(int64_t)ENOENT;
+        if (vfd == VFS_ERR_NOTDIR) return -(int64_t)ENOTDIR;
         if (vfd == VFS_ERR_NOMEM)  return -(int64_t)ENOMEM;
         if (vfd == VFS_ERR_NFILE)  return -(int64_t)ENFILE;
         if (vfd == VFS_ERR_ISDIR)  return -(int64_t)EISDIR;
@@ -658,8 +1184,8 @@ static int64_t sc_open(uint64_t path_ptr, uint64_t flags) {
 
     g_files[fd].open           = true;
     g_files[fd].vfs_fd         = vfd;
-    g_files[fd].flags          = (int)flags;
-    g_files[fd].fd_flags       = 0;
+    g_files[fd].flags          = lx & ~(O_CREAT | O_TRUNC | LX_O_EXCL | LX_O_CLOEXEC);
+    g_files[fd].fd_flags       = (lx & LX_O_CLOEXEC) ? FD_CLOEXEC : 0;
     g_files[fd].is_pipe_read   = false;
     g_files[fd].is_pipe_write  = false;
     g_files[fd].pipe_idx       = -1;
@@ -690,6 +1216,40 @@ static int64_t sc_close(uint64_t fd_arg) {
  
 
 
+
+                                                                           
+                                                                     
+                                                                             
+static inline bool sc_is_console(const sc_file_t *f) {
+    return !f->is_pipe_read && !f->is_pipe_write && f->vfs_fd < 0;
+}
+
+static int64_t sc_console_write(const void *buf_v, uint64_t count) {
+    const char *b = (const char *)buf_v;
+    for (uint64_t i = 0; i < count; i++) dbg_putc(b[i]);
+    return (int64_t)count;
+}
+
+static int64_t sc_console_read(sc_file_t *f, void *buf_v, uint64_t count) {
+    task_t *cur = sched_current();
+    int32_t tid = cur ? (int32_t)cur->tid : 0;
+    char *out = (char *)buf_v;
+    uint64_t n = 0;
+    for (;;) {
+        if (!ui_kbd_focus_owned_by(tid)) return (int64_t)n;                            
+        char ch;
+        while (n < count && usb_hid_kbd_read_char(&ch)) {
+            if (ch == '\r') ch = '\n';
+            out[n++] = ch;
+            if (ch == '\n') return (int64_t)n;                                       
+        }
+        if (n > 0) return (int64_t)n;
+        if (f->flags & LX_O_NONBLOCK) return -(int64_t)EAGAIN;
+        sc_check_exit_request();
+        sched_sleep_ns(2000000);
+    }
+}
+
 static int64_t sc_read_impl(sc_file_t *f, void *buf_v, uint64_t count) {
      
     if (f->is_pipe_read) {
@@ -700,6 +1260,7 @@ static int64_t sc_read_impl(sc_file_t *f, void *buf_v, uint64_t count) {
         uint32_t waited = 0;
         while (p->count == 0) {
             if (p->write_closed) return 0;   
+            if (f->flags & LX_O_NONBLOCK) return -(int64_t)EAGAIN;
             sched_yield();
             waited++;
             if (waited > 1000000) return -(int64_t)EIO;
@@ -714,10 +1275,8 @@ static int64_t sc_read_impl(sc_file_t *f, void *buf_v, uint64_t count) {
         p->count -= (uint32_t)n;
         return (int64_t)n;
     }
-    if (f->vfs_fd < 0) return -(int64_t)EBADF;       
-
-     
     if ((f->flags & O_ACCMODE) == O_WRONLY) return -(int64_t)EBADF;
+    if (f->vfs_fd < 0) return sc_console_read(f, buf_v, count);
 
     int64_t n = vfs_read(f->vfs_fd, buf_v, count);
     if (n == VFS_ERR_BADF)    return -(int64_t)EBADF;
@@ -745,12 +1304,14 @@ static int64_t sc_write_impl(sc_file_t *f, const void *buf_v, uint64_t count) {
      
     if (f->is_pipe_write) {
         pipe_t *p = &g_pipes[f->pipe_idx];
-        if (!p->valid || p->read_closed) return -(int64_t)EPIPE;
+        if (!p->valid || p->read_closed) { sc_raise_self(SC_SIGPIPE); return -(int64_t)EPIPE; }
 
         const uint8_t *buf = (const uint8_t *)buf_v;
         uint64_t written = 0;
         while (written < count) {
             if (p->count >= PIPE_BUF_SIZE) {
+                if (f->flags & LX_O_NONBLOCK) return written ? (int64_t)written : -(int64_t)EAGAIN;
+                if (p->read_closed) { sc_raise_self(SC_SIGPIPE); return -(int64_t)EPIPE; }
                 sched_yield();
                 continue;
             }
@@ -762,6 +1323,7 @@ static int64_t sc_write_impl(sc_file_t *f, const void *buf_v, uint64_t count) {
     }
      
     if ((f->flags & O_ACCMODE) == O_RDONLY) return -(int64_t)EBADF;
+    if (f->vfs_fd < 0) return sc_console_write(buf_v, count);
 
     int64_t n = vfs_write(f->vfs_fd, buf_v, count);
     if (n == VFS_ERR_ROFS)    return -(int64_t)EROFS;
@@ -789,7 +1351,7 @@ static int64_t sc_lseek(uint64_t fd_arg, uint64_t offset_arg, uint64_t whence) {
     int fd = (int)(uint32_t)fd_arg;
     sc_file_t *f = sc_get_file(fd);
     if (!f) return -(int64_t)EBADF;
-    if (f->is_pipe_read || f->is_pipe_write) return -(int64_t)EINVAL;
+    if (f->is_pipe_read || f->is_pipe_write || f->vfs_fd < 0) return -(int64_t)ESPIPE;
 
     int64_t offset = (int64_t)offset_arg;
     if ((int)whence == 0 && offset == 0) f->dir_pos = 0;    
@@ -804,12 +1366,12 @@ static int64_t sc_lseek(uint64_t fd_arg, uint64_t offset_arg, uint64_t whence) {
 
 
 
-static int64_t sc_stat(uint64_t path_ptr, uint64_t stat_ptr) {
+static int64_t sc_stat_fex(uint64_t path_ptr, uint64_t stat_ptr) {
     if (!syscall_validate_ptr((void *)(uintptr_t)stat_ptr, sizeof(sc_stat_t)))
         return -(int64_t)EFAULT;
 
     char path[VFS_MAX_PATH];
-    if (sc_copy_string((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
         return -(int64_t)EFAULT;
 
     vfs_stat_t vs;
@@ -833,7 +1395,7 @@ static int64_t sc_stat(uint64_t path_ptr, uint64_t stat_ptr) {
 
 
 
-static int64_t sc_fstat(uint64_t fd_arg, uint64_t stat_ptr) {
+static int64_t sc_fstat_fex(uint64_t fd_arg, uint64_t stat_ptr) {
     if (!syscall_validate_ptr((void *)(uintptr_t)stat_ptr, sizeof(sc_stat_t)))
         return -(int64_t)EFAULT;
 
@@ -883,7 +1445,7 @@ static int64_t sc_readdir(uint64_t fd_arg, uint64_t index, uint64_t dirent_ptr) 
 static int64_t sc_mkdir(uint64_t path_ptr, uint64_t mode) {
     (void)mode;
     char path[VFS_MAX_PATH];
-    if (sc_copy_string((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
         return -(int64_t)EFAULT;
 
     int r = vfs_mkdir(path);
@@ -900,7 +1462,7 @@ static int64_t sc_mkdir(uint64_t path_ptr, uint64_t mode) {
 
 static int64_t sc_rmdir(uint64_t path_ptr) {
     char path[VFS_MAX_PATH];
-    if (sc_copy_string((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
         return -(int64_t)EFAULT;
 
     int r = vfs_rmdir(path);
@@ -918,7 +1480,7 @@ static int64_t sc_rmdir(uint64_t path_ptr) {
 
 static int64_t sc_unlink(uint64_t path_ptr) {
     char path[VFS_MAX_PATH];
-    if (sc_copy_string((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
         return -(int64_t)EFAULT;
 
     int r = vfs_unlink(path);
@@ -935,14 +1497,49 @@ static int64_t sc_unlink(uint64_t path_ptr) {
 
 
 static int64_t sc_rename(uint64_t old_ptr, uint64_t new_ptr) {
-     
+                                                                                
+                                                                                     
+    char *op = (char *)kmalloc(VFS_MAX_PATH);
+    char *np = (char *)kmalloc(VFS_MAX_PATH);
+    uint8_t *buf = (uint8_t *)kmalloc(4096);
+    int64_t rc = 0;
+    if (!op || !np || !buf) { rc = -(int64_t)ENOMEM; goto out; }
+    if (sc_copy_path((const char *)(uintptr_t)old_ptr, op, VFS_MAX_PATH) < 0 ||
+        sc_copy_path((const char *)(uintptr_t)new_ptr, np, VFS_MAX_PATH) < 0) { rc = -(int64_t)EFAULT; goto out; }
+    if (strcmp(op, np) == 0) goto out;
 
+    vfs_stat_t st;
+    int r = vfs_stat(op, &st);
+    if (r != VFS_OK) { rc = sc_vfs_errno(r); goto out; }
+    if (st.type == VFS_TYPE_DIR) { rc = -(int64_t)EXDEV; goto out; }
 
+    vfs_stat_t dst;
+    if (vfs_stat(np, &dst) == VFS_OK && dst.type == VFS_TYPE_DIR) { rc = -(int64_t)EISDIR; goto out; }
 
-
-    (void)old_ptr; (void)new_ptr;
-    DBG_MSG("SC", "sys_rename: ENOSYS (vfs_rename not implemented)");
-    return -(int64_t)ENOSYS;
+    int in = vfs_open(op, O_RDONLY);
+    if (in < 0) { rc = sc_vfs_errno(in); goto out; }
+    int outfd = vfs_open(np, O_WRONLY | O_CREAT | O_TRUNC);
+    if (outfd < 0) { vfs_close(in); rc = sc_vfs_errno(outfd); goto out; }
+    for (;;) {
+        int64_t n = vfs_read(in, buf, 4096);
+        if (n < 0) { rc = -(int64_t)EIO; break; }
+        if (n == 0) break;
+        int64_t w = vfs_write(outfd, buf, (uint64_t)n);
+        if (w != n) { rc = (w == VFS_ERR_NOSPC) ? -(int64_t)ENOSPC : -(int64_t)EIO; break; }
+    }
+    vfs_close(in);
+    vfs_close(outfd);
+    if (rc == 0) {
+        r = vfs_unlink(op);
+        if (r != VFS_OK) rc = sc_vfs_errno(r);
+    } else {
+        vfs_unlink(np);
+    }
+out:
+    if (op) kfree(op);
+    if (np) kfree(np);
+    if (buf) kfree(buf);
+    return rc;
 }
 
  
@@ -952,11 +1549,10 @@ static int64_t sc_rename(uint64_t old_ptr, uint64_t new_ptr) {
 
 
 
-static char g_cwd[VFS_MAX_PATH] = "/";
 
 static int64_t sc_chdir(uint64_t path_ptr) {
     char path[VFS_MAX_PATH];
-    if (sc_copy_string((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
         return -(int64_t)EFAULT;
 
     vfs_stat_t vs;
@@ -1004,6 +1600,19 @@ static int64_t sc_fcntl(uint64_t fd_arg, uint64_t cmd, uint64_t arg) {
         sc_dup_into(new_fd, f);
         return (int64_t)new_fd;
     }
+    case 1030: {                                                        
+        int new_fd = sc_alloc_fd_from((int)arg);
+        if (new_fd < 0) return -(int64_t)EMFILE;
+        sc_dup_into(new_fd, f);
+        g_files[new_fd].fd_flags = FD_CLOEXEC;
+        return (int64_t)new_fd;
+    }
+    case 5:                                                                                      
+        if (!syscall_validate_ptr((void *)(uintptr_t)arg, 32)) return -(int64_t)EFAULT;
+        *(int16_t *)(uintptr_t)arg = 2;                         
+        return 0;
+    case 6: case 7:                                                                       
+        return 0;
     case F_GETFD:
         return (int64_t)f->fd_flags;
     case F_SETFD:
@@ -1086,6 +1695,8 @@ static int64_t sc_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     if ((flags & MAP_FIXED) && addr != 0) {
         va = ROUND_DOWN(addr, PAGE_SIZE);
         if (va > USER_VIRT_LIMIT) return -(int64_t)EINVAL;
+        for (uint64_t i = 0; i < npages; i++)                                                        
+            vmm_user_release_page(va + (i << PAGE_SHIFT));
     } else {
         va = mmap_bump_alloc(npages << PAGE_SHIFT);
         if (va == (uint64_t)-1) return -(int64_t)ENOMEM;
@@ -1099,9 +1710,10 @@ static int64_t sc_mmap(uint64_t addr, uint64_t length, uint64_t prot,
         uint8_t *kp = (uint8_t *)(uintptr_t)(pa + DIRECT_MAP_OFFSET);
         memset(kp, 0, (size_t)(npages << PAGE_SHIFT));
 
+        int pkind = (flags & MAP_SHARED) ? VMM_PAGE_SHARED : VMM_PAGE_OWNED;
         for (uint64_t i = 0; i < npages; i++) {
-            int r = vmm_map_user(va + (i << PAGE_SHIFT),
-                                 pa + (i << PAGE_SHIFT), rw, exec);
+            int r = vmm_map_user_ex(va + (i << PAGE_SHIFT),
+                                    pa + (i << PAGE_SHIFT), rw, exec, pkind);
             if (r != 0) {
                 pmm_free_frames(pa, (size_t)npages);
                 return -(int64_t)ENOMEM;
@@ -1125,6 +1737,7 @@ static int64_t sc_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     memset(kbuf, 0, (size_t)(npages << PAGE_SHIFT));
 
      
+    int64_t saved_pos = vfs_seek(f->vfs_fd, 0, 1);
     int64_t seek_r = vfs_seek(f->vfs_fd, (int64_t)offset, 0);
     if (seek_r < 0) {
         pmm_free_frames(pa, (size_t)npages);
@@ -1132,6 +1745,7 @@ static int64_t sc_mmap(uint64_t addr, uint64_t length, uint64_t prot,
     }
 
     int64_t nr = vfs_read(f->vfs_fd, kbuf, (uint64_t)(npages << PAGE_SHIFT));
+    if (saved_pos >= 0) vfs_seek(f->vfs_fd, saved_pos, 0);
     if (nr < 0) {
         pmm_free_frames(pa, (size_t)npages);
         return -(int64_t)EIO;
@@ -1160,39 +1774,63 @@ static int64_t sc_mmap(uint64_t addr, uint64_t length, uint64_t prot,
 static int64_t sc_munmap(uint64_t addr, uint64_t length) {
     if (length == 0) return -(int64_t)EINVAL;
     if (addr > USER_VIRT_LIMIT) return -(int64_t)EINVAL;
-
     uint64_t va     = ROUND_DOWN(addr, PAGE_SIZE);
     uint64_t npages = ROUND_UP(length, PAGE_SIZE) >> PAGE_SHIFT;
-
-    for (uint64_t i = 0; i < npages; i++) {
-        uint64_t pva = va + (i << PAGE_SHIFT);
-        if (!sc_user_unmap_page(pva))
-            vmm_unmap(pva);    
-    }
-
-     
-
-
-
+                                                                                                              
+    for (uint64_t i = 0; i < npages; i++)
+        vmm_user_release_page(va + (i << PAGE_SHIFT));
     sc_vma_t *v = sc_vma_containing(va);
     if (v) {
         uint64_t v_end = v->va + (v->npages << PAGE_SHIFT);
         uint64_t u_end = va + (npages << PAGE_SHIFT);
-        if (va <= v->va && u_end >= v_end) {                        
-            pmm_free_frames(v->pa, (size_t)v->npages);
+        if (va <= v->va && u_end >= v_end) {                                       
             memset(v, 0, sizeof(*v));
-        } else if (va > v->va && u_end >= v_end) {                  
-            uint64_t keep = (va - v->va) >> PAGE_SHIFT;
-            pmm_free_frames(v->pa + (keep << PAGE_SHIFT), (size_t)(v->npages - keep));
-            v->npages = keep;
-        } else if (va <= v->va && u_end < v_end) {                  
+        } else if (va > v->va && u_end >= v_end) {                            
+            v->npages = (va - v->va) >> PAGE_SHIFT;
+        } else if (va <= v->va && u_end < v_end) {                            
             uint64_t cut = (u_end - v->va) >> PAGE_SHIFT;
-            pmm_free_frames(v->pa, (size_t)cut);
             v->va += cut << PAGE_SHIFT;
             v->pa += cut << PAGE_SHIFT;
             v->npages -= cut;
-        } else {                                                    
+        } else {                                                                                           
             memset(v, 0, sizeof(*v));
+        }
+    }
+    return 0;
+}
+static int64_t sc_mprotect(uint64_t addr, uint64_t length, uint64_t prot) {
+    if (addr > USER_VIRT_LIMIT || (addr & (PAGE_SIZE - 1))) return -(int64_t)EINVAL;
+    if (length == 0) return 0;
+    if (prot & ~(uint64_t)(PROT_READ | PROT_WRITE | PROT_EXEC)) return -(int64_t)EINVAL;
+    uint64_t npages = ROUND_UP(length, PAGE_SIZE) >> PAGE_SHIFT;
+    if (addr + (npages << PAGE_SHIFT) - 1 > USER_VIRT_LIMIT) return -(int64_t)ENOMEM;
+
+    for (uint64_t i = 0; i < npages; i++)                                                          
+        if (!sc_user_page_present(addr + (i << PAGE_SHIFT), NULL)) return -(int64_t)ENOMEM;
+
+    const uint64_t PTE_US  = 1ULL << 2;                            
+    const uint64_t PTE_WR  = 1ULL << 1;
+    const uint64_t PTE_CW  = 1ULL << 9;                                                 
+    for (uint64_t i = 0; i < npages; i++) {
+        uint64_t va = addr + (i << PAGE_SHIFT);
+        uint64_t *pte = sc_find_pte(va);
+        uint64_t e = *pte;
+        if (prot == PROT_NONE) e &= ~PTE_US;                                                           
+        else                   e |=  PTE_US;
+        if (e & PTE_CW) {
+                                                                                
+                                                                                 
+            e &= ~PTE_WR;
+        } else if (prot & PROT_WRITE) e |= PTE_WR;
+        else                          e &= ~PTE_WR;
+        if (prot & PROT_EXEC) e &= ~PTE_NX; else e |= PTE_NX;
+        *pte = e;
+        __asm__ volatile ("invlpg (%0)" :: "r"(va) : "memory");
+    }
+    for (int i = 0; i < SC_VMA_MAX; i++) {                                                            
+        sc_vma_t *v = &g_vma[i];
+        if (v->used && addr <= v->va && addr + (npages << PAGE_SHIFT) >= v->va + (v->npages << PAGE_SHIFT)) {
+            v->rw = (prot & PROT_WRITE) != 0; v->exec = (prot & PROT_EXEC) != 0;
         }
     }
     return 0;
@@ -1203,56 +1841,23 @@ static int64_t sc_munmap(uint64_t addr, uint64_t length) {
 
 
 
-
-
-
-
-
-static int64_t sc_mprotect(uint64_t addr, uint64_t length, uint64_t prot) {
-     
-
-
-
-
-
-
-    if (addr > USER_VIRT_LIMIT) return -(int64_t)EINVAL;
-    if (length == 0)            return -(int64_t)EINVAL;
-    (void)prot;
-
-    DBG_MSG("SC", "sys_mprotect: stub (no vma tracking)");
-    return 0;
-}
-
- 
-
-
-
-
 static int64_t sc_arch_prctl(uint64_t code, uint64_t addr) {
+    const uint32_t MSR_FS = 0xC0000100u, MSR_GS = 0xC0000101u;
     switch (code) {
     case ARCH_SET_FS:
-         
-
-        __asm__ volatile ("wrfsbase %0" :: "r"(addr));
-        return 0;
-    case ARCH_GET_FS: {
-        if (!syscall_validate_ptr((void *)(uintptr_t)addr, 8))
-            return -(int64_t)EFAULT;
-        uint64_t fs;
-        __asm__ volatile ("rdfsbase %0" : "=r"(fs));
-        *(uint64_t *)(uintptr_t)addr = fs;
+    case ARCH_SET_GS: {
+        if (addr > USER_VIRT_LIMIT) return -(int64_t)EPERM;                                                 
+        uint32_t msr = (code == ARCH_SET_FS) ? MSR_FS : MSR_GS;
+        __asm__ volatile ("wrmsr" :: "c"(msr), "a"((uint32_t)addr), "d"((uint32_t)(addr >> 32)) : "memory");
+        if (code == ARCH_SET_FS) { task_t *t = sched_current(); if (t) t->fs_base = addr; }
         return 0;
     }
-    case ARCH_SET_GS:
-        __asm__ volatile ("wrgsbase %0" :: "r"(addr));
-        return 0;
+    case ARCH_GET_FS:
     case ARCH_GET_GS: {
-        if (!syscall_validate_ptr((void *)(uintptr_t)addr, 8))
-            return -(int64_t)EFAULT;
-        uint64_t gs;
-        __asm__ volatile ("rdgsbase %0" : "=r"(gs));
-        *(uint64_t *)(uintptr_t)addr = gs;
+        if (!syscall_validate_ptr((void *)(uintptr_t)addr, 8)) return -(int64_t)EFAULT;
+        uint32_t msr = (code == ARCH_GET_FS) ? MSR_FS : MSR_GS, lo, hi;
+        __asm__ volatile ("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+        *(uint64_t *)(uintptr_t)addr = ((uint64_t)hi << 32) | lo;
         return 0;
     }
     default:
@@ -1276,6 +1881,9 @@ static int64_t sc_pipe(uint64_t pipefd_ptr) {
         g_pipes[pidx].valid = false;
         return -(int64_t)EMFILE;
     }
+                                                                                    
+    memset(&g_files[fd_r], 0, sizeof(sc_file_t));
+    g_files[fd_r].open = true;
 
     int fd_w = sc_alloc_fd();
     if (fd_w < 0) {
@@ -1383,9 +1991,9 @@ static int64_t sc_shm_at(uint64_t shm_idx_arg, uint64_t addr_hint, uint64_t prot
 
      
     for (uint32_t i = 0; i < shm->pages; i++) {
-        int r = vmm_map_user(va + ((uint64_t)i << PAGE_SHIFT),
-                             shm->phys_base + ((uint64_t)i << PAGE_SHIFT),
-                             rw, exec);
+        int r = vmm_map_user_ex(va + ((uint64_t)i << PAGE_SHIFT),
+                                shm->phys_base + ((uint64_t)i << PAGE_SHIFT),
+                                rw, exec, VMM_PAGE_FOREIGN);
         if (r != 0) return -(int64_t)ENOMEM;
     }
 
@@ -1409,7 +2017,7 @@ static int64_t sc_shm_detach(uint64_t va, uint64_t shm_idx_arg) {
 
      
     for (uint32_t i = 0; i < shm->pages; i++) {
-        vmm_unmap(ROUND_DOWN(va, PAGE_SIZE) + ((uint64_t)i << PAGE_SHIFT));
+        sc_user_unmap_page(ROUND_DOWN(va, PAGE_SIZE) + ((uint64_t)i << PAGE_SHIFT));
     }
 
     shm->refcount--;
@@ -1491,9 +2099,9 @@ static int64_t sc_get_framebuffer(uint64_t fb_ptr) {
         uint64_t npages    = (fb_bytes + page_off + PAGE_SIZE - 1) / PAGE_SIZE;
 
         for (uint64_t i = 0; i < npages; i++) {
-            int r = vmm_map_user(FB_USER_VA_BASE + (i << PAGE_SHIFT),
-                                 page_base + (i << PAGE_SHIFT),
-                                 true  , false  );
+            int r = vmm_map_user_ex(FB_USER_VA_BASE + (i << PAGE_SHIFT),
+                                    page_base + (i << PAGE_SHIFT),
+                                    true  , false  , VMM_PAGE_FOREIGN);
             if (r != 0) {
                 DBG_MSG("SC", "sys_get_framebuffer: vmm_map_user failed");
                 return -(int64_t)ENOMEM;
@@ -1836,6 +2444,149 @@ static int64_t sc_nanosleep(uint64_t req_ptr, uint64_t rem_ptr) {
 }
 
  
+                                                                              
+static void sc_set_realtime_ns(int64_t ns) {
+    g_rt_base_ns = ns - (int64_t)sc_mono_ns();
+    g_rt_valid   = true;
+}
+static void sc_sleep_until_mono(uint64_t deadline_ns) {
+    for (;;) {
+        uint64_t now = sc_mono_ns();
+        if (now >= deadline_ns) break;
+        sc_check_exit_request();
+        uint64_t rem = deadline_ns - now;
+        sched_sleep_ns(rem > 10000000ULL ? 10000000ULL : rem);                                                   
+    }
+}
+static bool sc_clock_valid(int64_t clk) {
+    switch ((int)clk) {
+    case SC_CLOCK_REALTIME: case SC_CLOCK_MONOTONIC: case SC_CLOCK_PROCESS_CPUTIME_ID:
+    case SC_CLOCK_THREAD_CPUTIME_ID: case SC_CLOCK_MONOTONIC_RAW: case SC_CLOCK_BOOTTIME:
+        return true;
+    default: return false;
+    }
+}
+
+                                                        
+static int64_t sc_time(uint64_t tloc_ptr) {
+    int64_t sec = sc_realtime_ns() / 1000000000LL;
+    if (tloc_ptr) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)tloc_ptr, sizeof(int64_t)))
+            return -(int64_t)EFAULT;
+        *(int64_t *)(uintptr_t)tloc_ptr = sec;
+    }
+    return sec;
+}
+
+                                                                             
+static int64_t sc_times(uint64_t buf_ptr) {
+    const uint64_t ns_per_tick = 1000000000ULL / SC_TICKS_PER_SEC;
+    if (buf_ptr) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)buf_ptr, sizeof(sc_tms_t)))
+            return -(int64_t)EFAULT;
+        task_t *t = sched_current();
+        sc_tms_t *tm = (sc_tms_t *)(uintptr_t)buf_ptr;
+        tm->tms_utime  = (int64_t)((t ? t->total_runtime : 0) / ns_per_tick);
+        tm->tms_stime  = 0;                                                          
+        tm->tms_cutime = (int64_t)(sc_cur()->child_cpu_ns / ns_per_tick);
+        tm->tms_cstime = 0;
+    }
+    return (int64_t)(sc_mono_ns() / ns_per_tick);
+}
+
+                                     
+static int64_t sc_getrusage(uint64_t who, uint64_t ru_ptr) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)ru_ptr, sizeof(sc_rusage_t)))
+        return -(int64_t)EFAULT;
+    uint64_t ns;
+    switch ((int64_t)who) {
+    case SC_RUSAGE_SELF: case SC_RUSAGE_THREAD: {
+        task_t *t = sched_current();
+        ns = t ? t->total_runtime : 0;
+        break;
+    }
+    case SC_RUSAGE_CHILDREN:
+        ns = sc_cur()->child_cpu_ns;
+        break;
+    default:
+        return -(int64_t)EINVAL;
+    }
+    sc_rusage_t *ru = (sc_rusage_t *)(uintptr_t)ru_ptr;
+    memset(ru, 0, sizeof(*ru));
+    ru->ru_utime.tv_sec  = (int64_t)(ns / 1000000000ULL);
+    ru->ru_utime.tv_usec = (int64_t)((ns % 1000000000ULL) / 1000ULL);
+    return 0;
+}
+
+                                                                             
+static int64_t sc_settimeofday(uint64_t tv_ptr, uint64_t tz_ptr) {
+    (void)tz_ptr;
+    if (!tv_ptr) return 0;
+    if (!syscall_validate_ptr((void *)(uintptr_t)tv_ptr, sizeof(sc_timeval_t)))
+        return -(int64_t)EFAULT;
+    const sc_timeval_t *tv = (const sc_timeval_t *)(uintptr_t)tv_ptr;
+    if (tv->tv_sec < 0 || tv->tv_usec < 0 || tv->tv_usec >= 1000000) return -(int64_t)EINVAL;
+    sc_set_realtime_ns(tv->tv_sec * 1000000000LL + tv->tv_usec * 1000LL);
+    return 0;
+}
+
+                                                            
+static int64_t sc_clock_settime(uint64_t clk, uint64_t ts_ptr) {
+    if ((int)clk != SC_CLOCK_REALTIME) return -(int64_t)EINVAL;
+    if (!syscall_validate_ptr((void *)(uintptr_t)ts_ptr, sizeof(sc_timespec_t)))
+        return -(int64_t)EFAULT;
+    const sc_timespec_t *ts = (const sc_timespec_t *)(uintptr_t)ts_ptr;
+    if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000LL) return -(int64_t)EINVAL;
+    sc_set_realtime_ns(ts->tv_sec * 1000000000LL + ts->tv_nsec);
+    return 0;
+}
+
+                                           
+static int64_t sc_clock_getres(uint64_t clk, uint64_t ts_ptr) {
+    if (!sc_clock_valid((int64_t)(int)clk)) return -(int64_t)EINVAL;
+    if (ts_ptr) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)ts_ptr, sizeof(sc_timespec_t)))
+            return -(int64_t)EFAULT;
+        sc_timespec_t *ts = (sc_timespec_t *)(uintptr_t)ts_ptr;
+        ts->tv_sec = 0; ts->tv_nsec = 1;
+    }
+    return 0;
+}
+
+                                           
+static int64_t sc_clock_nanosleep(uint64_t clk, uint64_t flags, uint64_t req_ptr, uint64_t rem_ptr) {
+    switch ((int)clk) {
+    case SC_CLOCK_REALTIME: case SC_CLOCK_MONOTONIC:
+    case SC_CLOCK_MONOTONIC_RAW: case SC_CLOCK_BOOTTIME: break;
+    default: return -(int64_t)EINVAL;
+    }
+    if (!syscall_validate_ptr((void *)(uintptr_t)req_ptr, sizeof(sc_timespec_t)))
+        return -(int64_t)EFAULT;
+    if (rem_ptr && !syscall_validate_ptr((void *)(uintptr_t)rem_ptr, sizeof(sc_timespec_t)))
+        return -(int64_t)EFAULT;
+    const sc_timespec_t *req = (const sc_timespec_t *)(uintptr_t)req_ptr;
+    int64_t sec = req->tv_sec, nsec = req->tv_nsec;
+    if (sec < 0 || nsec < 0 || nsec >= 1000000000LL) return -(int64_t)EINVAL;
+    if (sec > 100000000000LL) sec = 100000000000LL;                                             
+
+    if (flags & SC_TIMER_ABSTIME) {
+        int64_t abs_ns = sec * 1000000000LL + nsec;
+        if ((int)clk == SC_CLOCK_REALTIME) {
+            (void)sc_realtime_ns();                                                                     
+            abs_ns -= g_rt_base_ns;                                                                    
+        }
+        if (abs_ns > 0) sc_sleep_until_mono((uint64_t)abs_ns);
+        return 0;                                                                                    
+    }
+    if (sec > 100000000LL) sec = 100000000LL;
+    sc_sleep_until_mono(sc_mono_ns() + (uint64_t)sec * 1000000000ULL + (uint64_t)nsec);
+    if (rem_ptr) {
+        sc_timespec_t *rem = (sc_timespec_t *)(uintptr_t)rem_ptr;
+        rem->tv_sec = 0; rem->tv_nsec = 0;
+    }
+    return 0;
+}
+
 static void sc_uts_set(char *dst, const char *src) {
     size_t i = 0;
     while (src[i] && i < SC_UTS_LEN - 1) { dst[i] = src[i]; i++; }
@@ -1982,6 +2733,7 @@ static int64_t sc_madvise(uint64_t addr, uint64_t length, uint64_t advice) {
             uint64_t va = addr + (i << PAGE_SHIFT), pa;
             sc_vma_t *v = sc_vma_containing(va);
             if (!v || v->kind != SC_VMA_ANON) continue;
+            vmm_cow_break(va);                                                        
             if (sc_user_page_present(va, &pa))
                 memset((void *)(uintptr_t)(pa + DIRECT_MAP_OFFSET), 0, PAGE_SIZE);
         }
@@ -2016,8 +2768,7 @@ static int64_t sc_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size
 
     if (new_np < old_np) {                                             
         for (uint64_t i = new_np; i < old_np; i++)
-            sc_user_unmap_page(old_addr + (i << PAGE_SHIFT));
-        pmm_free_frames(v->pa + (new_np << PAGE_SHIFT), (size_t)(old_np - new_np));
+            vmm_user_release_page(old_addr + (i << PAGE_SHIFT));
         v->npages = new_np;
         return (int64_t)old_addr;
     }
@@ -2028,7 +2779,11 @@ static int64_t sc_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size
     if (new_pa == (uint64_t)-1) return -(int64_t)ENOMEM;
     uint8_t *kn = (uint8_t *)(uintptr_t)(new_pa + DIRECT_MAP_OFFSET);
     memset(kn, 0, (size_t)(new_np << PAGE_SHIFT));
-    memcpy(kn, (const void *)(uintptr_t)(v->pa + DIRECT_MAP_OFFSET), (size_t)(old_np << PAGE_SHIFT));
+    for (uint64_t i = 0; i < old_np; i++) {                                                                 
+        uint64_t opa;
+        if (sc_user_page_present(old_addr + (i << PAGE_SHIFT), &opa))
+            memcpy(kn + (i << PAGE_SHIFT), (const void *)(uintptr_t)(opa + DIRECT_MAP_OFFSET), PAGE_SIZE);
+    }
 
     uint64_t new_va = mmap_bump_alloc(new_np << PAGE_SHIFT);
     if (new_va == (uint64_t)-1) { pmm_free_frames(new_pa, (size_t)new_np); return -(int64_t)ENOMEM; }
@@ -2041,9 +2796,8 @@ static int64_t sc_mremap(uint64_t old_addr, uint64_t old_size, uint64_t new_size
             return -(int64_t)ENOMEM;
         }
     }
-    for (uint64_t i = 0; i < old_np; i++)                             
-        sc_user_unmap_page(old_addr + (i << PAGE_SHIFT));
-    pmm_free_frames(v->pa, (size_t)old_np);
+    for (uint64_t i = 0; i < old_np; i++)
+        vmm_user_release_page(old_addr + (i << PAGE_SHIFT));
 
     v->va = new_va; v->pa = new_pa; v->npages = new_np;
     return (int64_t)new_va;
@@ -2132,7 +2886,7 @@ static int64_t sc_writev(uint64_t fd, uint64_t iov, uint64_t cnt) { return sc_io
 static int64_t sc_access(uint64_t path_ptr, uint64_t mode) {
     if (mode & ~7ULL) return -(int64_t)EINVAL;
     char path[VFS_MAX_PATH];
-    if (sc_copy_string((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
         return -(int64_t)EFAULT;
     vfs_stat_t vs;
     int r = vfs_stat(path, &vs);
@@ -2145,7 +2899,7 @@ static int64_t sc_access(uint64_t path_ptr, uint64_t mode) {
 static int64_t sc_truncate(uint64_t path_ptr, uint64_t length) {
     if ((int64_t)length < 0) return -(int64_t)EINVAL;
     char path[VFS_MAX_PATH];
-    if (sc_copy_string((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
         return -(int64_t)EFAULT;
     int r = vfs_truncate(path, length);
     return r == VFS_OK ? 0 : sc_vfs_errno(r);
@@ -2327,7 +3081,8 @@ static int64_t sc_klog_read(uint64_t pos_ptr, uint64_t buf_ptr, uint64_t size) {
 static inline bool sc_is_noisy(uint64_t nr) {
     return nr == SYS_KLOG_READ   || nr == SYS_INPUT_POLL || nr == SYS_KBD_READ_CHAR ||
            nr == SYS_WIN_GET_RECT|| nr == SYS_SCHED_YIELD|| nr == SYS_NANOSLEEP ||
-           nr == SYS_CLOCK_GETTIME || nr == SYS_GETTIMEOFDAY || nr == SYS_GET_FRAMEBUFFER;
+           nr == SYS_CLOCK_GETTIME || nr == SYS_GETTIMEOFDAY || nr == SYS_GET_FRAMEBUFFER ||
+           nr == SYS_TIME || nr == SYS_TIMES || nr == SYS_CLOCK_GETRES || nr == SYS_CLOCK_NANOSLEEP;
 }
 
  
@@ -2392,9 +3147,552 @@ static int64_t sc_net_status(uint64_t buf_ptr, uint64_t bufsz) {
  
 
 
-int64_t syscall_dispatch(uint64_t nr,
+                                                                         
+                          
+                                                                            
+                                     
+                                                                            
+#define SC_E2BIG        7
+#define SC_ENOTTY       25
+#define SC_ETIMEDOUT    110
+
+                                                                            
+                                                                         
+                                                                               
+                                                                             
+                                                                                
+static bool sc_sig_default_fatal(int sig) {
+    switch (sig) {
+    case SC_SIGCHLD: case SC_SIGURG: case SC_SIGWINCH: case SC_SIGCONT:
+    case SC_SIGSTOP: case 20: case 21: case 22:                                         
+        return false;
+    default:
+        return true;
+    }
+}
+
+static void sc_exit_signal(int sig) {
+    sc_cur()->term_sig = sig;
+    sc_exit_group((uint64_t)(128 + sig));                                                  
+}
+
+static void sc_terminate_other(sc_proc_t *p, int sig) {
+    p->term_sig = sig;
+    p->exit_code = 128 + sig;
+    p->exit_set = true;
+    sc_group_kill_others(p, SC_NO_TID);                                  
+    sc_files_close_all(p);
+    p->state = SC_PROC_ZOMBIE;
+}
+
+static int sc_signal_proc(sc_proc_t *p, int sig, bool is_self) {
+    if (sig == 0) return 0;
+    uint64_t bit = 1ULL << (sig - 1);
+    sc_ksigaction_t *a = &p->sigact[sig];
+    if (sig != SC_SIGKILL) {
+        if (sig == SC_SIGSTOP)           return 0;
+        if (a->handler == SC_SIG_IGN)    return 0;
+        if (a->handler == SC_SIG_DFL && !sc_sig_default_fatal(sig)) return 0;
+        if (p->sigmask & bit)            { p->sigpending |= bit; return 0; }
+        if (a->handler != SC_SIG_DFL)    { p->sigpending |= bit; return 0; }                                  
+    }
+    if (is_self) sc_exit_signal(sig);
+    sc_terminate_other(p, sig);
+    return 0;
+}
+
+static void sc_raise_self(int sig) { sc_signal_proc(sc_cur(), sig, true); }
+
+static int64_t sc_rt_sigaction(uint64_t sig, uint64_t act_ptr, uint64_t old_ptr, uint64_t sz) {
+    if (sz != 8 || sig < 1 || sig >= SC_NSIG) return -(int64_t)EINVAL;
+    sc_proc_t *p = sc_cur();
+    if (old_ptr) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)old_ptr, sizeof(sc_ksigaction_t))) return -(int64_t)EFAULT;
+        *(sc_ksigaction_t *)(uintptr_t)old_ptr = p->sigact[sig];
+    }
+    if (act_ptr) {
+        if (sig == SC_SIGKILL || sig == SC_SIGSTOP) return -(int64_t)EINVAL;
+        if (!syscall_validate_ptr((void *)(uintptr_t)act_ptr, sizeof(sc_ksigaction_t))) return -(int64_t)EFAULT;
+        p->sigact[sig] = *(const sc_ksigaction_t *)(uintptr_t)act_ptr;
+        if (p->sigact[sig].handler == SC_SIG_IGN ||
+            (p->sigact[sig].handler == SC_SIG_DFL && !sc_sig_default_fatal((int)sig)))
+            p->sigpending &= ~(1ULL << (sig - 1));
+    }
+    return 0;
+}
+
+static int64_t sc_rt_sigprocmask(uint64_t how, uint64_t set_ptr, uint64_t old_ptr, uint64_t sz) {
+    if (sz != 8) return -(int64_t)EINVAL;
+    sc_proc_t *p = sc_cur();
+    if (old_ptr) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)old_ptr, 8)) return -(int64_t)EFAULT;
+        *(uint64_t *)(uintptr_t)old_ptr = p->sigmask;
+    }
+    if (!set_ptr) return 0;
+    if (!syscall_validate_ptr((void *)(uintptr_t)set_ptr, 8)) return -(int64_t)EFAULT;
+    uint64_t set = *(const uint64_t *)(uintptr_t)set_ptr;
+    switch ((int)how) {
+    case SC_SIG_BLOCK:   p->sigmask |= set;  break;
+    case SC_SIG_UNBLOCK: p->sigmask &= ~set; break;
+    case SC_SIG_SETMASK: p->sigmask = set;   break;
+    default: return -(int64_t)EINVAL;
+    }
+    p->sigmask &= ~((1ULL << (SC_SIGKILL - 1)) | (1ULL << (SC_SIGSTOP - 1)));
+    for (int sg = 1; sg < SC_NSIG; sg++) {                                                            
+        uint64_t b = 1ULL << (sg - 1);
+        if ((p->sigpending & b) && !(p->sigmask & b)) {
+            p->sigpending &= ~b;
+            sc_signal_proc(p, sg, true);
+        }
+    }
+    return 0;
+}
+
+static int64_t sc_sigaltstack(uint64_t ss_ptr, uint64_t old_ptr) {
+    sc_proc_t *p = sc_cur();
+    if (old_ptr) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)old_ptr, sizeof(sc_stack_t))) return -(int64_t)EFAULT;
+        *(sc_stack_t *)(uintptr_t)old_ptr = p->altstack;
+    }
+    if (ss_ptr) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)ss_ptr, sizeof(sc_stack_t))) return -(int64_t)EFAULT;
+        p->altstack = *(const sc_stack_t *)(uintptr_t)ss_ptr;
+    }
+    return 0;
+}
+
+static int64_t sc_kill_pid(int64_t pid, int64_t sig) {
+    if (sig < 0 || sig >= SC_NSIG) return -(int64_t)EINVAL;
+    if (pid <= 0) return -(int64_t)ESRCH;                                            
+    sc_proc_t *me = sc_cur();
+    sc_proc_t *p = sc_proc_find_pid((uint32_t)pid);
+    if (!p || p->state == SC_PROC_ZOMBIE || !sc_group_alive(p)) return -(int64_t)ESRCH;
+    return sc_signal_proc(p, (int)sig, p == me);
+}
+                                                                               
+static int64_t sc_kill_tid(int64_t tid, int64_t sig) {
+    if (sig < 0 || sig >= SC_NSIG) return -(int64_t)EINVAL;
+    if (tid <= 0) return -(int64_t)ESRCH;
+    sc_proc_t *r = sc_proc_find_tid((uint32_t)tid);
+    if (!r || !sc_task_alive(r->tid)) return -(int64_t)ESRCH;
+    sc_proc_t *p = r->leader ? r->leader : r;
+    if (p->state == SC_PROC_ZOMBIE) return -(int64_t)ESRCH;
+    return sc_signal_proc(p, (int)sig, p == sc_cur());
+}
+static int64_t sc_kill(uint64_t pid, uint64_t sig)           { return sc_kill_pid((int64_t)pid, (int64_t)sig); }
+static int64_t sc_tkill(uint64_t tid, uint64_t sig)          { return sc_kill_tid((int64_t)(int32_t)tid, (int64_t)sig); }
+static int64_t sc_tgkill(uint64_t tgid, uint64_t tid, uint64_t sig) { (void)tgid; return sc_kill_tid((int64_t)(int32_t)tid, (int64_t)sig); }
+
+                                                                            
+                                                                              
+                                                                                
+#define SC_FUTEX_SLOTS 256
+typedef struct { bool used, woken; uint64_t key; uint32_t pid; } sc_fwait_t;
+static sc_fwait_t g_fwait[SC_FUTEX_SLOTS];
+
+static bool sc_futex_key(uint64_t uaddr, uint64_t *key) {
+    uint64_t pa;
+    if (!sc_user_page_present(uaddr, &pa)) return false;
+    *key = pa + (uaddr & (PAGE_SIZE - 1));
+    return true;
+}
+static int sc_futex_wake_key(uint64_t key, int n) {
+    uint32_t tids[SC_FUTEX_SLOTS];
+    int c = 0;
+    uint64_t fl = sc_irq_save();
+    for (int i = 0; i < SC_FUTEX_SLOTS && c < n; i++)
+        if (g_fwait[i].used && !g_fwait[i].woken && g_fwait[i].key == key) {
+            g_fwait[i].woken = true;
+            tids[c++] = g_fwait[i].pid;
+        }
+    sc_irq_restore(fl);
+    for (int i = 0; i < c; i++) sched_wake(tids[i]);                                           
+    return c;
+}
+static void sc_futex_cleanup(uint32_t pid) {
+    uint64_t fl = sc_irq_save();
+    for (int i = 0; i < SC_FUTEX_SLOTS; i++)
+        if (g_fwait[i].used && g_fwait[i].pid == pid) g_fwait[i].used = false;
+    sc_irq_restore(fl);
+}
+                                                                              
+static void sc_exit_clear_tid(sc_proc_t *p) {
+    uint64_t a = p->clear_child_tid;
+    if (!a) return;
+    uint64_t key;
+    if ((a & 3) == 0 && a <= USER_VIRT_LIMIT && sc_futex_key(a, &key)) {
+        *(volatile uint32_t *)(uintptr_t)a = 0;
+        sc_futex_wake_key(key, 0x7FFFFFFF);
+    }
+    p->clear_child_tid = 0;
+}
+
+static int64_t sc_futex(uint64_t uaddr, uint64_t op, uint64_t val, uint64_t timeout_ptr,
+                        uint64_t uaddr2, uint64_t val3) {
+    int cmd = (int)(op & 0x7F);
+    if ((uaddr & 3) || !syscall_validate_ptr((void *)(uintptr_t)uaddr, 4)) return -(int64_t)EFAULT;
+    uint64_t key;
+    if (!sc_futex_key(uaddr, &key)) return -(int64_t)EFAULT;
+
+    switch (cmd) {
+    case SC_FUTEX_WAIT:
+    case SC_FUTEX_WAIT_BITSET: {
+        bool has = false;
+        uint64_t deadline = 0;
+        if (timeout_ptr) {
+            if (!syscall_validate_ptr((void *)(uintptr_t)timeout_ptr, sizeof(sc_timespec_t))) return -(int64_t)EFAULT;
+            const sc_timespec_t *ts = (const sc_timespec_t *)(uintptr_t)timeout_ptr;
+            if (ts->tv_sec < 0 || ts->tv_nsec < 0 || ts->tv_nsec >= 1000000000LL) return -(int64_t)EINVAL;
+            uint64_t ns = (uint64_t)ts->tv_sec * 1000000000ULL + (uint64_t)ts->tv_nsec;
+            if (cmd == SC_FUTEX_WAIT) deadline = sc_mono_ns() + ns;
+            else if (op & 256) {                                                                 
+                int64_t rel = (int64_t)ns - sc_realtime_ns();
+                deadline = sc_mono_ns() + (uint64_t)(rel > 0 ? rel : 0);
+            } else deadline = ns;                                                                 
+            has = true;
+        }
+        uint32_t pid = sched_current() ? sched_current()->tid : 0;                           
+        uint64_t fl = sc_irq_save();                                                                                       
+        int slot = -1;
+        for (int i = 0; i < SC_FUTEX_SLOTS; i++) if (!g_fwait[i].used) { slot = i; break; }
+        if (slot < 0) { sc_irq_restore(fl); return -(int64_t)EAGAIN; }
+        g_fwait[slot].used = true; g_fwait[slot].woken = false; g_fwait[slot].key = key; g_fwait[slot].pid = pid;
+        uint32_t cur = *(volatile uint32_t *)(uintptr_t)uaddr;
+        sc_irq_restore(fl);
+        if (cur != (uint32_t)val) { g_fwait[slot].used = false; return -(int64_t)EAGAIN; }
+        int64_t rc = 0;
+        for (;;) {
+            if (g_fwait[slot].woken) break;
+            if (has && sc_mono_ns() >= deadline) { rc = -(int64_t)SC_ETIMEDOUT; break; }
+            sc_check_exit_request();
+            {
+                uint64_t chunk = 5000000ULL;
+                if (has) {
+                    uint64_t now = sc_mono_ns();
+                    if (deadline > now && deadline - now < chunk) chunk = deadline - now;
+                }
+                sched_sleep_ns(chunk);
+            }
+        }
+        g_fwait[slot].used = false;
+        return rc;
+    }
+    case SC_FUTEX_WAKE:
+    case SC_FUTEX_WAKE_BITSET:
+        return sc_futex_wake_key(key, (int)(int32_t)val < 0 ? 0 : (int)(int32_t)val);
+    case SC_FUTEX_REQUEUE:
+    case SC_FUTEX_CMP_REQUEUE: {
+        uint64_t key2;
+        if ((uaddr2 & 3) || !syscall_validate_ptr((void *)(uintptr_t)uaddr2, 4) || !sc_futex_key(uaddr2, &key2))
+            return -(int64_t)EFAULT;
+        if (cmd == SC_FUTEX_CMP_REQUEUE && *(volatile uint32_t *)(uintptr_t)uaddr != (uint32_t)val3)
+            return -(int64_t)EAGAIN;
+        int woken = sc_futex_wake_key(key, (int)(int32_t)val);
+        int moved = 0, lim = (int)(int32_t)timeout_ptr;                                                  
+        uint64_t fl = sc_irq_save();
+        for (int i = 0; i < SC_FUTEX_SLOTS && moved < lim; i++)
+            if (g_fwait[i].used && !g_fwait[i].woken && g_fwait[i].key == key) { g_fwait[i].key = key2; moved++; }
+        sc_irq_restore(fl);
+        return woken + moved;
+    }
+    default:
+        return -(int64_t)ENOSYS;
+    }
+}
+
+static int64_t sc_set_tid_address(uint64_t tidptr) {
+    sc_proc_t *p = sc_thr();                                  
+    p->clear_child_tid = tidptr;
+    task_t *t = sched_current();
+    return (int64_t)(t ? t->tid : p->pid);
+}
+
+                                                                             
+static void sc_fill_kstat(sc_kstat_t *o, const vfs_stat_t *v) {
+    memset(o, 0, sizeof(*o));
+    bool dir = (v->type == VFS_TYPE_DIR);
+    o->st_dev     = 1;
+    o->st_ino     = v->cluster ? v->cluster : 1;
+    o->st_nlink   = dir ? 2 : 1;
+    o->st_mode    = dir ? (SC_S_IFDIR | 0755) : (SC_S_IFREG | ((v->attr & 1u) ? 0444 : 0644));
+    o->st_size    = (int64_t)v->size;
+    o->st_blksize = 4096;
+    uint64_t al   = v->alloc_size ? v->alloc_size : v->size;
+    o->st_blocks  = (int64_t)((al + 511) / 512);
+    o->st_atime_sec = (int64_t)v->atime;
+    o->st_mtime_sec = (int64_t)v->mtime;
+    o->st_ctime_sec = (int64_t)v->ctime;
+}
+
+static int64_t sc_fstat_file(sc_file_t *f, sc_kstat_t *o) {
+    if (f->is_pipe_read || f->is_pipe_write) {
+        memset(o, 0, sizeof(*o));
+        o->st_dev = 2; o->st_nlink = 1; o->st_mode = SC_S_IFIFO | 0600; o->st_blksize = 4096;
+        return 0;
+    }
+    if (f->vfs_fd < 0) {                                                      
+        memset(o, 0, sizeof(*o));
+        o->st_dev = 3; o->st_nlink = 1; o->st_mode = SC_S_IFCHR | 0620;
+        o->st_rdev = (4ULL << 8) | 1; o->st_blksize = 1024;
+        return 0;
+    }
+    vfs_stat_t vs;
+    int r = vfs_fstat(f->vfs_fd, &vs);
+    if (r != VFS_OK) return -(int64_t)EBADF;
+    sc_fill_kstat(o, &vs);
+    return 0;
+}
+
+static int64_t sc_stat_lx(uint64_t path_ptr, uint64_t st_ptr) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)st_ptr, sizeof(sc_kstat_t))) return -(int64_t)EFAULT;
+    char path[VFS_MAX_PATH];
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0) return -(int64_t)EFAULT;
+    vfs_stat_t vs;
+    int r = vfs_stat(path, &vs);
+    if (r != VFS_OK) return sc_vfs_errno(r);
+    sc_fill_kstat((sc_kstat_t *)(uintptr_t)st_ptr, &vs);
+    return 0;
+}
+
+static int64_t sc_fstat_lx(uint64_t fd_arg, uint64_t st_ptr) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)st_ptr, sizeof(sc_kstat_t))) return -(int64_t)EFAULT;
+    sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
+    if (!f) return -(int64_t)EBADF;
+    return sc_fstat_file(f, (sc_kstat_t *)(uintptr_t)st_ptr);
+}
+
+                                                                                 
+                                                                                    
+static bool sc_at_ok(uint64_t dirfd, uint64_t path_ptr) {
+    if ((int32_t)dirfd == AT_FDCWD) return true;
+    if (!syscall_validate_ptr((void *)(uintptr_t)path_ptr, 1)) return true;                                
+    return *(const char *)(uintptr_t)path_ptr == '/';
+}
+
+static int64_t sc_newfstatat(uint64_t dirfd, uint64_t path_ptr, uint64_t st_ptr, uint64_t flags) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)path_ptr, 1)) return -(int64_t)EFAULT;
+    if (*(const char *)(uintptr_t)path_ptr == '\0') {
+        if (flags & AT_EMPTY_PATH) return sc_fstat_lx(dirfd, st_ptr);
+        return -(int64_t)ENOENT;
+    }
+    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
+    return sc_stat_lx(path_ptr, st_ptr);
+}
+
+                                                                             
+typedef struct { uint32_t c_iflag, c_oflag, c_cflag, c_lflag; uint8_t c_line; uint8_t c_cc[19]; } sc_ktermios_t;
+typedef struct { uint16_t ws_row, ws_col, ws_xpixel, ws_ypixel; } sc_winsize_t;
+static sc_ktermios_t g_ktermios = {
+    0x0500, 0x0005, 0x00BF, 0x8A3B, 0,
+    { 3, 0x1C, 0x7F, 0x15, 4, 0, 1 }                                                        
+};
+
+static int64_t sc_ioctl(uint64_t fd_arg, uint64_t req, uint64_t arg) {
+    sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
+    if (!f) return -(int64_t)EBADF;
+
+    switch ((uint32_t)req) {
+    case SC_FIONBIO:
+        if (!syscall_validate_ptr((void *)(uintptr_t)arg, 4)) return -(int64_t)EFAULT;
+        if (*(const int32_t *)(uintptr_t)arg) f->flags |= LX_O_NONBLOCK; else f->flags &= ~LX_O_NONBLOCK;
+        return 0;
+    case SC_FIOCLEX:  f->fd_flags |= FD_CLOEXEC;  return 0;
+    case SC_FIONCLEX: f->fd_flags &= ~FD_CLOEXEC; return 0;
+    case SC_FIONREAD: {
+        if (!syscall_validate_ptr((void *)(uintptr_t)arg, 4)) return -(int64_t)EFAULT;
+        int32_t n = 0;
+        if (f->is_pipe_read) n = (int32_t)g_pipes[f->pipe_idx].count;
+        else if (f->vfs_fd >= 0) {
+            vfs_stat_t vs; int64_t pos = vfs_seek(f->vfs_fd, 0, 1);
+            if (vfs_fstat(f->vfs_fd, &vs) == VFS_OK && pos >= 0 && vs.size > (uint64_t)pos) n = (int32_t)(vs.size - (uint64_t)pos);
+        }
+        *(int32_t *)(uintptr_t)arg = n;
+        return 0;
+    }
+    default: break;
+    }
+
+    if (!sc_is_console(f)) return -(int64_t)SC_ENOTTY;                                                  
+
+    switch ((uint32_t)req) {
+    case SC_TCGETS:
+        if (!syscall_validate_ptr((void *)(uintptr_t)arg, sizeof(sc_ktermios_t))) return -(int64_t)EFAULT;
+        *(sc_ktermios_t *)(uintptr_t)arg = g_ktermios;
+        return 0;
+    case SC_TCSETS: case SC_TCSETSW: case SC_TCSETSF:
+        if (!syscall_validate_ptr((void *)(uintptr_t)arg, sizeof(sc_ktermios_t))) return -(int64_t)EFAULT;
+        g_ktermios = *(const sc_ktermios_t *)(uintptr_t)arg;
+        return 0;
+    case SC_TIOCGWINSZ: {
+        if (!syscall_validate_ptr((void *)(uintptr_t)arg, sizeof(sc_winsize_t))) return -(int64_t)EFAULT;
+        sc_winsize_t *w = (sc_winsize_t *)(uintptr_t)arg;
+        w->ws_row = 25; w->ws_col = 80; w->ws_xpixel = 0; w->ws_ypixel = 0;
+        return 0;
+    }
+    case SC_TIOCSWINSZ: return 0;
+    case SC_TIOCGPGRP:
+        if (!syscall_validate_ptr((void *)(uintptr_t)arg, 4)) return -(int64_t)EFAULT;
+        *(int32_t *)(uintptr_t)arg = (int32_t)sc_cur()->pid;
+        return 0;
+    case SC_TIOCSPGRP: return 0;
+    default: return -(int64_t)SC_ENOTTY;
+    }
+}
+
+                                                                             
+static int sc_poll_one(sc_pollfd_t *p) {
+    p->revents = 0;
+    if (p->fd < 0) return 0;
+    sc_file_t *f = sc_get_file(p->fd);
+    if (!f) { p->revents = SC_POLLNVAL; return 1; }
+    int16_t r = 0;
+    if (f->is_pipe_read) {
+        pipe_t *pp = &g_pipes[f->pipe_idx];
+        if (pp->count) r |= SC_POLLIN;
+        if (pp->write_closed) r |= SC_POLLHUP;
+    } else if (f->is_pipe_write) {
+        pipe_t *pp = &g_pipes[f->pipe_idx];
+        if (pp->read_closed) r |= SC_POLLERR;
+        else if (pp->count < PIPE_BUF_SIZE) r |= SC_POLLOUT;
+    } else if (f->vfs_fd < 0) {                                               
+        task_t *cur = sched_current();
+        if ((f->flags & O_ACCMODE) != O_WRONLY && cur && ui_kbd_focus_owned_by((int32_t)cur->tid)) r |= SC_POLLIN;
+        if ((f->flags & O_ACCMODE) != O_RDONLY) r |= SC_POLLOUT;
+    } else {
+        r = SC_POLLIN | SC_POLLOUT;                                                                  
+    }
+    p->revents = (int16_t)(r & (p->events | SC_POLLERR | SC_POLLHUP | SC_POLLNVAL));
+    return p->revents != 0;
+}
+
+static int64_t sc_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_arg) {
+    if (nfds > SC_FD_MAX * 2) return -(int64_t)EINVAL;
+    if (nfds && !syscall_validate_ptr((void *)(uintptr_t)fds_ptr, (size_t)(nfds * sizeof(sc_pollfd_t))))
+        return -(int64_t)EFAULT;
+    sc_pollfd_t *fds = (sc_pollfd_t *)(uintptr_t)fds_ptr;
+    int64_t tmo = (int64_t)(int32_t)timeout_arg;                                       
+    uint64_t start = sc_mono_ns();
+    for (;;) {
+        int ready = 0;
+        for (uint64_t i = 0; i < nfds; i++) ready += sc_poll_one(&fds[i]);
+        if (ready) return ready;
+        if (tmo == 0) return 0;
+        if (tmo > 0 && sc_mono_ns() - start >= (uint64_t)tmo * 1000000ULL) return 0;
+        sc_check_exit_request();
+        sched_sleep_ns(500000);
+    }
+}
+
+                                                                               
+static int64_t sc_openat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags, uint64_t mode) {
+    (void)mode;
+    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
+    return sc_open(path_ptr, flags);
+}
+static int64_t sc_mkdirat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
+    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
+    return sc_mkdir(path_ptr, mode);
+}
+static int64_t sc_unlinkat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
+    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
+    return (flags & AT_REMOVEDIR) ? sc_rmdir(path_ptr) : sc_unlink(path_ptr);
+}
+static int64_t sc_renameat(uint64_t odfd, uint64_t op, uint64_t ndfd, uint64_t np, uint64_t flags) {
+    if (flags) return -(int64_t)EINVAL;
+    if (!sc_at_ok(odfd, op) || !sc_at_ok(ndfd, np)) return -(int64_t)ENOSYS;
+    return sc_rename(op, np);
+}
+static int64_t sc_faccessat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
+    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
+    return sc_access(path_ptr, mode);
+}
+                                                                            
+static int64_t sc_readlink(uint64_t path_ptr, uint64_t buf_ptr, uint64_t size) {
+    (void)buf_ptr; (void)size;
+    char path[VFS_MAX_PATH];
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0) return -(int64_t)EFAULT;
+    vfs_stat_t vs;
+    int r = vfs_stat(path, &vs);
+    return r == VFS_OK ? -(int64_t)EINVAL : sc_vfs_errno(r);
+}
+static int64_t sc_readlinkat(uint64_t dirfd, uint64_t path_ptr, uint64_t buf_ptr, uint64_t size) {
+    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
+    return sc_readlink(path_ptr, buf_ptr, size);
+}
+
+static int64_t sc_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags) {
+    if (oldfd == newfd) return -(int64_t)EINVAL;
+    if (flags & ~(uint64_t)LX_O_CLOEXEC) return -(int64_t)EINVAL;
+    int64_t r = sc_dup2(oldfd, newfd);
+    if (r >= 0 && (flags & LX_O_CLOEXEC)) g_files[(int)r].fd_flags = FD_CLOEXEC;
+    return r;
+}
+static int64_t sc_pipe2(uint64_t pipefd_ptr, uint64_t flags) {
+    if (flags & ~(uint64_t)(LX_O_CLOEXEC | LX_O_NONBLOCK)) return -(int64_t)EINVAL;
+    int64_t r = sc_pipe(pipefd_ptr);
+    if (r < 0) return r;
+    const int32_t *fds = (const int32_t *)(uintptr_t)pipefd_ptr;
+    for (int i = 0; i < 2; i++) {
+        sc_file_t *f = sc_get_file(fds[i]);
+        if (!f) continue;
+        if (flags & LX_O_CLOEXEC)  f->fd_flags |= FD_CLOEXEC;
+        if (flags & LX_O_NONBLOCK) f->flags |= LX_O_NONBLOCK;
+    }
+    return 0;
+}
+
+                                                                               
+static int64_t sc_umask(uint64_t m) { sc_proc_t *p = sc_cur(); uint32_t o = p->umask_val; p->umask_val = (uint32_t)(m & 0777); return o; }
+
+static void sc_rlim_fill(uint64_t res, sc_rlimit_t *o) {
+    o->rlim_cur = o->rlim_max = SC_RLIM_INFINITY;
+    if (res == SC_RLIMIT_STACK)  o->rlim_cur = o->rlim_max = 128ULL * PAGE_SIZE;                                   
+    if (res == SC_RLIMIT_NOFILE) o->rlim_cur = o->rlim_max = SC_FD_MAX;
+}
+static int64_t sc_getrlimit(uint64_t res, uint64_t ptr) {
+    if (res > 15) return -(int64_t)EINVAL;
+    if (!syscall_validate_ptr((void *)(uintptr_t)ptr, sizeof(sc_rlimit_t))) return -(int64_t)EFAULT;
+    sc_rlim_fill(res, (sc_rlimit_t *)(uintptr_t)ptr);
+    return 0;
+}
+static int64_t sc_prlimit64(uint64_t pid, uint64_t res, uint64_t newp, uint64_t oldp) {
+    if (pid != 0 && pid != sc_cur()->pid) return -(int64_t)ESRCH;
+    if (res > 15) return -(int64_t)EINVAL;
+    if (oldp) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)oldp, sizeof(sc_rlimit_t))) return -(int64_t)EFAULT;
+        sc_rlim_fill(res, (sc_rlimit_t *)(uintptr_t)oldp);
+    }
+    return newp ? -(int64_t)EPERM : 0;                                                               
+}
+
+static int64_t sc_prctl(uint64_t option, uint64_t a2) {
+    task_t *t = sched_current();
+    if (option == 15 && t) {                                                       
+        if (!syscall_validate_ptr((void *)(uintptr_t)a2, 1)) return -(int64_t)EFAULT;
+        strncpy(t->name, (const char *)(uintptr_t)a2, 15); t->name[15] = '\0';
+        return 0;
+    }
+    if (option == 16 && t) {                                                       
+        if (!syscall_validate_ptr((void *)(uintptr_t)a2, 16)) return -(int64_t)EFAULT;
+        strncpy((char *)(uintptr_t)a2, t->name, 15); ((char *)(uintptr_t)a2)[15] = '\0';
+        return 0;
+    }
+    return -(int64_t)EINVAL;
+}
+
+                                                                                    
+static int64_t sc_perm_path(uint64_t path_ptr) {
+    char path[VFS_MAX_PATH];
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0) return -(int64_t)EFAULT;
+    vfs_stat_t vs;
+    int r = vfs_stat(path, &vs);
+    return r == VFS_OK ? 0 : sc_vfs_errno(r);
+}
+static int64_t sc_perm_fd(uint64_t fd) { return sc_get_file((int)(uint32_t)fd) ? 0 : -(int64_t)EBADF; }
+
+static int64_t sc_dispatch_inner(uint64_t nr,
                          uint64_t a1, uint64_t a2, uint64_t a3,
-                         uint64_t a4, uint64_t a5) {
+                         uint64_t a4, uint64_t a5, uint64_t a6) {
     if (nr != SYS_EXIT) sc_check_exit_request();
     if (!sc_is_noisy(nr)) DBG_VAL("SC", "syscall nr", nr);
 
@@ -2413,63 +3711,122 @@ int64_t syscall_dispatch(uint64_t nr,
     }
 
     switch (nr) {
-     
+                         
     case SYS_READ:          return sc_read(a1, a2, a3);
     case SYS_WRITE:         return sc_write(a1, a2, a3);
     case SYS_OPEN:          return sc_open(a1, a2);
+    case SYS_OPENAT:        return sc_openat(a1, a2, a3, a4);
     case SYS_CLOSE:         return sc_close(a1);
-    case SYS_STAT:          return sc_stat(a1, a2);
-    case SYS_FSTAT:         return sc_fstat(a1, a2);
+    case SYS_STAT:
+    case SYS_LSTAT:         return sc_stat_lx(a1, a2);
+    case SYS_FSTAT:         return sc_fstat_lx(a1, a2);
+    case SYS_NEWFSTATAT:    return sc_newfstatat(a1, a2, a3, a4);
+    case SYS_STAT_FEX:      return sc_stat_fex(a1, a2);                                    
+    case SYS_FSTAT_FEX:     return sc_fstat_fex(a1, a2);
+    case SYS_POLL:          return sc_poll(a1, a2, a3);
     case SYS_LSEEK:         return sc_lseek(a1, a2, a3);
-    case SYS_READDIR:       return sc_readdir(a1, a2, a3);
+    case SYS_IOCTL:         return sc_ioctl(a1, a2, a3);
+    case SYS_READDIR:                                                                   
+        return (a1 > 0x10000ULL) ? sc_readlink(a1, a2, a3) : sc_readdir(a1, a2, a3);
+    case SYS_READLINKAT:    return sc_readlinkat(a1, a2, a3, a4);
     case SYS_FTRUNCATE:     return sc_ftruncate(a1, a2);
     case SYS_FCNTL:         return sc_fcntl(a1, a2, a3);
     case SYS_MKDIR:         return sc_mkdir(a1, a2);
+    case SYS_MKDIRAT:       return sc_mkdirat(a1, a2, a3);
     case SYS_RMDIR:         return sc_rmdir(a1);
     case SYS_UNLINK:        return sc_unlink(a1);
+    case SYS_UNLINKAT:      return sc_unlinkat(a1, a2, a3);
     case SYS_RENAME:        return sc_rename(a1, a2);
+    case SYS_RENAMEAT:      return sc_renameat(a1, a2, a3, a4, 0);
+    case SYS_RENAMEAT2:     return sc_renameat(a1, a2, a3, a4, a5);
     case SYS_CHDIR:         return sc_chdir(a1);
     case SYS_PREAD64:       return sc_pread64(a1, a2, a3, a4);
     case SYS_PWRITE64:      return sc_pwrite64(a1, a2, a3, a4);
     case SYS_READV:         return sc_readv(a1, a2, a3);
-    case SYS_WRITEV:        return sc_writev(a1, a2, a3);
+    case SYS_WRITEV:
+    case SYS_WRITEV_LEGACY: return sc_writev(a1, a2, a3);
     case SYS_ACCESS:        return sc_access(a1, a2);
+    case SYS_FACCESSAT:
+    case SYS_FACCESSAT2:    return sc_faccessat(a1, a2, a3);
     case SYS_DUP:           return sc_dup(a1);
     case SYS_DUP2:          return sc_dup2(a1, a2);
+    case SYS_DUP3:          return sc_dup3(a1, a2, a3);
     case SYS_SENDFILE:      return sc_sendfile(a1, a2, a3, a4);
     case SYS_TRUNCATE:      return sc_truncate(a1, a2);
     case SYS_GETCWD:        return sc_getcwd(a1, a2);
     case SYS_GETDENTS64:    return sc_getdents64(a1, a2, a3);
-     
+    case SYS_PIPE:
+    case SYS_PIPE_LEGACY:   return sc_pipe(a1);
+    case SYS_PIPE2:         return sc_pipe2(a1, a2);
+    case SYS_FSYNC:
+    case SYS_FDATASYNC:     return sc_perm_fd(a1);                                               
+    case SYS_SYNC:          return 0;
+    case SYS_FADVISE64:     return sc_perm_fd(a1);
+    case SYS_CHMOD:
+    case SYS_CHOWN:
+    case SYS_LCHOWN:        return sc_perm_path(a1);                                           
+    case SYS_FCHMOD:
+    case SYS_FCHOWN:        return sc_perm_fd(a1);
+    case SYS_FCHMODAT:      return sc_at_ok(a1, a2) ? sc_perm_path(a2) : -(int64_t)ENOSYS;
+    case SYS_UMASK:         return sc_umask(a1);
+                          
     case SYS_BRK:           return sc_brk(a1);
-    case SYS_MMAP:          return sc_mmap(a1, a2, a3, a4, a5, 0);
+    case SYS_MMAP:          return sc_mmap(a1, a2, a3, a4, a5, a6);
     case SYS_MUNMAP:        return sc_munmap(a1, a2);
     case SYS_MPROTECT:      return sc_mprotect(a1, a2, a3);
     case SYS_MREMAP:        return sc_mremap(a1, a2, a3, a4);
     case SYS_MINCORE:       return sc_mincore(a1, a2, a3);
     case SYS_MADVISE:       return sc_madvise(a1, a2, a3);
     case SYS_SYSINFO:       return sc_sysinfo(a1);
-     
+                             
     case SYS_EXIT:          return sc_exit(a1);
+    case SYS_EXIT_GROUP:    return sc_exit_group(a1);
     case SYS_FORK:          return sc_fork();
-    case SYS_CLONE:         return sc_clone(a1, a2, a3, a4);
+    case SYS_VFORK:         return sc_fork_ex(CLONE_VFORK, 0, 0, 0, 0);
+    case SYS_CLONE:         return sc_clone_lx(a1, a2, a3, a4, a5);
     case SYS_EXECVE:        return sc_execve(a1, a2, a3);
     case SYS_WAIT4:         return sc_wait4(a1, a2, a3);
-    case SYS_GETPID:
-    case SYS_GETPID2:       return sc_getpid();
+    case SYS_GETPID:        return sc_getpid();
+    case SYS_GETPPID:       return sc_getppid();
+    case SYS_GETTID:        return sc_gettid();
+    case SYS_SET_TID_ADDRESS: return sc_set_tid_address(a1);
+    case SYS_GETUID: case SYS_GETEUID: case SYS_GETGID: case SYS_GETEGID:
+        return 0;                                                                                          
+    case SYS_SETPGID:       return 0;
+    case SYS_GETPGRP:
+    case SYS_GETPGID:
+    case SYS_GETSID:
+    case SYS_SETSID:        return (int64_t)sc_cur()->pid;
+    case SYS_PRCTL:         return sc_prctl(a1, a2);
+    case SYS_GETRLIMIT:     return sc_getrlimit(a1, a2);
+    case SYS_PRLIMIT64:     return sc_prlimit64(a1, a2, a3, a4);
     case SYS_SCHED_YIELD:   return sc_sched_yield();
+    case SYS_ARCH_PRCTL:    return sc_arch_prctl(a1, a2);
+    case SYS_FUTEX:         return sc_futex(a1, a2, a3, a4, a5, a6);
+                           
+    case SYS_RT_SIGACTION:  return sc_rt_sigaction(a1, a2, a3, a4);
+    case SYS_RT_SIGPROCMASK:return sc_rt_sigprocmask(a1, a2, a3, a4);
+    case SYS_SIGALTSTACK:   return sc_sigaltstack(a1, a2);
+    case SYS_KILL:          return sc_kill(a1, a2);
+    case SYS_TKILL:         return sc_tkill(a1, a2);
+    case SYS_TGKILL:        return sc_tgkill(a1, a2, a3);
+                        
     case SYS_NANOSLEEP:     return sc_nanosleep(a1, a2);
     case SYS_CLOCK_GETTIME: return sc_clock_gettime(a1, a2);
     case SYS_GETTIMEOFDAY:  return sc_gettimeofday(a1, a2);
+    case SYS_SETTIMEOFDAY:  return sc_settimeofday(a1, a2);
+    case SYS_TIME:          return sc_time(a1);
+    case SYS_TIMES:         return sc_times(a1);
+    case SYS_GETRUSAGE:     return sc_getrusage(a1, a2);
+    case SYS_CLOCK_SETTIME: return sc_clock_settime(a1, a2);
+    case SYS_CLOCK_GETRES:  return sc_clock_getres(a1, a2);
+    case SYS_CLOCK_NANOSLEEP: return sc_clock_nanosleep(a1, a2, a3, a4);
     case SYS_UNAME:         return sc_uname(a1);
     case SYS_GETRANDOM:     return sc_getrandom(a1, a2, a3);
-     
-    case SYS_ARCH_PRCTL:    return sc_arch_prctl(a1, a2);
-    case SYS_PIPE:          return sc_pipe(a1);
+                                  
     case SYS_SHM_GET:       return sc_shm_get(a1, a2, a3);
     case SYS_SHM_AT:        return sc_shm_at(a1, a2, a3);
     case SYS_SHM_DETACH:    return sc_shm_detach(a1, a2);
-     
     case SYS_GET_FRAMEBUFFER: return sc_get_framebuffer(a1);
     case SYS_WIN_CREATE:      return sc_win_create(a1, a2, a3, a4);
     case SYS_WIN_CLOSE:       return sc_win_close(a1);
@@ -2495,26 +3852,18 @@ int64_t syscall_dispatch(uint64_t nr,
 
 
 void syscall_init(void) {
-    memset(g_files, 0, sizeof(g_files));
+    memset(g_procs, 0, sizeof(g_procs));
     memset(g_pipes, 0, sizeof(g_pipes));
     memset(g_shm,   0, sizeof(g_shm));
-    memset(g_vma,   0, sizeof(g_vma));
     memset(g_vfs_refs, 0, sizeof(g_vfs_refs));
-    g_tsc_boot   = sc_rdtsc();       
-    g_rt_valid   = false;            
+    memset(&g_proc0, 0, sizeof(g_proc0));
+    g_cur_cache     = NULL;
+    g_cur_cache_tid = SC_NO_TID;
+    g_tsc_boot   = sc_rdtsc();
+    g_rt_valid   = false;
     g_rng_state  = 0;
-
-     
-
-
-
-    g_files[0].open  = true; g_files[0].vfs_fd = -1; g_files[0].flags = O_RDONLY;
-    g_files[1].open  = true; g_files[1].vfs_fd = -1; g_files[1].flags = O_WRONLY;
-    g_files[2].open  = true; g_files[2].vfs_fd = -1; g_files[2].flags = O_WRONLY;
-
-    g_brk_current = USER_HEAP_BASE;
-    g_brk_mapped  = USER_HEAP_BASE;
-    g_mmap_next   = USER_MMAP_BASE;
+                                                                        
+                                                                      
 
     DBG_MSG("SC", "syscall_init ok");
 }
@@ -2522,3 +3871,44 @@ void syscall_init(void) {
 #ifdef __cplusplus
 }
 #endif
+
+
+                                                                                 
+                                                                                 
+                                                                             
+                                                                            
+                                                                                    
+static bool sc_needs_proc_lock(uint64_t nr) {
+    switch (nr) {
+    case SYS_MMAP: case SYS_MUNMAP: case SYS_MPROTECT: case SYS_MREMAP: case SYS_BRK: case SYS_MADVISE:
+    case SYS_SHM_AT: case SYS_SHM_DETACH:
+    case SYS_OPEN: case SYS_OPENAT: case SYS_CLOSE: case SYS_DUP: case SYS_DUP2: case SYS_DUP3:
+    case SYS_PIPE: case SYS_PIPE2: case SYS_PIPE_LEGACY: case SYS_FCNTL:
+    case SYS_CHDIR: case SYS_FCHDIR:
+        return true;
+    default:
+        return false;
+    }
+}
+
+int64_t syscall_dispatch(uint64_t nr,
+                         uint64_t a1, uint64_t a2, uint64_t a3,
+                         uint64_t a4, uint64_t a5, uint64_t a6) {
+    if (!sc_needs_proc_lock(nr))
+        return sc_dispatch_inner(nr, a1, a2, a3, a4, a5, a6);
+
+    sc_proc_t *L = sc_cur();
+    task_t *t = sched_current();
+    uint32_t me = (t ? t->tid : 0) + 1;
+    for (;;) {
+        uint64_t fl = sc_irq_save();
+        uint32_t o = L->vm_owner;
+        if (o == 0 || !sc_task_alive(o - 1)) { L->vm_owner = me; sc_irq_restore(fl); break; }
+        sc_irq_restore(fl);
+        sc_check_exit_request();
+        sched_yield();
+    }
+    int64_t r = sc_dispatch_inner(nr, a1, a2, a3, a4, a5, a6);
+    if (L->vm_owner == me) L->vm_owner = 0;
+    return r;
+}
