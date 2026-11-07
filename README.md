@@ -10,4 +10,4 @@ Fexox OS исходный код / Source Code
 -library c: Musl (usermode), klibc (kernel mode)
 -Стадия разработки: Alpha2
 
-About Developer: известен под ником/псевдонимом на Reddit (u/Content_Grass4077), (Tobias Forester). !ИСПОЛЬЗУЕТСЯ БИБЛИОТЕКА LIBC MUSL ПОД РАЗРЕШИТЕЛЬНОЙ ЛИЦЕНЗИЕЙ MIT, АВТОР БИБЛИОТЕКИ: Rich Felker!
+About Developer: известен под ником/псевдонимом на Reddit (u/Content_Grass4077), (Tobias Forester) ПРОШЛЫЙ АККАУНТ BREAKFASTKITCHEN6249 был забанен!!!. !ИСПОЛЬЗУЕТСЯ БИБЛИОТЕКА LIBC MUSL ПОД РАЗРЕШИТЕЛЬНОЙ ЛИЦЕНЗИЕЙ MIT, АВТОР БИБЛИОТЕКИ: Rich Felker!
