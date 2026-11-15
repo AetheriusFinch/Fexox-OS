@@ -46,7 +46,6 @@ $CC $CFLAGS_KERN -c NVMe.c             -o build/NVMe.o
 $CC $CFLAGS_KERN -c klibc.c            -o build/klibc.o
 $CC $CFLAGS_KERN -c ELF64.c            -o build/ELF64.o
 $CC $CFLAGS_KERN -c Framebuffer.c      -o build/Framebuffer.o
-# FexoxDriverDisplay: software scaler/rotator, hot pixel loops -> -O2
 $CC ${CFLAGS_KERN/-O0/-O2} -c FexoxDriverDisplay.c -o build/FexoxDriverDisplay.o
 $CC $CFLAGS_KERN -c png.c              -o build/png.o
 $CC $CFLAGS_KERN -c ui_extra.c         -o build/ui_extra.o

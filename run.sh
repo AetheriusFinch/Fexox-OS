@@ -22,16 +22,13 @@ cp -f "$VARS" /c/fos/OVMF_VARS.fd
 exec "$(to_win "$QEMU")" \
   -machine q35 -m 768M -cpu qemu64 -vga std \
   \
-  `# UEFI firmware` \
   -drive "if=pflash,format=raw,readonly=on,file=$(to_win "$CODE")" \
   -drive "if=pflash,format=raw,file=C:/fos/OVMF_VARS.fd" \
   \
-  `# ESP: только для UEFI bootloader, НЕ virtio-blk` \
   -drive "if=none,id=esp,format=raw,file=$(to_win "$ESP"),readonly=on" \
   -device "virtio-scsi-pci,id=scsi0" \
   -device "scsi-cd,drive=esp,bus=scsi0.0" \
   \
-  `# DATA: отдельный диск для ядра — это то что видит virtio-blk драйвер` \
   -drive "if=none,id=vda,format=raw,file=$(to_win "$DATA")" \
   -device "virtio-blk-pci,drive=vda,disable-modern=on,disable-legacy=off" \
   \

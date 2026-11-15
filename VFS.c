@@ -1329,12 +1329,12 @@ int vfs_ftruncate(int fd, uint64_t size) {
     return f->node->ops->truncate(f->node, size);
 }
 
-/* ================================================================== */
-/* POSIX layer: credentials, symlink-aware path walk, attributes,      */
-/* links, rename, xattr access.  Used by the Linux/musl syscalls; the  */
-/* classic vfs_open()/vfs_stat()/... above keep working unchanged and  */
-/* behave as root (kernel-internal callers).                           */
-/* ================================================================== */
+ 
+ 
+ 
+ 
+ 
+ 
 
 #define VFS_SYMLOOP 40
 #define V_S_IFMT   0170000u
@@ -1355,10 +1355,10 @@ static inline const vfs_node_xops_t *nx(vfs_node_t *n) { return (n && n->ops) ? 
 static void node_put(vfs_node_t *n) { if (n && n->ops && n->ops->release) n->ops->release(n); }
 void vfs_node_put(vfs_node_t *n) { node_put(n); }
 
-/* Walk `in` component by component.
-     want_parent : stop before the last component, return the parent, name in `last`
-     follow_last : resolve a symbolic link in the last component too
-   Search (x) permission is required on every directory that is traversed.            */
+
+
+
+
 static vfs_node_t *vfs_walk(const char *in, bool want_parent, bool follow_last, char *last,
                             const vfs_cred_t *cr, int *err) {
     char *buf = (char *)kmalloc(VFS_MAX_PATH), *tgt = (char *)kmalloc(VFS_MAX_PATH), *nb = (char *)kmalloc(VFS_MAX_PATH);
@@ -1438,7 +1438,7 @@ out:
 static int node_perm(vfs_node_t *n, const vfs_cred_t *cr, uint32_t want) {
     const vfs_node_xops_t *x = nx(n);
     if (x && x->permission) return x->permission(n, cr, want);
-    if ((want & VFS_PERM_W) && (n->stat.attr & 1u)) return VFS_ERR_ACCES;      /* FAT read-only bit */
+    if ((want & VFS_PERM_W) && (n->stat.attr & 1u)) return VFS_ERR_ACCES;       
     return VFS_OK;
 }
 
@@ -1478,7 +1478,7 @@ int vfs_open2(const char *path, int flags, uint32_t mode) {
     if (!node) {
         if (err != VFS_ERR_NOENT || !(flags & O_CREAT)) return err;
         char last[VFS_MAX_NAME + 1];
-        /* creating through a dangling symbolic link creates the link's target */
+         
         char *cpath = (char *)kmalloc(VFS_MAX_PATH), *ltgt = (char *)kmalloc(VFS_MAX_PATH);
         if (!cpath || !ltgt) { if (cpath) kfree(cpath); if (ltgt) kfree(ltgt); return VFS_ERR_NOMEM; }
         kstr_cpy(cpath, path, VFS_MAX_PATH);
@@ -1516,7 +1516,7 @@ int vfs_open2(const char *path, int flags, uint32_t mode) {
         node = nn; created = true;
     } else {
         if ((flags & O_CREAT) && (flags & VFS_O_EXCL)) { node_put(node); return VFS_ERR_EXIST; }
-        if (node->stat.type == VFS_TYPE_LINK) { node_put(node); return VFS_ERR_LOOP; }       /* O_NOFOLLOW on a link */
+        if (node->stat.type == VFS_TYPE_LINK) { node_put(node); return VFS_ERR_LOOP; }        
     }
     if ((flags & VFS_O_LXDIR) && node->stat.type != VFS_TYPE_DIR) { node_put(node); return VFS_ERR_NOTDIR; }
     if (node->stat.type == VFS_TYPE_DIR && want_w) { node_put(node); return VFS_ERR_ISDIR; }
@@ -1557,9 +1557,9 @@ int vfs_fgetattr(int fd, vfs_attr_t *out) {
 static int node_setattr(vfs_node_t *n, const vfs_setattr_t *sa, const vfs_cred_t *cr) {
     const vfs_node_xops_t *x = nx(n);
     if (x && x->setattr) return x->setattr(n, sa, cr);
-    if (sa->valid & (VFS_SET_MODE | VFS_SET_UID | VFS_SET_GID)) return VFS_ERR_PERM;   /* FAT has no owners/modes */
+    if (sa->valid & (VFS_SET_MODE | VFS_SET_UID | VFS_SET_GID)) return VFS_ERR_PERM;    
     if ((sa->valid & VFS_SET_SIZE) && n->ops->truncate) return n->ops->truncate(n, sa->size);
-    return VFS_OK;                                                                    /* times: ignored */
+    return VFS_OK;                                                                     
 }
 int vfs_setattr(const char *path, int follow, const vfs_setattr_t *sa) {
     const vfs_cred_t *cr = vfs_cred(); int err;

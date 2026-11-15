@@ -1,5 +1,5 @@
 /* Fexox OS Project, EULA GPLv2 */
-/* FexoxHybridFS - see FexoxHybridFS.h for the design summary. */
+ 
 
 #include "FexoxHybridFS.h"
 #include "debug_out.h"
@@ -9,15 +9,15 @@ extern void  kfree(void *p);
 extern void  sched_yield(void);
 extern uint64_t usb_tsc_per_ms(void);
 
-/* ------------------------------------------------------------------ */
-/* small helpers (no libc dependency)                                  */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static void *fh_zalloc(uint64_t n) {
     void *p = kmalloc(n);
     if (p) { uint8_t *b = (uint8_t *)p; for (uint64_t i = 0; i < n; i++) b[i] = 0; }
     return p;
 }
-typedef struct { uint64_t v; } __attribute__((packed, may_alias)) fh_u64u_t;   /* unaligned-safe access */
+typedef struct { uint64_t v; } __attribute__((packed, may_alias)) fh_u64u_t;    
 static void fh_set(void *d, uint8_t v, uint64_t n) {
     uint8_t *p = (uint8_t *)d;
     uint64_t w = 0x0101010101010101ULL * v;
@@ -54,15 +54,15 @@ static bool fh_is_zero(const void *p, uint64_t n) {
 #define IHASH      256u
 #define ICACHE_MAX 2048u
 #define DIRTY_LIMIT (8u * 1024u * 1024u)
-#define FH_MAGIC   0x53464859484F5846ULL      /* "FOXHYFS" */
+#define FH_MAGIC   0x53464859484F5846ULL       
 #define FH_UB_MAGIC 0x42554859484F5846ULL
 #define FH_VERSION 1u
 #define FH_ROOT_INO 1u
 #define FH_LINK_MAX 65000u
 
-/* ------------------------------------------------------------------ */
-/* checksum: CRC32C lane + Fletcher lane = 64 bits                     */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static uint32_t g_crc[256];
 static bool     g_crc_ok;
 
@@ -87,16 +87,16 @@ static uint64_t fh_cksum(const void *p, uint64_t n) {
     return ((uint64_t)(s ^ (a << 16)) << 32) | (uint64_t)(~c);
 }
 
-/* ------------------------------------------------------------------ */
-/* LZ4-format block compressor ("FHLZ")                                */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 #define LZ_HBITS 12
 
 static inline uint32_t lz_rd32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
 
-/* returns compressed size, or 0 if it does not fit in cap */
+ 
 static uint32_t fh_lz_compress(const uint8_t *src, uint32_t n, uint8_t *dst, uint32_t cap,
                                uint32_t *ht, uint32_t *basep) {
     if (n < 32) return 0;
@@ -140,7 +140,7 @@ static uint32_t fh_lz_compress(const uint8_t *src, uint32_t n, uint8_t *dst, uin
     return op;
 }
 
-/* returns FH_OK if exactly dlen bytes were produced */
+ 
 static int fh_lz_decompress(const uint8_t *src, uint32_t clen, uint8_t *dst, uint32_t dlen) {
     uint32_t ip = 0, op = 0;
     while (ip < clen) {
@@ -162,20 +162,20 @@ static int fh_lz_decompress(const uint8_t *src, uint32_t clen, uint8_t *dst, uin
     return op == dlen ? FH_OK : FH_ECORRUPT;
 }
 
-/* ------------------------------------------------------------------ */
-/* runtime structures                                                  */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 typedef struct fh_tnode {
-    fh_bp_t          bp;                 /* where the CURRENT on-disk copy lives */
-    fh_bp_t          ptr[FANOUT];        /* exactly 4096 bytes: the on-disk image */
+    fh_bp_t          bp;                  
+    fh_bp_t          ptr[FANOUT];         
     struct fh_tnode *kid[FANOUT];
     bool             dirty;
-    uint8_t          level;              /* 1 = points to leaves */
+    uint8_t          level;               
 } fh_tnode_t;
 
 typedef struct {
     fh_bp_t     root;
-    uint32_t    depth;                   /* 0: root IS the single leaf */
+    uint32_t    depth;                    
     fh_tnode_t *rnode;
 } fh_tree_t;
 
@@ -194,7 +194,7 @@ typedef struct { uint64_t blk; uint32_t n; } fh_pend_t;
 
 struct fhfs {
     blkdev_t *dev;
-    uint32_t  spb;                       /* device sectors per 4K block */
+    uint32_t  spb;                        
     bool      ro, dead, compress;
     fh_label_t lab;
     uint64_t  total, data_start, data_end, dstart, meta_lo, meta_hi;
@@ -215,18 +215,18 @@ struct fhfs {
     bool      gdirty;
     uint64_t  last_commit_ms;
     uint32_t  cksum_errors;
-    /* block sharing (reflink / snapshots): holders of every block that has more than one */
+     
     struct { uint64_t blk; uint32_t rc, pad; } *rc; uint32_t rc_cap, rc_n;
-    /* snapshots */
+     
     struct fh_snap { char name[48]; uint64_t id, txg, time_ns; fh_bp_t root; uint32_t depth, flags; } snaps[36];
     uint32_t  nsnaps; uint64_t snap_next_id;
     fh_bp_t   snap_bp; bool snap_dirty;
-    fhfs_t   *parent; uint32_t snap_mounts;       /* read-only snapshot view -> its live fs */
+    fhfs_t   *parent; uint32_t snap_mounts;        
 };
 
-/* ------------------------------------------------------------------ */
-/* time / lock / device I/O                                            */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static inline uint64_t fh_rdtsc(void) {
     uint32_t lo, hi; __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo;
 }
@@ -235,7 +235,7 @@ static uint64_t fh_now_ms(void) {
     return fh_rdtsc() / per;
 }
 __attribute__((weak)) uint64_t fhfs_time_ns(void) {
-    return 1767225600000000000ULL + fh_now_ms() * 1000000ULL;   /* 2026-01-01 + uptime */
+    return 1767225600000000000ULL + fh_now_ms() * 1000000ULL;    
 }
 __attribute__((weak)) int blkdev_flush(blkdev_t *dev) { (void)dev; return 0; }
 
@@ -252,7 +252,7 @@ static int fh_bio(fhfs_t *fs, uint64_t blk, uint32_t nb, void *buf, bool wr) {
     uint64_t lba = blk * fs->spb;
     uint32_t cnt = nb * fs->spb;
     uint8_t *p = (uint8_t *)buf;
-    uint32_t chunk = 256;                         /* sectors per request */
+    uint32_t chunk = 256;                          
     while (cnt) {
         uint32_t c = cnt > chunk ? chunk : cnt;
         int r = wr ? blkdev_write(fs->dev, lba, c, p) : blkdev_read(fs->dev, lba, c, p);
@@ -268,9 +268,9 @@ static int fh_bwrite(fhfs_t *fs, uint64_t blk, uint32_t nb, const void *buf) {
 }
 static void fh_barrier(fhfs_t *fs) { blkdev_flush(fs->dev); }
 
-/* ------------------------------------------------------------------ */
-/* allocation bitmap + adaptive allocator                              */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static inline bool bm_test(fhfs_t *fs, uint64_t b) { return (fs->bm[b >> 6] >> (b & 63)) & 1; }
 static inline void bm_setbit(fhfs_t *fs, uint64_t b) { fs->bm[b >> 6] |= 1ULL << (b & 63); }
 static inline void bm_clrbit(fhfs_t *fs, uint64_t b) { fs->bm[b >> 6] &= ~(1ULL << (b & 63)); }
@@ -320,7 +320,7 @@ static int fh_alloc(fhfs_t *fs, uint32_t nb, bool meta, uint64_t *out) {
     else                                  { cur = &fs->cur_data; lo = fs->dstart;   hi = fs->data_end; }
     uint64_t from = *cur; if (from < lo || from >= hi) from = lo;
     bool ok = bm_scan(fs, from, hi, nb, align, &found) || bm_scan(fs, lo, from + nb < hi ? from + nb : hi, nb, align, &found);
-    if (!ok && cur == &fs->cur_meta) {                     /* meta zone full: spill into data zone */
+    if (!ok && cur == &fs->cur_meta) {                      
         cur = &fs->cur_data; lo = fs->dstart; hi = fs->data_end; from = *cur; if (from < lo || from >= hi) from = lo;
         ok = bm_scan(fs, from, hi, nb, align, &found) || bm_scan(fs, lo, from + nb < hi ? from + nb : hi, nb, align, &found);
     }
@@ -331,7 +331,7 @@ static int fh_alloc(fhfs_t *fs, uint32_t nb, bool meta, uint64_t *out) {
     return FH_OK;
 }
 
-/* ---- block holders (only blocks with >= 2 holders are stored) ---- */
+ 
 typedef struct { uint64_t blk; uint32_t rc, pad; } fh_rc_ent_t;
 static inline uint32_t rc_hash(uint64_t b, uint32_t cap) { return (uint32_t)((b * 0x9E3779B97F4A7C15ULL) >> 33) & (cap - 1); }
 static fh_rc_ent_t *rc_find(fhfs_t *fs, uint64_t blk) {
@@ -343,7 +343,7 @@ static fh_rc_ent_t *rc_find(fhfs_t *fs, uint64_t blk) {
     }
 }
 static int rc_insert(fhfs_t *fs, uint64_t blk, uint32_t rc) {
-    if ((fs->rc_n + 1) * 2 > fs->rc_cap) {                      /* keep load factor <= 50% */
+    if ((fs->rc_n + 1) * 2 > fs->rc_cap) {                       
         uint32_t nc = fs->rc_cap ? fs->rc_cap * 2 : 1024;
         fh_rc_ent_t *nt = (fh_rc_ent_t *)fh_zalloc((uint64_t)nc * sizeof(fh_rc_ent_t));
         if (!nt) return FH_ENOMEM;
@@ -359,19 +359,19 @@ static int rc_insert(fhfs_t *fs, uint64_t blk, uint32_t rc) {
     t[j].blk = blk; t[j].rc = rc; fs->rc_n++;
     return FH_OK;
 }
-/* one more holder of a block that already has at least one */
+ 
 static int rc_inc(fhfs_t *fs, uint64_t blk) {
     fh_rc_ent_t *e = rc_find(fs, blk);
     if (e) { e->rc++; return FH_OK; }
     return rc_insert(fs, blk, 2);
 }
-/* one holder less. Returns true if somebody else still holds the block. */
+ 
 static bool rc_release(fhfs_t *fs, uint64_t blk) {
     fh_rc_ent_t *e = rc_find(fs, blk);
     if (!e) return false;
     if (--e->rc > 1) return true;
     fh_rc_ent_t *t = (fh_rc_ent_t *)fs->rc; uint32_t mask = fs->rc_cap - 1;
-    uint32_t i = (uint32_t)(e - t), j = i;                       /* backward-shift deletion */
+    uint32_t i = (uint32_t)(e - t), j = i;                        
     for (;;) {
         j = (j + 1) & mask;
         if (!t[j].blk) break;
@@ -386,22 +386,22 @@ static inline uint32_t bp_nblk(const fh_bp_t *bp) { return bp->blk ? (bp->clen +
 
 static void fh_free_bp(fhfs_t *fs, const fh_bp_t *bp) {
     if (!bp->blk) return;
-    if (rc_release(fs, bp->blk)) return;                    /* still used by a clone / snapshot */
+    if (rc_release(fs, bp->blk)) return;                     
     uint32_t n = bp_nblk(bp); if (!n) n = 1;
-    if (bp->birth == (uint32_t)fs->open_txg) { bm_unmark(fs, bp->blk, n); return; }  /* never committed */
+    if (bp->birth == (uint32_t)fs->open_txg) { bm_unmark(fs, bp->blk, n); return; }   
     if (fs->npend == fs->cappend) {
         uint32_t nc = fs->cappend ? fs->cappend * 2 : 1024;
         fh_pend_t *np = (fh_pend_t *)kmalloc((uint64_t)nc * sizeof(fh_pend_t));
-        if (!np) return;                                    /* leak a block rather than corrupt */
+        if (!np) return;                                     
         if (fs->pend) { fh_cpy(np, fs->pend, (uint64_t)fs->npend * sizeof(fh_pend_t)); kfree(fs->pend); }
         fs->pend = np; fs->cappend = nc;
     }
     fs->pend[fs->npend].blk = bp->blk; fs->pend[fs->npend].n = n; fs->npend++;
 }
 
-/* ------------------------------------------------------------------ */
-/* block pointers: read / write with checksum + compression            */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static int fh_read_bp(fhfs_t *fs, const fh_bp_t *bp, void *out) {
     if (!bp->blk) { fh_set(out, 0, bp->lsize); return FH_OK; }
     uint32_t nb = bp_nblk(bp);
@@ -419,7 +419,7 @@ static int fh_write_bp(fhfs_t *fs, const void *data, uint32_t lsize, bool meta, 
     if (allow_comp && fs->compress && lsize >= 512) {
         uint32_t raw_blocks = (lsize + BLK - 1) / BLK;
         uint32_t cap = raw_blocks * BLK;
-        if (cap > 512) cap -= 512;                 /* must save at least one block to be worth it */
+        if (cap > 512) cap -= 512;                  
         uint32_t c = fh_lz_compress(src, lsize, fs->cbuf, cap, fs->lz_ht, &fs->lz_base);
         if (c && (c + BLK - 1) / BLK < raw_blocks) { src = fs->cbuf; clen = c; comp = 1; }
     }
@@ -438,9 +438,9 @@ static int fh_write_bp(fhfs_t *fs, const void *data, uint32_t lsize, bool meta, 
     return FH_OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* RoW radix trees (fan-out 128). depth 0 = the root pointer is a leaf */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static inline uint64_t tree_cap(uint32_t depth) { return depth == 0 ? 1 : ((uint64_t)1 << (7 * depth)); }
 
 static fh_tnode_t *tn_new(uint8_t level) {
@@ -497,8 +497,8 @@ static int tree_lookup(fhfs_t *fs, fh_tree_t *t, uint64_t idx, fh_bp_t *out) {
 static int tree_set(fhfs_t *fs, fh_tree_t *t, uint64_t idx, const fh_bp_t *bp, fh_bp_t *old) {
     if (old) fh_set(old, 0, sizeof(*old));
     if (t->depth == 0 && idx == 0) { if (old) *old = t->root; t->root = *bp; return FH_OK; }
-    if (!bp->blk && idx >= tree_cap(t->depth)) return FH_OK;        /* clearing beyond the end */
-    while (idx >= tree_cap(t->depth)) {                              /* grow upwards */
+    if (!bp->blk && idx >= tree_cap(t->depth)) return FH_OK;         
+    while (idx >= tree_cap(t->depth)) {                               
         fh_tnode_t *nn = tn_new((uint8_t)(t->depth + 1));
         if (!nn) return FH_ENOMEM;
         if (t->depth == 0) nn->ptr[0] = t->root;
@@ -564,7 +564,7 @@ static void tn_release_blocks(fhfs_t *fs, fh_tnode_t *n) {
     if (n->bp.blk) fh_free_bp(fs, &n->bp);
 }
 
-/* free every block of the tree (leaves + nodes) and reset it to empty */
+ 
 static void tree_destroy(fhfs_t *fs, fh_tree_t *t) {
     if (t->depth == 0) { fh_free_bp(fs, &t->root); }
     else {
@@ -574,9 +574,9 @@ static void tree_destroy(fhfs_t *fs, fh_tree_t *t) {
     fh_set(t, 0, sizeof(*t));
 }
 
-/* ------------------------------------------------------------------ */
-/* forward declarations                                                */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static int  fh_commit(fhfs_t *fs);
 static int  fh_snap_write(fhfs_t *fs);
 static void fh_iput_l(fhfs_inode_t *ip);
@@ -585,9 +585,9 @@ static bool fh_umount_core(fhfs_t *fs);
 static void fh_dirty(fhfs_inode_t *ip) { ip->dirty = true; ip->fs->gdirty = true; }
 static uint32_t fh_rec_of(const fhfs_inode_t *ip) { return 1u << ip->d.rec_shift; }
 
-/* ------------------------------------------------------------------ */
-/* inode cache                                                         */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static fhfs_inode_t *ic_find(fhfs_t *fs, uint64_t ino) {
     for (fhfs_inode_t *p = fs->ihash[ino % IHASH]; p; p = p->hnext) if (p->ino == ino) return p;
     return NULL;
@@ -639,9 +639,9 @@ static fhfs_inode_t *fh_iget(fhfs_t *fs, uint64_t ino, int *err) {
     return ip;
 }
 
-/* ------------------------------------------------------------------ */
-/* hot record cache (read cache + write-back buffer in one)            */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static int hot_flush(fhfs_t *fs, fh_hot_t *h) {
     if (!h->used || !h->dirty) return FH_OK;
     fhfs_inode_t *ip = h->ip;
@@ -654,7 +654,7 @@ static int hot_flush(fhfs_t *fs, fh_hot_t *h) {
     else {
         uint32_t lsize = remain > (int64_t)rs ? rs : (uint32_t)remain;
         bool meta = FH_S_ISDIR(ip->d.mode) || FH_S_ISLNK(ip->d.mode);
-        if (fh_is_zero(h->buf, lsize)) fh_set(&bp, 0, sizeof(bp));      /* sparse: store a hole */
+        if (fh_is_zero(h->buf, lsize)) fh_set(&bp, 0, sizeof(bp));       
         else {
             int r = fh_write_bp(fs, h->buf, lsize, meta, true, &bp);
             if (r) { h->dirty = true; return r; }
@@ -702,7 +702,7 @@ static int hot_flush_ip(fhfs_t *fs, fhfs_inode_t *ip) {
     return FH_OK;
 }
 
-/* drop (without writing) every cached record with idx >= from */
+ 
 static void hot_drop(fhfs_t *fs, fhfs_inode_t *ip, int64_t from) {
     for (int i = 0; i < HOT_SLOTS; i++) {
         fh_hot_t *h = &fs->hot[i];
@@ -710,9 +710,9 @@ static void hot_drop(fhfs_t *fs, fhfs_inode_t *ip, int64_t from) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* file data                                                           */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static int64_t fh_file_read(fhfs_t *fs, fhfs_inode_t *ip, uint64_t off, uint64_t len, void *buf) {
     if (off >= ip->d.size) return 0;
     if (len > ip->d.size - off) len = ip->d.size - off;
@@ -762,9 +762,9 @@ static int fh_file_truncate(fhfs_t *fs, fhfs_inode_t *ip, uint64_t nsize) {
     uint64_t osize = ip->d.size;
     uint32_t rs = fh_rec_of(ip), sh = ip->d.rec_shift;
     if (nsize < osize) {
-        uint64_t first_free = (nsize + rs - 1) >> sh;       /* first record that disappears */
+        uint64_t first_free = (nsize + rs - 1) >> sh;        
         uint64_t last = (osize + rs - 1) >> sh;
-        if (nsize & (rs - 1)) {                              /* zero the tail of the boundary record */
+        if (nsize & (rs - 1)) {                               
             fh_hot_t *h; int r = hot_get(fs, ip, (int64_t)(nsize >> sh), true, &h); if (r) return r;
             uint32_t from = (uint32_t)(nsize & (rs - 1));
             fh_set(h->buf + from, 0, rs - from);
@@ -788,9 +788,9 @@ static int fh_file_truncate(fhfs_t *fs, fhfs_inode_t *ip, uint64_t nsize) {
     return FH_OK;
 }
 
-/* ------------------------------------------------------------------ */
-/* directories: array of variable-size entries inside 4K records       */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 typedef struct __attribute__((packed)) {
     uint64_t ino; uint16_t reclen; uint8_t namelen, type; char name[];
 } fh_dent_t;
@@ -840,7 +840,7 @@ static int dir_add(fhfs_t *fs, fhfs_inode_t *dir, const char *name, uint32_t nle
     for (uint64_t b = 0; b <= nb; b++) {
         bool newblk = (b == nb);
         int r = hot_get(fs, dir, (int64_t)b, !newblk, &h); if (r) return r;
-        if (newblk) {                                         /* one empty entry covering the block */
+        if (newblk) {                                          
             fh_dent_t *e = (fh_dent_t *)(void *)h->buf;
             e->ino = 0; e->reclen = BLK; e->namelen = 0; e->type = 0;
         }
@@ -920,9 +920,9 @@ static bool dir_is_empty(fhfs_t *fs, fhfs_inode_t *dir) {
     char nm[8]; return dir_nth(fs, dir, 0, nm, sizeof(nm), NULL, NULL) == FH_ENOENT;
 }
 
-/* ------------------------------------------------------------------ */
-/* extended attributes (one 4K block per inode) + POSIX ACL            */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 #define ACL_ACCESS  "system.posix_acl_access"
 #define ACL_DEFAULT "system.posix_acl_default"
 #define ACL_VERSION 2u
@@ -949,7 +949,7 @@ static int xa_write(fhfs_t *fs, fhfs_inode_t *ip, const uint8_t *blk) {
     fh_dirty(ip);
     return FH_OK;
 }
-/* returns entry offset or -1 */
+ 
 static int xa_find(const uint8_t *blk, const char *name, uint32_t nlen, uint32_t *vlen, uint32_t *voff, uint32_t *end) {
     uint32_t off = 0;
     while (off + 4 <= BLK) {
@@ -993,9 +993,9 @@ static int xa_set_int(fhfs_t *fs, fhfs_inode_t *ip, const char *name, const void
     uint32_t vl, vo, end;
     int e = xa_find(blk, name, nl, &vl, &vo, &end);
     if (e == -2) { kfree(blk); return FH_ECORRUPT; }
-    if (e >= 0 && (flags & 1)) { kfree(blk); return FH_EEXIST; }      /* XATTR_CREATE */
-    if (e < 0 && (flags & 2)) { kfree(blk); return FH_ENODATA; }      /* XATTR_REPLACE */
-    if (e >= 0) {                                                    /* remove the old entry first */
+    if (e >= 0 && (flags & 1)) { kfree(blk); return FH_EEXIST; }       
+    if (e < 0 && (flags & 2)) { kfree(blk); return FH_ENODATA; }       
+    if (e >= 0) {                                                     
         uint32_t tot = (4 + nl + vl + 3u) & ~3u;
         fh_move(blk + e, blk + e + tot, BLK - (uint32_t)e - tot);
         fh_set(blk + BLK - tot, 0, tot);
@@ -1033,7 +1033,7 @@ static int xa_remove_int(fhfs_t *fs, fhfs_inode_t *ip, const char *name) {
 
 typedef struct { uint16_t tag, perm; uint32_t id; } fh_acl_ent_t;
 
-/* parse a Linux posix_acl xattr value; returns entry count or negative error */
+ 
 static int acl_parse(const uint8_t *v, uint32_t len, fh_acl_ent_t *ents, uint32_t max) {
     if (len < 4 || ((len - 4) & 7)) return FH_EINVAL;
     uint32_t ver = (uint32_t)v[0] | ((uint32_t)v[1] << 8) | ((uint32_t)v[2] << 16) | ((uint32_t)v[3] << 24);
@@ -1058,7 +1058,7 @@ static uint32_t acl_emit(const fh_acl_ent_t *ents, uint32_t n, uint8_t *v) {
     }
     return 4 + n * 8;
 }
-/* strict validation like Linux posix_acl_valid() */
+ 
 static bool acl_valid(const fh_acl_ent_t *e, uint32_t n) {
     int uo = 0, go = 0, ot = 0, mk = 0, nu = 0, ng = 0;
     for (uint32_t i = 0; i < n; i++) {
@@ -1126,9 +1126,9 @@ static int fh_perm_l(fhfs_t *fs, fhfs_inode_t *ip, const fhfs_cred_t *cr, uint32
     return ((perm & want) == want) ? FH_OK : FH_EACCES;
 }
 
-/* ------------------------------------------------------------------ */
-/* inode life cycle                                                    */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static void fh_destroy_storage(fhfs_t *fs, fhfs_inode_t *ip) {
     hot_drop(fs, ip, 0);
     tree_destroy(fs, &ip->tree);
@@ -1140,7 +1140,7 @@ static void fh_destroy_storage(fhfs_t *fs, fhfs_inode_t *ip) {
     if (ino < fs->ino_hint) fs->ino_hint = ino;
 }
 
-/* returns true if the whole fs object was freed (dead fs, last inode) */
+ 
 static bool fh_iput_k(fhfs_inode_t *ip) {
     fhfs_t *fs = ip->fs;
     if (ip->ref == 0) return false;
@@ -1149,7 +1149,7 @@ static bool fh_iput_k(fhfs_inode_t *ip) {
         if (ip->ref == 0) { ic_unlink_free(fs, ip); if (fs->icount == 0) { kfree(fs); return true; } }
         return false;
     }
-    /* an unlinked file is destroyed as soon as only our own record cache still holds it */
+     
     if (ip->d.mode && ip->d.nlink == 0) {
         uint32_t h = 0;
         for (int i = 0; i < HOT_SLOTS; i++) if (fs->hot[i].used && fs->hot[i].ip == ip) h++;
@@ -1340,7 +1340,7 @@ static int fh_rename_l(fhfs_t *fs, fhfs_inode_t *od, const char *on, fhfs_inode_
             }
         } else if (fr != FH_ENOENT) r = fr;
     }
-    if (!r && sdir) {                          /* refuse to move a directory into itself */
+    if (!r && sdir) {                           
         fhfs_inode_t *a = nd; a->ref++;
         for (int guard = 0; guard < 4096; guard++) {
             if (a->ino == si->ino) { r = FH_EINVAL; break; }
@@ -1375,9 +1375,9 @@ static int fh_rename_l(fhfs_t *fs, fhfs_inode_t *od, const char *on, fhfs_inode_
     return r;
 }
 
-/* ------------------------------------------------------------------ */
-/* atomic commit                                                       */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static int fh_write_uber(fhfs_t *fs, uint64_t txg) {
     fh_uber_t *u = (fh_uber_t *)(void *)fs->tmpbuf;
     fh_set(u, 0, BLK);
@@ -1477,7 +1477,7 @@ static int fh_commit(fhfs_t *fs) {
     r = tree_flush(fs, &fs->itree); if (r) goto fail;
     if (fs->snap_dirty) { r = fh_snap_write(fs); if (r) goto fail; }
 
-    fh_barrier(fs);                                /* all data + metadata durable BEFORE the switch */
+    fh_barrier(fs);                                 
     r = fh_write_uber(fs, fs->open_txg); if (r) goto fail;
     fh_barrier(fs);
 
@@ -1493,9 +1493,9 @@ fail:
     return r;
 }
 
-/* ------------------------------------------------------------------ */
-/* media detection + geometry                                          */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static bool fh_prefix(const char *s, const char *p) { while (*p) { if (*s++ != *p++) return false; } return true; }
 
 static uint32_t fh_probe_media(blkdev_t *dev) {
@@ -1504,7 +1504,7 @@ static uint32_t fh_probe_media(blkdev_t *dev) {
     if (fh_prefix(dev->name, "vd")) return FH_MEDIA_SSD;
     uint64_t per = usb_tsc_per_ms();
     if (!per || dev->sector_count < 2048) return FH_MEDIA_SSD;
-    /* random-read latency probe: a spinning disk needs milliseconds per seek */
+     
     uint8_t *buf = (uint8_t *)kmalloc(4096); if (!buf) return FH_MEDIA_SSD;
     uint64_t seed = 0x9E3779B97F4A7C15ULL, total = 0; int n = 0;
     for (int i = 0; i < 12; i++) {
@@ -1512,7 +1512,7 @@ static uint32_t fh_probe_media(blkdev_t *dev) {
         uint64_t lba = (seed >> 16) % (dev->sector_count - 8);
         uint64_t t0 = fh_rdtsc();
         if (blkdev_read(dev, lba, 1, buf) != VFS_OK) continue;
-        if (i >= 2) { total += fh_rdtsc() - t0; n++; }       /* first reads warm the path */
+        if (i >= 2) { total += fh_rdtsc() - t0; n++; }        
     }
     kfree(buf);
     if (!n) return FH_MEDIA_SSD;
@@ -1526,7 +1526,7 @@ static void fh_geometry(fh_label_t *lab, uint64_t total, uint32_t media) {
     lab->data_start = 256; lab->data_end = total - UB_SLOTS;
     uint64_t at = lab->data_end - lab->data_start;
     lab->meta_start = lab->data_start; lab->meta_blocks = 0;
-    if (media == FH_MEDIA_HDD) {                  /* metadata zone: ~3% at the start, data streams after it */
+    if (media == FH_MEDIA_HDD) {                   
         uint64_t mb = at / 32; if (mb < 256) mb = 256; if (mb > 262144) mb = 262144;
         if (mb * 4 < at) lab->meta_blocks = mb;
     }
@@ -1560,9 +1560,9 @@ static void fh_teardown_buffers(fhfs_t *fs) {
     fs->bm = NULL; fs->iobuf = fs->cbuf = fs->tmpbuf = NULL; fs->lz_ht = NULL; fs->pend = NULL;
 }
 
-/* ------------------------------------------------------------------ */
-/* format                                                              */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 int fhfs_format(blkdev_t *dev, const char *label, uint32_t media) {
     fh_crc_init();
     if (!dev || dev->sector_size == 0 || dev->sector_size > BLK || (BLK % dev->sector_size)) return FH_EINVAL;
@@ -1588,7 +1588,7 @@ int fhfs_format(blkdev_t *dev, const char *label, uint32_t media) {
 
     uint8_t *z = (uint8_t *)fh_zalloc(BLK * UB_SLOTS);
     if (!z) { fh_teardown_buffers(fs); kfree(fs); return FH_ENOMEM; }
-    r = fh_bwrite(fs, 0, 1, z);                                          /* kill any old label first */
+    r = fh_bwrite(fs, 0, 1, z);                                           
     if (!r) r = fh_bwrite(fs, 1, UB_SLOTS, z);
     if (!r) r = fh_bwrite(fs, total - UB_SLOTS, UB_SLOTS, z);
     kfree(z);
@@ -1612,24 +1612,24 @@ int fhfs_format(blkdev_t *dev, const char *label, uint32_t media) {
         else { fh_cpy(lb, &lab, sizeof(lab)); r = fh_bwrite(fs, 0, 1, lb); kfree(lb); fh_barrier(fs); }
     }
     if (root) fh_iput_l(root);
-    fh_umount_core(fs);                                                  /* frees fs */
+    fh_umount_core(fs);                                                   
     return r;
 }
 
-/* ------------------------------------------------------------------ */
-/* mount: pick the newest valid uberblock, rebuild the allocation map  */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static fhfs_t *g_mounted[4];
 
 typedef struct {
     uint64_t first_free, next_leaf;
     uint64_t orph[128]; uint32_t norph;
     bool     have_ff;
-    bool     live;                /* scanning the live tree (not a snapshot) */
-    bool     release;             /* drop one holder of every block instead of counting it */
+    bool     live;                 
+    bool     release;              
 } fh_scan_t;
 
-/* count one holder of the block: first holder marks it used, every other one is a share */
+ 
 static int fh_visit(fhfs_t *fs, const fh_bp_t *bp) {
     if (bm_test(fs, bp->blk)) return rc_inc(fs, bp->blk);
     bm_mark(fs, bp->blk, bp_nblk(bp));
@@ -1720,7 +1720,7 @@ fhfs_t *fhfs_mount_dev(blkdev_t *dev, uint32_t flags, int *err) {
     fs->ro = dev->readonly || (flags & MS_RDONLY);
     if (flags & FHFS_MNT_NOCOMPRESS) fs->compress = false;
 
-    /* newest valid uberblock of the 2 x 16 slots */
+     
     fh_uber_t best; bool have = false;
     for (uint32_t i = 0; i < 2 * UB_SLOTS; i++) {
         uint64_t blk = (i < UB_SLOTS) ? 1 + i : fs->total - UB_SLOTS + (i - UB_SLOTS);
@@ -1737,7 +1737,7 @@ fhfs_t *fhfs_mount_dev(blkdev_t *dev, uint32_t flags, int *err) {
     if (!sc) { fh_teardown_buffers(fs); kfree(fs); *err = FH_ENOMEM; return NULL; }
     sc->live = true;
     r = scan_walk(fs, &fs->itree.root, fs->itree.depth, 0, true, sc);
-    if (!r && best.snap_root.blk) {                                  /* snapshots: every tree is one more holder */
+    if (!r && best.snap_root.blk) {                                   
         fh_snap_tab_t *tab = (fh_snap_tab_t *)kmalloc(BLK);
         if (!tab) r = FH_ENOMEM;
         else {
@@ -1767,7 +1767,7 @@ fhfs_t *fhfs_mount_dev(blkdev_t *dev, uint32_t flags, int *err) {
         *err = root ? FH_ECORRUPT : e; return NULL;
     }
     fh_iput_l(root);
-    /* unlinked-but-open files of a crashed session: free them now */
+     
     for (uint32_t i = 0; i < sc->norph; i++) {
         fhfs_inode_t *o = fh_iget(fs, sc->orph[i], &e);
         if (!o) continue;
@@ -1780,7 +1780,7 @@ fhfs_t *fhfs_mount_dev(blkdev_t *dev, uint32_t flags, int *err) {
     return fs;
 }
 
-/* flush + free all caches.  Returns true when the fs object itself was freed. */
+ 
 static bool fh_umount_core(fhfs_t *fs) {
     for (int i = 0; i < 4; i++) if (g_mounted[i] == fs) g_mounted[i] = NULL;
     for (int i = 0; i < HOT_SLOTS; i++) {
@@ -1835,9 +1835,9 @@ extern void sched_sleep_ns(uint64_t ns);
 static void fhfs_syncd(void *a) { (void)a; for (;;) { sched_sleep_ns(1000000000ULL); fhfs_tick(); } }
 int fhfs_start_syncd(void) { return sched_create_kthread(fhfs_syncd, NULL, "fhfs-sync", 0); }
 
-/* ------------------------------------------------------------------ */
-/* public API (all entry points take the fs lock)                      */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 #define LOCKED(ip, expr) do { fhfs_t *_f = (ip)->fs; fh_lock(_f); r = (expr); fh_unlock(_f); } while (0)
 
 fhfs_inode_t *fhfs_root(fhfs_t *fs) { int e; fh_lock(fs); fhfs_inode_t *r = fh_iget(fs, FH_ROOT_INO, &e); fh_unlock(fs); return r; }
@@ -1990,7 +1990,7 @@ int fhfs_setattr(fhfs_inode_t *ip, const fhfs_setattr_t *sa, const fhfs_cred_t *
     int r; LOCKED(ip, fh_setattr_l(ip->fs, ip, sa, cr)); return r;
 }
 
-/* ---- xattr API: POSIX ACLs keep the mode bits in sync ---- */
+ 
 int fhfs_getxattr(fhfs_inode_t *ip, const char *name, void *buf, size_t sz) {
     int r; LOCKED(ip, xa_get_int(ip->fs, ip, name, buf, sz)); return r;
 }
@@ -2056,9 +2056,9 @@ int fhfs_errno(int e) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* snapshots + reflink                                                 */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static int fh_snap_find(fhfs_t *fs, const char *name) {
     for (uint32_t i = 0; i < fs->nsnaps; i++) {
         const char *a = fs->snaps[i].name, *b = name;
@@ -2075,10 +2075,10 @@ static int fh_snap_create_l(fhfs_t *fs, const char *name) {
     for (uint32_t i = 0; i < n; i++) if (name[i] == '/' || name[i] == ' ') return FH_EINVAL;
     if (fh_snap_find(fs, name) >= 0) return FH_EEXIST;
     if (fs->nsnaps >= 36) return FH_ENOSPC;
-    int r = fh_commit(fs);                         /* freeze a fully consistent on-disk state */
+    int r = fh_commit(fs);                          
     if (r) return r;
     fh_scan_t *sc = (fh_scan_t *)fh_zalloc(sizeof(*sc)); if (!sc) return FH_ENOMEM;
-    r = scan_walk(fs, &fs->itree.root, fs->itree.depth, 0, true, sc);   /* every block gets one more holder */
+    r = scan_walk(fs, &fs->itree.root, fs->itree.depth, 0, true, sc);    
     kfree(sc);
     if (r) return r;
     struct fh_snap *sn = &fs->snaps[fs->nsnaps];
@@ -2098,7 +2098,7 @@ static int fh_snap_delete_l(fhfs_t *fs, const char *name) {
     fh_scan_t *sc = (fh_scan_t *)fh_zalloc(sizeof(*sc)); if (!sc) return FH_ENOMEM;
     sc->release = true;
     struct fh_snap sn = fs->snaps[i];
-    int r = scan_walk(fs, &sn.root, sn.depth, 0, true, sc);      /* drop this snapshot's holder of each block */
+    int r = scan_walk(fs, &sn.root, sn.depth, 0, true, sc);       
     kfree(sc);
     if (r) return r;
     for (uint32_t k = (uint32_t)i; k + 1 < fs->nsnaps; k++) fs->snaps[k] = fs->snaps[k + 1];
@@ -2115,7 +2115,7 @@ int fhfs_snapshot_list(fhfs_t *fs, uint32_t idx, char *name, uint64_t *txg, uint
     fh_unlock(fs); return r;
 }
 
-/* read-only view of a snapshot: an independent fhfs_t that shares only the device */
+ 
 fhfs_t *fhfs_snapshot_mount(fhfs_t *fs, const char *name, int *err) {
     int dummy; if (!err) err = &dummy;
     fh_lock(fs);
@@ -2147,7 +2147,7 @@ fhfs_t *fhfs_snapshot_mount(fhfs_t *fs, const char *name, int *err) {
     return c;
 }
 
-/* whole-file clone: dst shares every block of src until either side is modified */
+ 
 static int fh_reflink_l(fhfs_t *fs, fhfs_inode_t *src, fhfs_inode_t *dst) {
     if (fs->ro) return FH_EROFS;
     if (src == dst) return FH_EINVAL;
@@ -2155,13 +2155,13 @@ static int fh_reflink_l(fhfs_t *fs, fhfs_inode_t *src, fhfs_inode_t *dst) {
     int r = hot_flush_ip(fs, src); if (r) return r;
     r = tree_flush(fs, &src->tree); if (r) return r;
     src->d.data_root = src->tree.root; src->d.data_depth = (uint8_t)src->tree.depth;
-    hot_drop(fs, dst, 0);                           /* forget whatever dst had */
+    hot_drop(fs, dst, 0);                            
     tree_destroy(fs, &dst->tree);
     dst->d.size = 0; dst->d.blocks4k = 0;
     if (src->tree.root.blk) {
         fh_scan_t *sc = (fh_scan_t *)fh_zalloc(sizeof(*sc)); if (!sc) return FH_ENOMEM;
         fh_bp_t root = src->tree.root;
-        r = scan_walk(fs, &root, src->tree.depth, 0, false, sc);   /* one more holder of every block */
+        r = scan_walk(fs, &root, src->tree.depth, 0, false, sc);    
         kfree(sc);
         if (r) return r;
     }
@@ -2176,9 +2176,9 @@ int fhfs_reflink(fhfs_inode_t *src, fhfs_inode_t *dst) {
     int r; LOCKED(src, fh_reflink_l(src->fs, src, dst)); return r;
 }
 
-/* ------------------------------------------------------------------ */
-/* VFS glue                                                            */
-/* ------------------------------------------------------------------ */
+ 
+ 
+ 
 static int fh_to_vfs(int e) {
     switch (e) {
         case FH_OK: return VFS_OK;
@@ -2205,7 +2205,7 @@ static void fh_vfill(vfs_node_t *n, fhfs_inode_t *ip) {
     n->stat.attr = ip->d.mode;
     n->stat.cluster = (uint32_t)ip->ino;
 }
-/* takes over the caller's inode reference */
+ 
 static vfs_node_t *fh_vnode(fhfs_inode_t *ip) {
     vfs_node_t *n = (vfs_node_t *)fh_zalloc(sizeof(*n));
     if (!n) { fhfs_iput(ip); return NULL; }
@@ -2276,7 +2276,7 @@ static void fh_v_release(vfs_node_t *n) {
 }
 
 
-/* ---- POSIX extensions (credentials, ownership, links, xattr, clones) ---- */
+ 
 static fhfs_cred_t *fh_cred(const vfs_cred_t *c, fhfs_cred_t *o) {
     if (!c) return NULL;
     o->uid = c->euid; o->gid = c->egid;
@@ -2379,8 +2379,8 @@ int fhfs_node_statfs(vfs_node_t *n, fhfs_stat_t *o) {
     return 0;
 }
 
-/* ---- snapshot administration (root only) ----
-   cmd 1 create(name)  2 delete(name)  3 list(idx -> out48)  4 mount(name at `at`, read-only)  */
+
+
 int fhfs_vfs_snapshot(int cmd, const char *path, const char *name, const char *at, uint32_t idx, char *out48) {
     if (vfs_cred()->euid != 0) return VFS_ERR_ACCES;
     int err; vfs_node_t *n = vfs_lookup_node(path, 1, &err);

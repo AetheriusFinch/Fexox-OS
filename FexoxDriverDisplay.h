@@ -1,19 +1,19 @@
 /* Fexox OS Project, EULA GPLv2 */
-/*
- * FexoxDriverDisplay (FDD) - display layer between the GUI and the physical screen.
- *
- *   GUI / apps draw into a LOGICAL surface (any resolution up to the surface maximum).
- *   FDD presents that surface to the physical linear framebuffer (the one UEFI/GOP gave us):
- *
- *     - scaling   : nearest or bilinear filter, stretched or aspect-preserving (letterbox)
- *     - rotation  : 0 / 90 / 180 / 270 degrees
- *     - mode switch at run time, no reboot (the logical resolution is just a number;
- *       the physical mode stays whatever the firmware set)
- *
- * The GPU/GOP does none of this, so everything is done in software (integer-only, no SSE).
- * The logical surface has a FIXED pitch and a fixed size for the whole run, so a pointer that
- * was handed to a user process stays valid when the logical resolution changes.
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #ifndef FEXOX_DRIVER_DISPLAY_H
 #define FEXOX_DRIVER_DISPLAY_H
 
@@ -22,34 +22,34 @@
 #include "Framebuffer.h"
 
 #define FDD_ROT_0    0
-#define FDD_ROT_90   1      /* clockwise */
+#define FDD_ROT_90   1       
 #define FDD_ROT_180  2
 #define FDD_ROT_270  3
 
 #define FDD_FILTER_NEAREST   0
 #define FDD_FILTER_BILINEAR  1
 
-#define FDD_FIT_LETTERBOX    0      /* keep aspect ratio, black bars */
-#define FDD_FIT_STRETCH      1      /* fill the whole screen */
+#define FDD_FIT_LETTERBOX    0       
+#define FDD_FIT_STRETCH      1       
 
 #define FDD_MIN_W   640u
 #define FDD_MIN_H   480u
 
-/* Physical side: call once from fb_init() with the firmware framebuffer. */
-int  fdd_init(const fb_info_t *info, uint8_t *front_virt);   /* front_virt = mapped framebuffer */
-bool fdd_ready(void);                 /* physical framebuffer known, 32 bpp */
+ 
+int  fdd_init(const fb_info_t *info, uint8_t *front_virt);    
+bool fdd_ready(void);                  
 
-/* Allocates the logical surface (tries 2x native capped at 3840x2160, then smaller) and
-   selects logical = physical.  Returns the surface or NULL (FDD stays inactive). */
+
+
 uint8_t *fdd_alloc_surface(void);
-bool     fdd_active(void);            /* surface allocated and present path enabled */
+bool     fdd_active(void);             
 
 uint8_t *fdd_surface(void);
-uint32_t fdd_surface_pitch(void);     /* bytes, constant */
-uint64_t fdd_surface_bytes(void);     /* whole allocation, constant */
+uint32_t fdd_surface_pitch(void);      
+uint64_t fdd_surface_bytes(void);      
 void     fdd_surface_max(uint32_t *w, uint32_t *h);
 
-/* Mode control.  Returns 0 or a negative error (mode unchanged). */
+ 
 int  fdd_set_mode(uint32_t logical_w, uint32_t logical_h, int rotation, int filter, int fit);
 int  fdd_set_rotation(int rotation);
 int  fdd_set_filter(int filter, int fit);
@@ -61,15 +61,15 @@ int      fdd_filter(void);
 int      fdd_fit(void);
 void     fdd_phys_size(uint32_t *w, uint32_t *h);
 
-/* Relative pointer motion measured on the physical screen -> motion on the logical surface
-   (call this on every mouse delta, otherwise the cursor moves sideways on a rotated screen). */
+
+
 void fdd_rotate_delta(int32_t *dx, int32_t *dy);
 
-/* Copies the logical surface (or a logical rectangle of it) to the screen. */
+ 
 void fdd_present(void);
 void fdd_present_rect(int32_t x, int32_t y, uint32_t w, uint32_t h);
 
-/* Standard modes that fit into the surface, ascending.  Returns the count. */
+ 
 int  fdd_standard_modes(uint32_t (*out)[2], int max);
 
 #endif

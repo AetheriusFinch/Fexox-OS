@@ -308,7 +308,7 @@ int fb_init(const fb_info_t *info) {
 
         g_fb.front      = (uint8_t *)(uintptr_t)(info->phys_addr + DIRECT_MAP_OFFSET);
         g_fb.phys_addr  = info->phys_addr;
-        (void)fdd_init(info, g_fb.front);      /* FexoxDriverDisplay: physical side */
+        (void)fdd_init(info, g_fb.front);       
 
         if (info->red_mask || info->green_mask || info->blue_mask) {
             g_fb.r_shift = mask_to_shift(info->red_mask);
@@ -366,8 +366,8 @@ int fb_enable_double_buffer(void) {
     if (g_fb.mode != FB_MODE_LINEAR) return -1;
     if (g_fb.back) return 0;
 
-    /* FexoxDriverDisplay: the back buffer is the LOGICAL surface; pitch is fixed for the whole run
-       (a pointer already given to a user process stays valid when the resolution changes). */
+    
+
     uint8_t *fdd_surf = fdd_alloc_surface();
     if (fdd_surf) {
         g_fb.back   = fdd_surf;
@@ -462,7 +462,7 @@ void fb_flip(void) {
 static bool fb_apply_virtual_resolution(uint32_t w, uint32_t h) {
     if (g_fb.mode != FB_MODE_LINEAR) return false;
     if (!w || !h) return false;
-    if (fdd_active()) {            /* real run-time mode switch through FexoxDriverDisplay */
+    if (fdd_active()) {             
         if (fdd_set_mode(w, h, fdd_rotation(), fdd_filter(), fdd_fit()) != 0) return false;
         g_fb.width  = fdd_logical_w();
         g_fb.height = fdd_logical_h();
@@ -3602,7 +3602,7 @@ static void ui_load_mode_list(void) {
 
 
 
-/* ---- FexoxDriverDisplay glue: saved mode, rotation/scaling labels, relayout after a mode change ---- */
+ 
 #define FDD_CFG_PATH "/etc/fdd.cfg"
 extern void ui_set_mouse_pos(int32_t x, int32_t y);
 extern void ui_get_mouse_pos(int32_t *out_x, int32_t *out_y);
@@ -3626,7 +3626,7 @@ static void fdd_cfg_save(void) {
     vfs_close(fd);
 }
 
-/* applies "W H rot filter fit" from fdd.cfg; returns true when a mode was applied */
+ 
 static bool fdd_cfg_load(void) {
     if (!fdd_active()) return false;
     int fd = vfs_open(FDD_CFG_PATH, O_RDONLY);
@@ -3669,7 +3669,7 @@ static void fdd_apply_scale_idx(int i) {
                          (i & 2) ? FDD_FIT_STRETCH : FDD_FIT_LETTERBOX);
 }
 
-/* After the logical resolution / rotation changed: keep windows and the pointer on screen, redraw. */
+ 
 static void ui_after_mode_change(void) {
     g_fb.width  = fdd_logical_w();
     g_fb.height = fdd_logical_h();
@@ -3681,11 +3681,11 @@ static void ui_after_mode_change(void) {
         if (w->y + (int32_t)w->h > usable_h)            w->y = usable_h - (int32_t)w->h;
         if (w->x < 0) w->x = 0;
         if (w->y < 0) w->y = 0;
-        w->redraw_gen++;                       /* user-space windows repaint themselves */
+        w->redraw_gen++;                        
     }
     int32_t mx, my;
     ui_get_mouse_pos(&mx, &my);
-    ui_set_mouse_pos(mx, my);                  /* clamps to the new logical size */
+    ui_set_mouse_pos(mx, my);                   
     ui_draw_desktop();
 }
 
@@ -3697,7 +3697,7 @@ static void ui_load_persisted_resolution(void) {
         int n = fdd_standard_modes(sm, 16);
         for (int i = 0; i < n; i++) (void)res_add(sm[i][0], sm[i][1]);
         uint32_t mw, mh; fdd_surface_max(&mw, &mh);
-        int o = 0;                              /* drop modes the surface cannot hold */
+        int o = 0;                               
         for (int i = 0; i < g_res_count; i++) {
             const ui_resolution_t *r = &g_resolutions[i];
             if (r->w < FDD_MIN_W || r->h < FDD_MIN_H || r->w > mw || r->h > mh) continue;

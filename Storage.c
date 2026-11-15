@@ -1,25 +1,25 @@
 /* Fexox OS Project, EULA GPLv2 */
-/*
- * Storage.c - volume discovery and mounting policy.
- *
- *   /            FexoxHybridFS (FHFS).  Always the system filesystem.
- *   /boot        FAT32 boot volume (flash / ESP with kernel.bin or FEXOX.SEED) - seed source
- *   /mnt/<dev>   every other FAT32 (or extra FHFS) volume: USB flash drives etc.
- *
- * Where the FHFS root is looked for (in this order):
- *   1. any block device or partition that already carries a valid FHFS label
- *   2. a partition that is DEDICATED to Fexox and still blank:
- *        MBR type 0xDA, or GPT type GUID FEXOX_GPT_GUID (below)
- *      -> formatted automatically on first boot (only if its first 8 sectors are all zero)
- *   3. fallback (no FHFS anywhere): the FAT32 boot volume is mounted as "/" like before.
- *
- * A whole disk is NEVER formatted automatically.
- *
- * Seeding: when "/" is FHFS and a FAT32 boot volume is mounted on /boot, its files are copied
- *   /boot/APPS/ -> /APPS/   (copied when missing or different: system binaries)
- *   /boot/init    -> /init     (same)
- *   /boot/UI/ -> /UI/   (copied only when missing: user may customise)
- */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -35,14 +35,14 @@ extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
 
 #ifndef FEXOX_STORAGE_HOTPLUG_POLL
-#define FEXOX_STORAGE_HOTPLUG_POLL 1    /* daemon calls usb_hotplug_poll() itself */
+#define FEXOX_STORAGE_HOTPLUG_POLL 1     
 #endif
 
 static void (*g_log)(const char *) = 0;
 static void slog(const char *s) { dbg_puts(s); if (g_log) g_log(s); }
 static void slog2(const char *a, const char *b) { slog(a); slog(b); }
 
-/* -------------------------- small string helpers -------------------------- */
+ 
 static size_t s_len(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
 static int s_eq(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return *a == *b; }
 static void s_cpy(char *d, const char *s, size_t max) {
@@ -52,7 +52,7 @@ static void s_cat(char *d, const char *s, size_t max) {
     size_t n = s_len(d); s_cpy(d + n, s, max > n ? max - n : 0);
 }
 
-/* ------------------------------ partitions ------------------------------- */
+ 
 typedef struct { blkdev_t *base; uint64_t first_lba; } part_priv_t;
 
 static int part_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf) {
@@ -89,8 +89,8 @@ static const uint8_t FEXOX_GPT_GUID[16] =
 
 typedef struct { uint64_t start, size; int dedicated; } pent_t;
 
-/* A real FAT32 boot sector (not just "something that starts with a jump"): MBR boot code of a
-   partitioned disk must never be mistaken for a superfloppy FAT volume. */
+
+
 static int fat_bpb(const uint8_t *s) {
     if (s[510] != 0x55 || s[511] != 0xAA) return 0;
     if (s[0] != 0xEB && s[0] != 0xE9) return 0;
@@ -98,15 +98,15 @@ static int fat_bpb(const uint8_t *s) {
     if (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096) return 0;
     uint8_t spc = s[13];
     if (spc == 0 || (spc & (spc - 1))) return 0;
-    if (s[14] == 0 && s[15] == 0) return 0;                 /* reserved sectors */
-    if (s[16] != 1 && s[16] != 2) return 0;                 /* number of FATs */
-    if (s[17] != 0 || s[18] != 0) return 0;                 /* root entries: 0 on FAT32 */
-    if (s[22] != 0 || s[23] != 0) return 0;                 /* FAT16 size: 0 on FAT32 */
+    if (s[14] == 0 && s[15] == 0) return 0;                  
+    if (s[16] != 1 && s[16] != 2) return 0;                  
+    if (s[17] != 0 || s[18] != 0) return 0;                  
+    if (s[22] != 0 || s[23] != 0) return 0;                  
     if (!(s[82]=='F' && s[83]=='A' && s[84]=='T' && s[85]=='3' && s[86]=='2')) return 0;
     return 1;
 }
 
-/* Reads the MBR/GPT of `bd` (sector 0 already in `sec`, 4096 bytes buffer). */
+ 
 static int read_parts(blkdev_t *bd, uint8_t *sec, pent_t *out, int max) {
     uint32_t ss = bd->sector_size;
     int n = 0, is_gpt = 0;
@@ -118,7 +118,7 @@ static int read_parts(blkdev_t *bd, uint8_t *sec, pent_t *out, int max) {
             uint8_t type = e[4];
             uint32_t lba = rd32(e + 8), cnt = rd32(e + 12);
             if (type == 0 || lba == 0 || cnt == 0) continue;
-            if (type == 0x05 || type == 0x0F || type == 0x85) continue;      /* extended */
+            if (type == 0x05 || type == 0x0F || type == 0x85) continue;       
             out[n].start = lba; out[n].size = cnt; out[n].dedicated = (type == 0xDA); n++;
         }
         return n;
@@ -147,7 +147,7 @@ static int read_parts(blkdev_t *bd, uint8_t *sec, pent_t *out, int max) {
     return n;
 }
 
-/* ------------------------------ candidates ------------------------------- */
+ 
 enum { K_FHFS = 1, K_BLANK = 2, K_FAT = 3 };
 typedef struct { blkdev_t *dev; int kind; int done; } cand_t;
 #define ST_MAX_CAND 32
@@ -159,8 +159,8 @@ static blkdev_t *g_scanned[ST_MAX_SCAN];
 static uint8_t   g_tries[ST_MAX_SCAN];
 static int       g_nscanned = 0;
 
-static int g_root_kind = 0;        /* 0 none, 1 FHFS, 2 legacy FAT */
-static int g_boot_mounted = 0;     /* FAT boot volume sits on /boot */
+static int g_root_kind = 0;         
+static int g_boot_mounted = 0;      
 static int g_seeded = 0;
 static bool g_first_fat_seen = false;
 static int  g_fat_wait = 0;
@@ -196,7 +196,7 @@ static void dec_str(char *o, unsigned v) {
     int k = 0; while (n) o[k++] = t[--n]; o[k] = 0;
 }
 
-/* returns 1 when the disk is fully handled (do not rescan), 0 to retry later */
+ 
 static int scan_disk(blkdev_t *bd) {
     uint32_t ss = bd->sector_size ? bd->sector_size : 512u;
     if (ss > 4096u || bd->sector_count == 0) return 1;
@@ -214,7 +214,7 @@ static int scan_disk(blkdev_t *bd) {
     for (int i = 0; i < np; i++) {
         if (pe[i].start + pe[i].size > bd->sector_count) continue;
         if (g_pd_used >= ST_MAX_PARTS) break;
-        /* probe through a temporary device */
+         
         blkdev_t tmp; part_priv_t tp;
         make_part_dev(&tmp, &tp, bd, &pe[i], "tmp");
         int kind = 0;
@@ -249,7 +249,7 @@ static void scan_new_disks(void) {
         if (!d || is_part(d)) continue;
         int known = -1;
         for (int k = 0; k < g_nscanned; k++) if (g_scanned[k] == d) { known = k; break; }
-        if (known >= 0 && g_tries[known] == 0) continue;          /* handled */
+        if (known >= 0 && g_tries[known] == 0) continue;           
         if (known < 0) {
             if (g_nscanned >= ST_MAX_SCAN) continue;
             known = g_nscanned++; g_scanned[known] = d; g_tries[known] = 3;
@@ -260,7 +260,7 @@ static void scan_new_disks(void) {
     }
 }
 
-/* -------------------------------- helpers --------------------------------- */
+ 
 static bool path_exists(const char *p) { vfs_stat_t st; return vfs_stat(p, &st) == VFS_OK; }
 
 static void ensure_dir(const char *p, uint32_t mode) {
@@ -278,7 +278,7 @@ static bool has_marker(const char *prefix, const char *const *marks) {
 static const char *const MARK_SEED[]   = { "/kernel.bin", "/FEXOX.SEED", NULL };
 static const char *const MARK_LEGACY[] = { "/kernel.bin", "/EFI", "/UI", "/APPS", "/FEXOX.SEED", NULL };
 
-/* ------------------------------- root mount ------------------------------- */
+ 
 static void make_system_dirs(void) {
     ensure_dir("/boot", 0755); ensure_dir("/mnt", 0755); ensure_dir("/UI", 0755);
     ensure_dir("/APPS", 0755); ensure_dir("/tmp", 01777); ensure_dir("/etc", 0755);
@@ -325,7 +325,7 @@ static int try_legacy_root(void) {
     return 0;
 }
 
-/* ---------------------------------- seeding -------------------------------- */
+ 
 static bool same_content(const char *a, const char *b) {
     bool same = true;
     uint8_t *x = (uint8_t *)kmalloc(16384), *y = (uint8_t *)kmalloc(16384);
@@ -371,8 +371,8 @@ static bool copy_file(const char *src, const char *dst, uint32_t mode, bool over
     return ok;
 }
 
-/* FAT without LFN reports 8.3 names in capitals; the system uses lower-case names, so fold
-   names that contain no lower-case letter (README.TXT -> readme.txt, but not top-level UI/APPS). */
+
+
 static void fold_name(const char *in, char *out, size_t max) {
     bool has_lower = false, has_upper = false;
     for (const char *p = in; *p; p++) { if (*p >= 'a' && *p <= 'z') has_lower = true; if (*p >= 'A' && *p <= 'Z') has_upper = true; }
@@ -401,7 +401,7 @@ static void seed_dir(const char *src, const char *dst, bool overwrite, int depth
         if (de->type == VFS_TYPE_DIR) { seed_dir(sp, dp, overwrite, depth + 1); continue; }
         size_t l = s_len(nm);
         bool exe = overwrite || (l > 4 && s_eq(nm + l - 4, ".elf"));
-        if (!copy_file(sp, dp, exe ? 0755 : 0644, overwrite)) break;     /* disk full etc. */
+        if (!copy_file(sp, dp, exe ? 0755 : 0644, overwrite)) break;      
     }
     kfree(de);
     vfs_close(dfd);
@@ -418,7 +418,7 @@ static void seed_from_boot(void) {
     slog("[STORAGE] seeding done\n");
 }
 
-/* ------------------------- FAT / extra FHFS volumes ------------------------ */
+ 
 static void mount_extra_volumes(void) {
     for (int i = 0; i < g_nc; i++) {
         cand_t *c = &g_c[i];
@@ -450,9 +450,9 @@ static void mount_extra_volumes(void) {
 }
 
 
-/* ---------------------------------- benchmark ------------------------------ */
-/* Reads the biggest file of /boot/UI from FAT32 (/boot) and from FHFS (/UI), twice each, and writes
-   4 MiB to FHFS /tmp.  Set -DFEXOX_STORAGE_BENCH=0 to switch it off. */
+ 
+
+
 #ifndef FEXOX_STORAGE_BENCH
 #define FEXOX_STORAGE_BENCH 1
 #endif
@@ -466,7 +466,7 @@ static void dec64s(char *o, uint64_t v) {
 static void b_report(const char *what, const char *path, uint64_t bytes, uint64_t tsc) {
     uint64_t per = usb_tsc_per_ms(); if (!per) per = 3000000ULL;
     uint64_t us = tsc * 1000 / per, ms = us / 1000;
-    uint64_t mibs10 = us ? (bytes * 10 * 1000000ULL / us) / (1024 * 1024) : 0;     /* MiB/s * 10 */
+    uint64_t mibs10 = us ? (bytes * 10 * 1000000ULL / us) / (1024 * 1024) : 0;      
     char a[24], b[24], c[24], d[24];
     dec64s(a, bytes / 1024); dec64s(b, ms); dec64s(c, mibs10 / 10); dec64s(d, mibs10 % 10);
     slog("  "); slog(what); slog(path); slog(": "); slog(a); slog(" KiB, "); slog(b); slog(" ms, ");
@@ -503,7 +503,7 @@ static void storage_bench(void) {
 
     uint8_t *buf = (uint8_t *)kmalloc(65536);
     if (!buf) return;
-    for (int i = 0; i < 65536; i++) buf[i] = (uint8_t)(i * 31u + (i >> 8));      /* not compressible-to-nothing */
+    for (int i = 0; i < 65536; i++) buf[i] = (uint8_t)(i * 31u + (i >> 8));       
     uint64_t t0 = b_tsc();
     int fd = vfs_open2("/tmp/bench.bin", O_WRONLY | O_CREAT | O_TRUNC, 0644);
     uint64_t total = 0;
@@ -519,7 +519,7 @@ static void storage_bench(void) {
 static void storage_bench(void) {}
 #endif
 
-/* --------------------------------- public ---------------------------------- */
+ 
 int storage_init(void (*log)(const char *)) {
     g_log = log;
     fhfs_register();
@@ -532,7 +532,7 @@ int storage_init(void (*log)(const char *)) {
         }
         if (try_fhfs_root()) break;
         if (g_first_fat_seen) {
-            /* FAT boot volume present but no FHFS yet: give other devices a short grace period */
+             
             if (++g_fat_wait > 8 && try_legacy_root()) break;
         }
         if (round == 0) slog("[STORAGE] waiting for storage devices...\n");

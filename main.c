@@ -177,7 +177,7 @@ static void kout_dec(const char *label, uint64_t v) {
     out[o] = '\0';
     kout(label); kout(out); kout("\n");
 }
-/* kout + copy into the diagnostic ring (partial pieces are joined until '\n') */
+ 
 static char g_klog_line[96]; static int g_klog_len;
 static void klog(const char *s) {
     kout(s);
@@ -293,8 +293,8 @@ void fexox_os_isr_heartbeat(void) {
 
     uint32_t kf = 0; uint64_t ks = 0, ku = 0;
     kmalloc_get_diag(&kf, &ks, &ku);
-    /* Self-explanatory allocator status (the old "sz=0" looked like a fault to readers:
-       it only meant "size of the last FAILED allocation: none"). */
+    
+
     d = dbg_s(b, kf ? "heap FAIL" : "heap OK");
     d = dbg_s(d, " fails="); d = dbg_u(d, kf);
     d = dbg_s(d, " last_fail="); if (kf) d = dbg_u(d, ks); else d = dbg_s(d, "none");
@@ -374,7 +374,7 @@ static int ps2_controller_present(void) {
 
 
 
-/* Volume discovery / mounting lives in Storage.c (FHFS root, FAT32 for removable media). */
+ 
 
 typedef struct __attribute__((packed)) {
     uint32_t reserved0;
@@ -939,7 +939,7 @@ void kernel_entry(BOOT_INFO *info) {
     kout("[OK] vfs\n");
 
      
-    /* fhfs_register()/fat32_register() are called inside storage_init() */
+     
 
      
 
@@ -1082,7 +1082,7 @@ void kernel_entry(BOOT_INFO *info) {
 
 
     {
-        /* FHFS is the system root; FAT32 volumes (USB flash, boot ESP) go to /boot and /mnt/<dev>. */
+         
         int mounted = storage_init(klog);
         if (mounted) {
              
@@ -1149,7 +1149,7 @@ void kernel_entry(BOOT_INFO *info) {
                 usb_delay_ms(pg);
 
                 fbcon_clear(); kout("=== DIAG 4/5: USB event log, older part ===\n");
-                usbdiag_dump(kout, USBDIAG_VIEW_USB, 52);          /* 52 newest; first lines = older */
+                usbdiag_dump(kout, USBDIAG_VIEW_USB, 52);           
                 usb_delay_ms(pg);
 
                 fbcon_clear(); kout("=== DIAG 5/5: storage / mount log ===\n");

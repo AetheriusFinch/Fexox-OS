@@ -196,8 +196,8 @@ typedef struct sc_proc {
     struct sc_proc *leader;
     bool            exit_set;                                                                        
     uint32_t        vm_owner;                                                                          
-    vfs_cred_t cred;                 /* uid/gid/euid/egid/groups (zero = root) */
-    uint32_t   suid, sgid;           /* saved set-user/group-id */
+    vfs_cred_t cred;                  
+    uint32_t   suid, sgid;            
 } sc_proc_t;
 
 static sc_proc_t *g_procs[SC_PROC_MAX];
@@ -1059,8 +1059,8 @@ static int64_t sc_execve(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
                                                                               
                                                                                           
     sc_proc_t *p = sc_cur();
-    if (xa.mode & 04000u) p->cred.euid = xa.uid;                      /* set-user-ID program */
-    if (xa.mode & 02000u) p->cred.egid = xa.gid;                      /* set-group-ID program */
+    if (xa.mode & 04000u) p->cred.euid = xa.uid;                       
+    if (xa.mode & 02000u) p->cred.egid = xa.gid;                       
     p->suid = p->cred.euid; p->sgid = p->cred.egid;
     {                                                                    
         task_t *self = sched_current();
@@ -1959,8 +1959,8 @@ static int64_t sc_get_framebuffer(uint64_t fb_ptr) {
         uint32_t pitch     = fb_pitch();
         uint32_t height    = fb_height();
         uint64_t fb_bytes  = (uint64_t)pitch * (uint64_t)height;
-        {   /* FexoxDriverDisplay: map the whole fixed-size logical surface, so the mapping stays
-               valid when the resolution is switched at run time */
+        {   
+
             extern uint64_t fdd_surface_bytes(void);
             uint64_t sb = fdd_surface_bytes();
             if (sb > fb_bytes) fb_bytes = sb;
@@ -3308,7 +3308,7 @@ static sc_ktermios_t g_ktermios = {
 static int64_t sc_ioctl(uint64_t fd_arg, uint64_t req, uint64_t arg) {
     sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
     if (!f) return -(int64_t)EBADF;
-    if ((uint32_t)req == 0x40049409u) return sc_ficlone(fd_arg, arg);          /* FICLONE: cp --reflink */
+    if ((uint32_t)req == 0x40049409u) return sc_ficlone(fd_arg, arg);           
 
     switch ((uint32_t)req) {
     case SC_FIONBIO:
@@ -3477,12 +3477,12 @@ static int64_t sc_prctl(uint64_t option, uint64_t a2) {
 
 
 
-/* ===================================================================== */
-/* POSIX file API for musl on FexoxHybridFS                              */
-/*   credentials (uid/gid/groups/setuid), *at() paths, symlinks, hard    */
-/*   links, chmod/chown, timestamps, xattr + ACL, statfs, reflink,       */
-/*   snapshots.  Every call is checked against the caller's credentials. */
-/* ===================================================================== */
+ 
+ 
+ 
+ 
+ 
+ 
 
 #define SCE_E2BIG         7
 #define SCE_ENOTTY        25
@@ -3509,7 +3509,7 @@ static int64_t sc_vfs_errno(int r) {
     case VFS_ERR_INVAL:  return -(int64_t)EINVAL;
     case VFS_ERR_BADF:   return -(int64_t)EBADF;
     case VFS_ERR_NFILE:  return -(int64_t)ENFILE;
-    case VFS_ERR_BUSY:   return -(int64_t)16;               /* EBUSY */
+    case VFS_ERR_BUSY:   return -(int64_t)16;                
     case VFS_ERR_NOTEMPTY: return -(int64_t)ENOTEMPTY;
     case VFS_ERR_UNSUP:  return -(int64_t)ENOSYS;
     case VFS_ERR_LOOP:   return -(int64_t)SCE_ELOOP;
@@ -3526,7 +3526,7 @@ static int64_t sc_vfs_errno(int r) {
 }
 #define SC_ERR(r) sc_vfs_errno(r)
 
-/* ---------------- credentials ---------------- */
+ 
 static const vfs_cred_t *sc_cred_provider(void) {
     sc_proc_t *p = sc_cur();
     p->cred.umask = p->umask_val;
@@ -3630,8 +3630,8 @@ static int64_t sc_setgroups(uint64_t size, uint64_t list) {
     return 0;
 }
 
-/* ---------------- paths ---------------- */
-/* Resolve (dirfd, user path) to an absolute kernel path. */
+ 
+ 
 static int64_t sc_getpath(uint64_t dirfd, uint64_t uptr, char *out, size_t sz) {
     const char *u = (const char *)(uintptr_t)uptr;
     if (!syscall_validate_ptr(u, 1)) return -(int64_t)EFAULT;
@@ -3671,7 +3671,7 @@ static int64_t sc_openat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags_arg, 
 }
 static int64_t sc_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) { return sc_openat((uint64_t)(int64_t)AT_FDCWD, path_ptr, flags, mode); }
 
-/* ---------------- stat ---------------- */
+ 
 static void sc_kstat_from_attr(sc_kstat_t *o, const vfs_attr_t *a) {
     memset(o, 0, sizeof(*o));
     o->st_dev = a->dev; o->st_ino = a->ino; o->st_nlink = a->nlink; o->st_mode = a->mode;
@@ -3681,7 +3681,7 @@ static void sc_kstat_from_attr(sc_kstat_t *o, const vfs_attr_t *a) {
     o->st_mtime_sec = (int64_t)(a->mtime_ns / 1000000000ULL); o->st_mtime_nsec = (int64_t)(a->mtime_ns % 1000000000ULL);
     o->st_ctime_sec = (int64_t)(a->ctime_ns / 1000000000ULL); o->st_ctime_nsec = (int64_t)(a->ctime_ns % 1000000000ULL);
 }
-/* attributes of an fd: files and directories through the VFS, pipes / consoles as FIFO / char device */
+ 
 static int sc_attr_of_fd(int fd, vfs_attr_t *a) {
     sc_file_t *f = sc_get_file(fd);
     if (!f) return -(int)EBADF;
@@ -3739,7 +3739,7 @@ static int64_t sc_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags, uint6
 }
 static int64_t sc_newfstatat(uint64_t dirfd, uint64_t path_ptr, uint64_t st_ptr, uint64_t flags) { return sc_fstatat(dirfd, path_ptr, st_ptr, flags); }
 
-/* ---------------- directories, links, names ---------------- */
+ 
 static int64_t sc_mkdirat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
     char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
     return SC_ERR(vfs_mkdir2(path, (uint32_t)mode & 07777u));
@@ -3748,7 +3748,7 @@ static int64_t sc_mkdir(uint64_t path_ptr, uint64_t mode) { return sc_mkdirat((u
 static int64_t sc_mknodat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, uint64_t dev) {
     char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
     uint32_t t = (uint32_t)mode & 0170000u;
-    if ((t == 0020000u || t == 0060000u) && !sc_is_priv(sc_cur())) return -(int64_t)EPERM;     /* device nodes: root only */
+    if ((t == 0020000u || t == 0060000u) && !sc_is_priv(sc_cur())) return -(int64_t)EPERM;      
     return SC_ERR(vfs_mknod2(path, (uint32_t)mode, dev));
 }
 static int64_t sc_mknod(uint64_t path_ptr, uint64_t mode, uint64_t dev) { return sc_mknodat((uint64_t)(int64_t)AT_FDCWD, path_ptr, mode, dev); }
@@ -3759,7 +3759,7 @@ static int64_t sc_unlinkat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
 static int64_t sc_unlink(uint64_t path_ptr) { return sc_unlinkat((uint64_t)(int64_t)AT_FDCWD, path_ptr, 0); }
 static int64_t sc_rmdir(uint64_t path_ptr)  { return sc_unlinkat((uint64_t)(int64_t)AT_FDCWD, path_ptr, AT_REMOVEDIR); }
 
-/* plain FAT volumes cannot rename natively: copy + delete (regular files only) */
+ 
 static int sc_rename_copy(const char *op, const char *np) {
     vfs_stat_t st; if (vfs_stat(op, &st) != VFS_OK) return VFS_ERR_NOENT;
     if (st.type == VFS_TYPE_DIR) return VFS_ERR_UNSUP;
@@ -3852,7 +3852,7 @@ static int64_t sc_faccessat2(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, u
 static int64_t sc_access(uint64_t path_ptr, uint64_t mode) { return sc_faccessat2((uint64_t)(int64_t)AT_FDCWD, path_ptr, mode, 0); }
 static int64_t sc_faccessat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) { return sc_faccessat2(dirfd, path_ptr, mode, 0); }
 
-/* ---------------- ownership, mode, times ---------------- */
+ 
 static int64_t sc_set_common(const char *path, int fd, int follow, const vfs_setattr_t *sa) {
     if (fd >= 0) {
         sc_file_t *f = sc_get_file(fd);
@@ -3884,7 +3884,7 @@ static int64_t sc_lchown(uint64_t p, uint64_t u, uint64_t g) { return sc_chown_i
 static int64_t sc_fchown(uint64_t fd, uint64_t u, uint64_t g) { return sc_chown_impl(0, 0, (int)(uint32_t)fd, u, g, 1); }
 static int64_t sc_fchownat(uint64_t dfd, uint64_t p, uint64_t u, uint64_t g, uint64_t flags) { return sc_chown_impl(dfd, p, -1, u, g, !(flags & AT_SYMLINK_NOFOLLOW)); }
 
-/* times[0] = atime, times[1] = mtime; each {sec, nsec} (UTIME_NOW / UTIME_OMIT understood) */
+ 
 static int64_t sc_utimens_apply(const char *path, int fd, int follow, const sc_timespec_t *ts) {
     vfs_setattr_t sa; memset(&sa, 0, sizeof sa);
     uint64_t now = (uint64_t)sc_realtime_ns();
@@ -3904,7 +3904,7 @@ static int64_t sc_utimens_apply(const char *path, int fd, int follow, const sc_t
 static int64_t sc_utimensat(uint64_t dirfd, uint64_t path_ptr, uint64_t times_ptr, uint64_t flags) {
     const sc_timespec_t *ts = NULL;
     if (times_ptr) { if (!syscall_validate_ptr((void *)(uintptr_t)times_ptr, 2 * sizeof(sc_timespec_t))) return -(int64_t)EFAULT; ts = (const sc_timespec_t *)(uintptr_t)times_ptr; }
-    if (!path_ptr) return sc_utimens_apply(NULL, (int)(int32_t)dirfd, 1, ts);              /* futimens() */
+    if (!path_ptr) return sc_utimens_apply(NULL, (int)(int32_t)dirfd, 1, ts);               
     char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
     return sc_utimens_apply(path, -1, !(flags & AT_SYMLINK_NOFOLLOW), ts);
 }
@@ -3931,7 +3931,7 @@ static int64_t sc_utime(uint64_t path_ptr, uint64_t buf_ptr) {
     return sc_utimens_apply(path, -1, 1, pt);
 }
 
-/* fallocate(fd, 0, off, len): grow the file (space is allocated lazily by the RoW allocator) */
+ 
 static int64_t sc_fallocate(uint64_t fd_arg, uint64_t mode, uint64_t off, uint64_t len) {
     sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
     if (!f || f->is_pipe_read || f->is_pipe_write || f->vfs_fd < 0) return -(int64_t)EBADF;
@@ -3943,7 +3943,7 @@ static int64_t sc_fallocate(uint64_t fd_arg, uint64_t mode, uint64_t off, uint64
     return 0;
 }
 
-/* ---------------- sync ---------------- */
+ 
 static int64_t sc_fsync(uint64_t fd_arg) {
     sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
     if (!f) return -(int64_t)EBADF;
@@ -3953,7 +3953,7 @@ static int64_t sc_fsync(uint64_t fd_arg) {
 }
 static int64_t sc_sync_all(void) { vfs_sync_all(); return 0; }
 
-/* ---------------- extended attributes + ACL ---------------- */
+ 
 static int node_attr_of(vfs_node_t *n, vfs_attr_t *a) {
     const vfs_node_xops_t *x = n->ops ? n->ops->x : NULL;
     return (x && x->getattr) ? x->getattr(n, a) : -1;
@@ -3974,7 +3974,7 @@ static int64_t sc_xattr_node(uint64_t target, int is_fd, int follow, vfs_node_t 
     return 0;
 }
 static bool sc_has_prefix(const char *s, const char *p) { while (*p) { if (*s++ != *p++) return false; } return true; }
-/* which namespaces may the caller touch? returns 0 or -errno; write=1 for set/remove */
+ 
 static int64_t sc_xattr_policy(vfs_node_t *n, const char *name, int write) {
     sc_proc_t *p = sc_cur();
     const vfs_node_xops_t *x = n->ops ? n->ops->x : NULL;
@@ -3988,7 +3988,7 @@ static int64_t sc_xattr_policy(vfs_node_t *n, const char *name, int write) {
     if (!strcmp(name, "system.posix_acl_access") || !strcmp(name, "system.posix_acl_default")) {
         if (!write) return 0;
         vfs_attr_t a; if (node_attr_of(n, &a)) return -(int64_t)EIO;
-        return (sc_is_priv(p) || p->cred.euid == a.uid) ? 0 : -(int64_t)EPERM;                /* owner (or root) only */
+        return (sc_is_priv(p) || p->cred.euid == a.uid) ? 0 : -(int64_t)EPERM;                 
     }
     return -(int64_t)SCE_ENOTSUP;
 }
@@ -4028,12 +4028,12 @@ static int64_t sc_removexattr_impl(uint64_t target, int is_fd, int follow, uint6
     return r;
 }
 
-/* ---------------- statfs ---------------- */
+ 
 typedef struct { int64_t f_type, f_bsize; uint64_t f_blocks, f_bfree, f_bavail, f_files, f_ffree; int32_t f_fsid[2]; int64_t f_namelen, f_frsize, f_flags, f_spare[4]; } sc_statfs_t;
 static int64_t sc_statfs_node(vfs_node_t *n, uint64_t out) {
     if (!syscall_validate_ptr((void *)(uintptr_t)out, sizeof(sc_statfs_t))) return -(int64_t)EFAULT;
     sc_statfs_t *s = (sc_statfs_t *)(uintptr_t)out; memset(s, 0, sizeof *s);
-    s->f_bsize = 4096; s->f_frsize = 4096; s->f_namelen = 255; s->f_type = 0x4D44;                    /* MSDOS_SUPER_MAGIC for FAT */
+    s->f_bsize = 4096; s->f_frsize = 4096; s->f_namelen = 255; s->f_type = 0x4D44;                     
     fhfs_stat_t st;
     if (fhfs_node_statfs(n, &st) == 0) {
         s->f_type = 0x46485346; s->f_blocks = st.total_blocks; s->f_bfree = st.free_blocks; s->f_bavail = st.free_blocks;
@@ -4052,7 +4052,7 @@ static int64_t sc_fstatfs(uint64_t fd_arg, uint64_t out) {
     vfs_node_t *n = vfs_fd_node(f->vfs_fd); return n ? sc_statfs_node(n, out) : -(int64_t)EBADF;
 }
 
-/* ---------------- FICLONE (cp --reflink) + snapshots ---------------- */
+ 
 #define SC_FICLONE 0x40049409UL
 static int64_t sc_ficlone(uint64_t dst_fd, uint64_t src_fd) {
     sc_file_t *d = sc_get_file((int)(uint32_t)dst_fd), *s = sc_get_file((int)(uint32_t)src_fd);
@@ -4063,7 +4063,7 @@ static int64_t sc_ficlone(uint64_t dst_fd, uint64_t src_fd) {
     if (!dn || !sn || !x || !x->reflink) return -(int64_t)SCE_ENOTSUP;
     return SC_ERR(x->reflink(sn, dn));
 }
-/* cmd 1 create(path,name)  2 delete(path,name)  3 list(path, idx -> buf[48])  4 mount(path,name -> mountpoint) */
+ 
 static int64_t sc_fhfs_snapshot(uint64_t cmd, uint64_t path_ptr, uint64_t name_ptr, uint64_t a4, uint64_t a5) {
     char path[VFS_MAX_PATH], name[64], at[VFS_MAX_PATH]; char out48[48];
     int64_t pr = sc_getpath((uint64_t)(int64_t)AT_FDCWD, path_ptr, path, sizeof path); if (pr) return pr;

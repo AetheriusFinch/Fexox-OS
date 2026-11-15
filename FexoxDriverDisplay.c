@@ -1,9 +1,9 @@
 /* Fexox OS Project, EULA GPLv2 */
-/*
- * FexoxDriverDisplay.c - software scaler / rotator in front of the physical framebuffer.
- * See FexoxDriverDisplay.h.  Integer maths only (the kernel is built with -mgeneral-regs-only).
- * Build this file with -O2: the pixel loops are hot.
- */
+
+
+
+
+
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -31,28 +31,28 @@ static inline void fdd_irq_restore(uint64_t f) {
 #define FDD_MAX_COLS 8192u
 
 typedef struct {
-    /* physical */
+     
     uint8_t *front; uint32_t pw, ph, ppitch; uint8_t bpp;
     bool     phys_ok;
-    /* logical surface (fixed for the whole run) */
+     
     uint8_t *surf; uint32_t spitch, smax_w, smax_h; uint64_t sbytes;
     bool     active;
-    /* current mode */
+     
     uint32_t lw, lh; int rot, filter, fit;
-    /* derived */
-    uint32_t rw, rh;                 /* logical size after rotation */
-    uint32_t vx, vy, vw, vh;         /* viewport on the physical screen */
-    int64_t  base, step_u, step_v;   /* byte offsets: rotated (u,v) -> surface */
+     
+    uint32_t rw, rh;                  
+    uint32_t vx, vy, vw, vh;          
+    int64_t  base, step_u, step_v;    
     bool     identity;
 } fdd_t;
 
 static fdd_t g;
 
-static int32_t col_o0[FDD_MAX_COLS];     /* u0 * step_u */
-static int32_t col_o1[FDD_MAX_COLS];     /* u1 * step_u */
-static uint8_t col_w[FDD_MAX_COLS];      /* 0..255 weight of u1 */
+static int32_t col_o0[FDD_MAX_COLS];      
+static int32_t col_o1[FDD_MAX_COLS];      
+static uint8_t col_w[FDD_MAX_COLS];       
 
-/* ----------------------------- small helpers ------------------------------ */
+ 
 static void copy_nt(void *dst, const void *src, size_t n) {
     uint64_t *d = (uint64_t *)dst; const uint64_t *s = (const uint64_t *)src;
     size_t c = n / 8;
@@ -62,7 +62,7 @@ static void copy_nt(void *dst, const void *src, size_t n) {
     if (t) { uint8_t *db = (uint8_t *)(d + c); const uint8_t *sb = (const uint8_t *)(s + c); for (size_t i = 0; i < t; i++) db[i] = sb[i]; }
 }
 
-/* blends 4 byte lanes at once: result = a*(256-w)/256 + b*w/256, w in 0..255 */
+ 
 static inline uint32_t blend(uint32_t a, uint32_t b, uint32_t w) {
     uint32_t aw = 256u - w;
     uint32_t lo = ((a & 0x00FF00FFu) * aw + (b & 0x00FF00FFu) * w) >> 8;
@@ -70,10 +70,10 @@ static inline uint32_t blend(uint32_t a, uint32_t b, uint32_t w) {
     return (lo & 0x00FF00FFu) | ((hi & 0x00FF00FFu) << 8);
 }
 
-/* ------------------------------ geometry ---------------------------------- */
+ 
 static int recompute(uint32_t lw, uint32_t lh, int rot, int filter, int fit, bool commit);
 
-/* Fills the derived part of `n` (a copy of the state) and the column tables when commit is true. */
+ 
 static int derive(fdd_t *n, bool commit) {
     bool swap = (n->rot == FDD_ROT_90 || n->rot == FDD_ROT_270);
     n->rw = swap ? n->lh : n->lw;
@@ -103,7 +103,7 @@ static int derive(fdd_t *n, bool commit) {
     n->identity = (n->rot == FDD_ROT_0 && n->rw == n->pw && n->rh == n->ph &&
                    n->vw == n->pw && n->vh == n->ph);
     if (n->identity) return 0;
-    if (n->bpp != 32) return -4;                       /* scaling/rotation need 32 bpp */
+    if (n->bpp != 32) return -4;                        
     if (n->vw > FDD_MAX_COLS) return -5;
 
     if (commit) {
@@ -137,7 +137,7 @@ static void clear_front(void) {
 static int recompute(uint32_t lw, uint32_t lh, int rot, int filter, int fit, bool commit) {
     fdd_t n = g;
     n.lw = lw; n.lh = lh; n.rot = rot; n.filter = filter; n.fit = fit;
-    int rc = derive(&n, false);                        /* validate first, tables untouched */
+    int rc = derive(&n, false);                         
     if (rc != 0) return rc;
     uint64_t fl = FDD_IRQ_SAVE();
     rc = derive(&n, true);
@@ -149,7 +149,7 @@ static int recompute(uint32_t lw, uint32_t lh, int rot, int filter, int fit, boo
     return rc;
 }
 
-/* ------------------------------- public API ------------------------------- */
+ 
 int fdd_init(const fb_info_t *info, uint8_t *front_virt) {
     g = (fdd_t){0};
     if (!info || info->mode != FB_MODE_LINEAR || !front_virt || !info->width || !info->height) return -1;
@@ -235,7 +235,7 @@ int fdd_standard_modes(uint32_t (*out)[2], int max) {
     return n;
 }
 
-/* -------------------------------- presenting ------------------------------ */
+ 
 void fdd_present_rect(int32_t x, int32_t y, uint32_t w, uint32_t h) {
     if (!g.active || !w || !h) return;
     if (x < 0) { if ((uint32_t)(-x) >= w) return; w += (uint32_t)x; x = 0; }
@@ -251,7 +251,7 @@ void fdd_present_rect(int32_t x, int32_t y, uint32_t w, uint32_t h) {
         return;
     }
 
-    /* logical rect -> rotated-image rect [u0,u1) x [v0,v1) */
+     
     uint32_t lw = g.lw, lh = g.lh, u0, u1, v0, v1;
     switch (g.rot) {
     default:
@@ -260,7 +260,7 @@ void fdd_present_rect(int32_t x, int32_t y, uint32_t w, uint32_t h) {
     case FDD_ROT_180: u0 = lw - (x + w);      u1 = lw - x;           v0 = lh - (y + h);      v1 = lh - y; break;
     case FDD_ROT_270: u0 = y;                 u1 = y + h;            v0 = lw - (x + w);      v1 = lw - x; break;
     }
-    /* -> destination rect (grown by the filter footprint) */
+     
     int64_t mx = (int64_t)(g.vw / g.rw) + 2, my = (int64_t)(g.vh / g.rh) + 2;
     int64_t dx0 = (int64_t)g.vx + (int64_t)((uint64_t)u0 * g.vw / g.rw) - mx;
     int64_t dx1 = (int64_t)g.vx + (int64_t)(((uint64_t)u1 * g.vw + g.rw - 1) / g.rw) + mx;

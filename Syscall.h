@@ -135,7 +135,7 @@
 #define SYS_DUP3          292
 #define SYS_PIPE2         293
 
-/* POSIX file API for FexoxHybridFS (links, ownership, times, xattr, statfs, credentials) */
+ 
 #define SYS_STATX              332
 #define SYS_SYNCFS             306
 #define SYS_FCHMODAT2          452
@@ -179,7 +179,7 @@
 #define SYS_SETFSGID           123
 #define SYS_FALLOCATE          285
 #define SYS_FHFS_SNAPSHOT      520
-/* custom: cmd 1 create, 2 delete, 3 list, 4 mount-readonly (root only) */
+ 
 #define SYS_PRLIMIT64     302
 #define SYS_RENAMEAT2     316
 #define SYS_FACCESSAT2    439
