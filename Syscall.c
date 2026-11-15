@@ -11,6 +11,7 @@ extern "C" {
 #include <stdbool.h>
 
 #include "Syscall.h"
+#include "FexoxHybridFS.h"
 #include "VFS.h"
 #include "Scheduler.h"
 #include "ELF64.h"
@@ -195,6 +196,8 @@ typedef struct sc_proc {
     struct sc_proc *leader;
     bool            exit_set;                                                                        
     uint32_t        vm_owner;                                                                          
+    vfs_cred_t cred;                 /* uid/gid/euid/egid/groups (zero = root) */
+    uint32_t   suid, sgid;           /* saved set-user/group-id */
 } sc_proc_t;
 
 static sc_proc_t *g_procs[SC_PROC_MAX];
@@ -383,6 +386,9 @@ static int pipe_alloc(void) {
 
 static uint8_t g_vfs_refs[VFS_MAX_FD];
 
+static char *g_vfs_path[VFS_MAX_FD];
+static int64_t sc_ficlone(uint64_t dst_fd, uint64_t src_fd);
+
 static void sc_release_file(sc_file_t *f) {
     if (f->is_pipe_read || f->is_pipe_write) {
         if (f->pipe_idx < 0 || f->pipe_idx >= PIPE_MAX) return;
@@ -394,7 +400,7 @@ static void sc_release_file(sc_file_t *f) {
         if (f->vfs_fd < VFS_MAX_FD && g_vfs_refs[f->vfs_fd] > 1) {
             g_vfs_refs[f->vfs_fd]--;
         } else {
-            if (f->vfs_fd < VFS_MAX_FD) g_vfs_refs[f->vfs_fd] = 0;
+            if (f->vfs_fd < VFS_MAX_FD) { g_vfs_refs[f->vfs_fd] = 0; if (g_vfs_path[f->vfs_fd]) { kfree(g_vfs_path[f->vfs_fd]); g_vfs_path[f->vfs_fd] = NULL; } }
             vfs_close(f->vfs_fd);
         }
     }
@@ -576,7 +582,7 @@ static int64_t sc_copy_string(const char *user_ptr, char *kbuf, size_t kbuf_size
                                                                              
                                                                            
                                                                              
-static int sc_copy_path(const char *user_ptr, char *kbuf, size_t kbuf_size) {
+static int sc_copy_path_base(const char *base, const char *user_ptr, char *kbuf, size_t kbuf_size) {
     if (!syscall_validate_ptr(user_ptr, 1)) return -1;
     char *tmp = (char *)kmalloc(2 * VFS_MAX_PATH);
     if (!tmp) return -1;
@@ -591,7 +597,7 @@ static int sc_copy_path(const char *user_ptr, char *kbuf, size_t kbuf_size) {
     }
     size_t n = 0;
     if (raw[0] != '/') {
-        const char *cwd = g_cwd;
+        const char *cwd = base ? base : g_cwd;
         size_t cl = strlen(cwd);
         if (cl + 1 + i + 1 > VFS_MAX_PATH) { kfree(tmp); return -1; }
         memcpy(tmp, cwd, cl); n = cl;
@@ -623,6 +629,8 @@ static int sc_copy_path(const char *user_ptr, char *kbuf, size_t kbuf_size) {
     kfree(tmp);
     return (int)o;
 }
+
+static int sc_copy_path(const char *user_ptr, char *kbuf, size_t kbuf_size) { return sc_copy_path_base(NULL, user_ptr, kbuf, kbuf_size); }
 
 static void    sc_raise_self(int sig);
 static void    sc_futex_cleanup(uint32_t pid);
@@ -1033,6 +1041,10 @@ static int64_t sc_execve(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
         return -(int64_t)EFAULT;
     DBG_MSG("SC", "sys_execve");
     DBG_VAL("SC", "execve path ptr", path_ptr);
+    vfs_attr_t xa; int xr = vfs_getattr(path, 1, &xa);
+    if (xr) return sc_vfs_errno(xr);
+    if ((xa.mode & 0170000u) == 0040000u) return -(int64_t)EACCES;
+    if ((xr = vfs_access2(path, VFS_PERM_X, 0, 1)) != 0) return sc_vfs_errno(xr);
     int tid = sc_exec_spawn(path, argv_ptr, envp_ptr);
     if (tid < 0) {
         if (tid == SC_EXEC_E2BIG)  return -(int64_t)7;                 
@@ -1047,6 +1059,9 @@ static int64_t sc_execve(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
                                                                               
                                                                                           
     sc_proc_t *p = sc_cur();
+    if (xa.mode & 04000u) p->cred.euid = xa.uid;                      /* set-user-ID program */
+    if (xa.mode & 02000u) p->cred.egid = xa.gid;                      /* set-group-ID program */
+    p->suid = p->cred.euid; p->sgid = p->cred.egid;
     {                                                                    
         task_t *self = sched_current();
         sc_group_kill_others(p, self ? self->tid : SC_NO_TID);
@@ -1149,52 +1164,7 @@ static int64_t sc_wait4(uint64_t tid_arg, uint64_t wstatus_ptr, uint64_t options
 
 
 
-static int64_t sc_open(uint64_t path_ptr, uint64_t flags_arg) {
-    char path[VFS_MAX_PATH];
-    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
-        return -(int64_t)EFAULT;
 
-    int lx = (int)flags_arg;                                                     
-    int vf = lx & (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND);
-    if (lx & LX_O_DIRECTORY) vf |= O_DIRECTORY;                                       
-
-    if ((lx & O_CREAT) && (lx & LX_O_EXCL)) {
-        vfs_stat_t ex;
-        if (vfs_stat(path, &ex) == VFS_OK) return -(int64_t)EEXIST;
-    }
-
-    int vfd = vfs_open(path, vf);
-    if (vfd == VFS_ERR_ISDIR && (lx & O_ACCMODE) == O_RDONLY)                                        
-        vfd = vfs_open(path, vf | O_DIRECTORY);
-    if (vfd < 0) {
-        if (vfd == VFS_ERR_NOENT)  return -(int64_t)ENOENT;
-        if (vfd == VFS_ERR_NOTDIR) return -(int64_t)ENOTDIR;
-        if (vfd == VFS_ERR_NOMEM)  return -(int64_t)ENOMEM;
-        if (vfd == VFS_ERR_NFILE)  return -(int64_t)ENFILE;
-        if (vfd == VFS_ERR_ISDIR)  return -(int64_t)EISDIR;
-        if (vfd == VFS_ERR_ROFS)   return -(int64_t)EROFS;
-        return -(int64_t)EIO;
-    }
-
-    int fd = sc_alloc_fd();
-    if (fd < 0) {
-        vfs_close(vfd);
-        return -(int64_t)EMFILE;
-    }
-
-    g_files[fd].open           = true;
-    g_files[fd].vfs_fd         = vfd;
-    g_files[fd].flags          = lx & ~(O_CREAT | O_TRUNC | LX_O_EXCL | LX_O_CLOEXEC);
-    g_files[fd].fd_flags       = (lx & LX_O_CLOEXEC) ? FD_CLOEXEC : 0;
-    g_files[fd].is_pipe_read   = false;
-    g_files[fd].is_pipe_write  = false;
-    g_files[fd].pipe_idx       = -1;
-    g_files[fd].dir_pos        = 0;
-    if (vfd < VFS_MAX_FD) g_vfs_refs[vfd] = 1;
-
-    DBG_VAL("SC", "sys_open fd", (uint64_t)(uint32_t)fd);
-    return (int64_t)fd;
-}
 
  
 
@@ -1442,105 +1412,26 @@ static int64_t sc_readdir(uint64_t fd_arg, uint64_t index, uint64_t dirent_ptr) 
 
 
 
-static int64_t sc_mkdir(uint64_t path_ptr, uint64_t mode) {
-    (void)mode;
-    char path[VFS_MAX_PATH];
-    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
-        return -(int64_t)EFAULT;
 
-    int r = vfs_mkdir(path);
-    if (r == VFS_ERR_EXIST)  return -(int64_t)EEXIST;
-    if (r == VFS_ERR_NOENT)  return -(int64_t)ENOENT;
-    if (r == VFS_ERR_ROFS)   return -(int64_t)EROFS;
-    if (r < 0)               return -(int64_t)EIO;
-    return 0;
-}
-
- 
-
-
-
-static int64_t sc_rmdir(uint64_t path_ptr) {
-    char path[VFS_MAX_PATH];
-    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
-        return -(int64_t)EFAULT;
-
-    int r = vfs_rmdir(path);
-    if (r == VFS_ERR_NOENT)  return -(int64_t)ENOENT;
-    if (r == VFS_ERR_NOTDIR) return -(int64_t)ENOTDIR;
-    if (r == VFS_ERR_BUSY)   return -(int64_t)ENOTEMPTY;
-    if (r == VFS_ERR_ROFS)   return -(int64_t)EROFS;
-    if (r < 0)               return -(int64_t)EIO;
-    return 0;
-}
-
- 
-
-
-
-static int64_t sc_unlink(uint64_t path_ptr) {
-    char path[VFS_MAX_PATH];
-    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
-        return -(int64_t)EFAULT;
-
-    int r = vfs_unlink(path);
-    if (r == VFS_ERR_NOENT)  return -(int64_t)ENOENT;
-    if (r == VFS_ERR_ISDIR)  return -(int64_t)EISDIR;
-    if (r == VFS_ERR_ROFS)   return -(int64_t)EROFS;
-    if (r < 0)               return -(int64_t)EIO;
-    return 0;
-}
 
  
 
 
 
 
-static int64_t sc_rename(uint64_t old_ptr, uint64_t new_ptr) {
-                                                                                
-                                                                                     
-    char *op = (char *)kmalloc(VFS_MAX_PATH);
-    char *np = (char *)kmalloc(VFS_MAX_PATH);
-    uint8_t *buf = (uint8_t *)kmalloc(4096);
-    int64_t rc = 0;
-    if (!op || !np || !buf) { rc = -(int64_t)ENOMEM; goto out; }
-    if (sc_copy_path((const char *)(uintptr_t)old_ptr, op, VFS_MAX_PATH) < 0 ||
-        sc_copy_path((const char *)(uintptr_t)new_ptr, np, VFS_MAX_PATH) < 0) { rc = -(int64_t)EFAULT; goto out; }
-    if (strcmp(op, np) == 0) goto out;
 
-    vfs_stat_t st;
-    int r = vfs_stat(op, &st);
-    if (r != VFS_OK) { rc = sc_vfs_errno(r); goto out; }
-    if (st.type == VFS_TYPE_DIR) { rc = -(int64_t)EXDEV; goto out; }
+ 
 
-    vfs_stat_t dst;
-    if (vfs_stat(np, &dst) == VFS_OK && dst.type == VFS_TYPE_DIR) { rc = -(int64_t)EISDIR; goto out; }
 
-    int in = vfs_open(op, O_RDONLY);
-    if (in < 0) { rc = sc_vfs_errno(in); goto out; }
-    int outfd = vfs_open(np, O_WRONLY | O_CREAT | O_TRUNC);
-    if (outfd < 0) { vfs_close(in); rc = sc_vfs_errno(outfd); goto out; }
-    for (;;) {
-        int64_t n = vfs_read(in, buf, 4096);
-        if (n < 0) { rc = -(int64_t)EIO; break; }
-        if (n == 0) break;
-        int64_t w = vfs_write(outfd, buf, (uint64_t)n);
-        if (w != n) { rc = (w == VFS_ERR_NOSPC) ? -(int64_t)ENOSPC : -(int64_t)EIO; break; }
-    }
-    vfs_close(in);
-    vfs_close(outfd);
-    if (rc == 0) {
-        r = vfs_unlink(op);
-        if (r != VFS_OK) rc = sc_vfs_errno(r);
-    } else {
-        vfs_unlink(np);
-    }
-out:
-    if (op) kfree(op);
-    if (np) kfree(np);
-    if (buf) kfree(buf);
-    return rc;
-}
+
+
+
+ 
+
+
+
+
+
 
  
 
@@ -1550,38 +1441,13 @@ out:
 
 
 
-static int64_t sc_chdir(uint64_t path_ptr) {
-    char path[VFS_MAX_PATH];
-    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
-        return -(int64_t)EFAULT;
 
-    vfs_stat_t vs;
-    int r = vfs_stat(path, &vs);
-    if (r == VFS_ERR_NOENT)  return -(int64_t)ENOENT;
-    if (r < 0)               return -(int64_t)EIO;
-    if (vs.type != VFS_TYPE_DIR) return -(int64_t)ENOTDIR;
-
-    strncpy(g_cwd, path, VFS_MAX_PATH - 1);
-    g_cwd[VFS_MAX_PATH - 1] = '\0';
-    return 0;
-}
 
  
 
 
 
-static int64_t sc_ftruncate(uint64_t fd_arg, uint64_t length) {
-    int fd = (int)(uint32_t)fd_arg;
-    sc_file_t *f = sc_get_file(fd);
-    if (!f || f->is_pipe_read || f->is_pipe_write) return -(int64_t)EBADF;
-    if ((f->flags & O_ACCMODE) == O_RDONLY) return -(int64_t)EBADF;
 
-    int r = vfs_ftruncate(f->vfs_fd, length);
-    if (r == VFS_ERR_ROFS)  return -(int64_t)EROFS;
-    if (r == VFS_ERR_NOSPC) return -(int64_t)ENOSPC;
-    if (r < 0)              return -(int64_t)EIO;
-    return 0;
-}
 
  
 
@@ -2093,6 +1959,12 @@ static int64_t sc_get_framebuffer(uint64_t fb_ptr) {
         uint32_t pitch     = fb_pitch();
         uint32_t height    = fb_height();
         uint64_t fb_bytes  = (uint64_t)pitch * (uint64_t)height;
+        {   /* FexoxDriverDisplay: map the whole fixed-size logical surface, so the mapping stays
+               valid when the resolution is switched at run time */
+            extern uint64_t fdd_surface_bytes(void);
+            uint64_t sb = fdd_surface_bytes();
+            if (sb > fb_bytes) fb_bytes = sb;
+        }
 
         uint64_t page_base = ROUND_DOWN(back_pa, PAGE_SIZE);
         uint64_t page_off  = back_pa - page_base;
@@ -2258,23 +2130,7 @@ static int64_t sc_input_poll(uint64_t input_ptr) {
 
 
  
-static int64_t sc_vfs_errno(int r) {
-    switch (r) {
-    case VFS_ERR_NOENT:  return -(int64_t)ENOENT;
-    case VFS_ERR_NOMEM:  return -(int64_t)ENOMEM;
-    case VFS_ERR_ISDIR:  return -(int64_t)EISDIR;
-    case VFS_ERR_NOTDIR: return -(int64_t)ENOTDIR;
-    case VFS_ERR_ROFS:   return -(int64_t)EROFS;
-    case VFS_ERR_NOSPC:  return -(int64_t)ENOSPC;
-    case VFS_ERR_EXIST:  return -(int64_t)EEXIST;
-    case VFS_ERR_INVAL:  return -(int64_t)EINVAL;
-    case VFS_ERR_BADF:   return -(int64_t)EBADF;
-    case VFS_ERR_NFILE:  return -(int64_t)ENFILE;
-    case VFS_ERR_BUSY:   return -(int64_t)ENOTEMPTY;
-    case VFS_ERR_UNSUP:  return -(int64_t)ENOSYS;
-    default:             return -(int64_t)EIO;
-    }
-}
+
 
  
 
@@ -2883,27 +2739,10 @@ static int64_t sc_writev(uint64_t fd, uint64_t iov, uint64_t cnt) { return sc_io
 
  
 
-static int64_t sc_access(uint64_t path_ptr, uint64_t mode) {
-    if (mode & ~7ULL) return -(int64_t)EINVAL;
-    char path[VFS_MAX_PATH];
-    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
-        return -(int64_t)EFAULT;
-    vfs_stat_t vs;
-    int r = vfs_stat(path, &vs);
-    if (r != VFS_OK) return sc_vfs_errno(r);
-    if ((mode & SC_W_OK) && (vs.attr & 0x01u)) return -(int64_t)EACCES;    
-    return 0;
-}
+
 
  
-static int64_t sc_truncate(uint64_t path_ptr, uint64_t length) {
-    if ((int64_t)length < 0) return -(int64_t)EINVAL;
-    char path[VFS_MAX_PATH];
-    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0)
-        return -(int64_t)EFAULT;
-    int r = vfs_truncate(path, length);
-    return r == VFS_OK ? 0 : sc_vfs_errno(r);
-}
+
 
  
 static int64_t sc_getcwd(uint64_t buf_ptr, uint64_t size) {
@@ -2999,7 +2838,8 @@ static int64_t sc_getdents64(uint64_t fd_arg, uint64_t buf_ptr, uint64_t count) 
         int64_t  doff = (int64_t)f->dir_pos + 1;
         uint16_t rl = (uint16_t)reclen;
         uint8_t  dt = (ent.type == VFS_TYPE_DIR) ? SC_DT_DIR :
-                      (ent.type == VFS_TYPE_FILE) ? SC_DT_REG : SC_DT_UNKNOWN;
+                      (ent.type == VFS_TYPE_FILE) ? SC_DT_REG :
+                      (ent.type == VFS_TYPE_LINK) ? 10 : SC_DT_UNKNOWN;
         memcpy(rec + 0,  &ino,  8);
         memcpy(rec + 8,  &doff, 8);
         memcpy(rec + 16, &rl,   2);
@@ -3443,23 +3283,9 @@ static int64_t sc_fstat_file(sc_file_t *f, sc_kstat_t *o) {
     return 0;
 }
 
-static int64_t sc_stat_lx(uint64_t path_ptr, uint64_t st_ptr) {
-    if (!syscall_validate_ptr((void *)(uintptr_t)st_ptr, sizeof(sc_kstat_t))) return -(int64_t)EFAULT;
-    char path[VFS_MAX_PATH];
-    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0) return -(int64_t)EFAULT;
-    vfs_stat_t vs;
-    int r = vfs_stat(path, &vs);
-    if (r != VFS_OK) return sc_vfs_errno(r);
-    sc_fill_kstat((sc_kstat_t *)(uintptr_t)st_ptr, &vs);
-    return 0;
-}
 
-static int64_t sc_fstat_lx(uint64_t fd_arg, uint64_t st_ptr) {
-    if (!syscall_validate_ptr((void *)(uintptr_t)st_ptr, sizeof(sc_kstat_t))) return -(int64_t)EFAULT;
-    sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
-    if (!f) return -(int64_t)EBADF;
-    return sc_fstat_file(f, (sc_kstat_t *)(uintptr_t)st_ptr);
-}
+
+
 
                                                                                  
                                                                                     
@@ -3469,15 +3295,7 @@ static bool sc_at_ok(uint64_t dirfd, uint64_t path_ptr) {
     return *(const char *)(uintptr_t)path_ptr == '/';
 }
 
-static int64_t sc_newfstatat(uint64_t dirfd, uint64_t path_ptr, uint64_t st_ptr, uint64_t flags) {
-    if (!syscall_validate_ptr((void *)(uintptr_t)path_ptr, 1)) return -(int64_t)EFAULT;
-    if (*(const char *)(uintptr_t)path_ptr == '\0') {
-        if (flags & AT_EMPTY_PATH) return sc_fstat_lx(dirfd, st_ptr);
-        return -(int64_t)ENOENT;
-    }
-    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
-    return sc_stat_lx(path_ptr, st_ptr);
-}
+
 
                                                                              
 typedef struct { uint32_t c_iflag, c_oflag, c_cflag, c_lflag; uint8_t c_line; uint8_t c_cc[19]; } sc_ktermios_t;
@@ -3490,6 +3308,7 @@ static sc_ktermios_t g_ktermios = {
 static int64_t sc_ioctl(uint64_t fd_arg, uint64_t req, uint64_t arg) {
     sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
     if (!f) return -(int64_t)EBADF;
+    if ((uint32_t)req == 0x40049409u) return sc_ficlone(fd_arg, arg);          /* FICLONE: cp --reflink */
 
     switch ((uint32_t)req) {
     case SC_FIONBIO:
@@ -3584,41 +3403,14 @@ static int64_t sc_poll(uint64_t fds_ptr, uint64_t nfds, uint64_t timeout_arg) {
 }
 
                                                                                
-static int64_t sc_openat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags, uint64_t mode) {
-    (void)mode;
-    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
-    return sc_open(path_ptr, flags);
-}
-static int64_t sc_mkdirat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
-    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
-    return sc_mkdir(path_ptr, mode);
-}
-static int64_t sc_unlinkat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
-    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
-    return (flags & AT_REMOVEDIR) ? sc_rmdir(path_ptr) : sc_unlink(path_ptr);
-}
-static int64_t sc_renameat(uint64_t odfd, uint64_t op, uint64_t ndfd, uint64_t np, uint64_t flags) {
-    if (flags) return -(int64_t)EINVAL;
-    if (!sc_at_ok(odfd, op) || !sc_at_ok(ndfd, np)) return -(int64_t)ENOSYS;
-    return sc_rename(op, np);
-}
-static int64_t sc_faccessat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
-    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
-    return sc_access(path_ptr, mode);
-}
+
+
+
+
+
                                                                             
-static int64_t sc_readlink(uint64_t path_ptr, uint64_t buf_ptr, uint64_t size) {
-    (void)buf_ptr; (void)size;
-    char path[VFS_MAX_PATH];
-    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0) return -(int64_t)EFAULT;
-    vfs_stat_t vs;
-    int r = vfs_stat(path, &vs);
-    return r == VFS_OK ? -(int64_t)EINVAL : sc_vfs_errno(r);
-}
-static int64_t sc_readlinkat(uint64_t dirfd, uint64_t path_ptr, uint64_t buf_ptr, uint64_t size) {
-    if (!sc_at_ok(dirfd, path_ptr)) return -(int64_t)ENOSYS;
-    return sc_readlink(path_ptr, buf_ptr, size);
-}
+
+
 
 static int64_t sc_dup3(uint64_t oldfd, uint64_t newfd, uint64_t flags) {
     if (oldfd == newfd) return -(int64_t)EINVAL;
@@ -3681,14 +3473,611 @@ static int64_t sc_prctl(uint64_t option, uint64_t a2) {
 }
 
                                                                                     
-static int64_t sc_perm_path(uint64_t path_ptr) {
-    char path[VFS_MAX_PATH];
-    if (sc_copy_path((const char *)(uintptr_t)path_ptr, path, sizeof(path)) < 0) return -(int64_t)EFAULT;
-    vfs_stat_t vs;
-    int r = vfs_stat(path, &vs);
-    return r == VFS_OK ? 0 : sc_vfs_errno(r);
+
+
+
+
+/* ===================================================================== */
+/* POSIX file API for musl on FexoxHybridFS                              */
+/*   credentials (uid/gid/groups/setuid), *at() paths, symlinks, hard    */
+/*   links, chmod/chown, timestamps, xattr + ACL, statfs, reflink,       */
+/*   snapshots.  Every call is checked against the caller's credentials. */
+/* ===================================================================== */
+
+#define SCE_E2BIG         7
+#define SCE_ENOTTY        25
+#define SCE_EMLINK        31
+#define SCE_ENAMETOOLONG  36
+#define SCE_ELOOP         40
+#define SCE_ENODATA       61
+#define SCE_ENOTSUP       95
+#define SC_AT_SYMLINK_FOLLOW 0x400
+#define SC_AT_EACCESS        0x200
+#define SC_UTIME_NOW      0x3fffffffLL
+#define SC_UTIME_OMIT     0x3ffffffeLL
+#define SC_DTYPE_LNK      10
+
+static int64_t sc_vfs_errno(int r) {
+    switch (r) {
+    case VFS_ERR_NOENT:  return -(int64_t)ENOENT;
+    case VFS_ERR_NOMEM:  return -(int64_t)ENOMEM;
+    case VFS_ERR_ISDIR:  return -(int64_t)EISDIR;
+    case VFS_ERR_NOTDIR: return -(int64_t)ENOTDIR;
+    case VFS_ERR_ROFS:   return -(int64_t)EROFS;
+    case VFS_ERR_NOSPC:  return -(int64_t)ENOSPC;
+    case VFS_ERR_EXIST:  return -(int64_t)EEXIST;
+    case VFS_ERR_INVAL:  return -(int64_t)EINVAL;
+    case VFS_ERR_BADF:   return -(int64_t)EBADF;
+    case VFS_ERR_NFILE:  return -(int64_t)ENFILE;
+    case VFS_ERR_BUSY:   return -(int64_t)16;               /* EBUSY */
+    case VFS_ERR_NOTEMPTY: return -(int64_t)ENOTEMPTY;
+    case VFS_ERR_UNSUP:  return -(int64_t)ENOSYS;
+    case VFS_ERR_LOOP:   return -(int64_t)SCE_ELOOP;
+    case VFS_ERR_ACCES:  return -(int64_t)EACCES;
+    case VFS_ERR_PERM:   return -(int64_t)EPERM;
+    case VFS_ERR_NAMETOOLONG: return -(int64_t)SCE_ENAMETOOLONG;
+    case VFS_ERR_NODATA: return -(int64_t)SCE_ENODATA;
+    case VFS_ERR_RANGE:  return -(int64_t)ERANGE;
+    case VFS_ERR_XDEV:   return -(int64_t)EXDEV;
+    case VFS_ERR_MLINK:  return -(int64_t)SCE_EMLINK;
+    case VFS_ERR_2BIG:   return -(int64_t)SCE_E2BIG;
+    default:             return -(int64_t)EIO;
+    }
 }
-static int64_t sc_perm_fd(uint64_t fd) { return sc_get_file((int)(uint32_t)fd) ? 0 : -(int64_t)EBADF; }
+#define SC_ERR(r) sc_vfs_errno(r)
+
+/* ---------------- credentials ---------------- */
+static const vfs_cred_t *sc_cred_provider(void) {
+    sc_proc_t *p = sc_cur();
+    p->cred.umask = p->umask_val;
+    return &p->cred;
+}
+static bool sc_is_priv(const sc_proc_t *p) { return p->cred.euid == 0; }
+#define NOID ((uint32_t)-1)
+
+static int64_t sc_getuid(void)  { return sc_cur()->cred.uid; }
+static int64_t sc_geteuid(void) { return sc_cur()->cred.euid; }
+static int64_t sc_getgid(void)  { return sc_cur()->cred.gid; }
+static int64_t sc_getegid(void) { return sc_cur()->cred.egid; }
+
+static int64_t sc_setuid(uint64_t u) {
+    sc_proc_t *p = sc_cur(); uint32_t id = (uint32_t)u;
+    if (id == NOID) return -(int64_t)EINVAL;
+    if (sc_is_priv(p)) { p->cred.uid = p->cred.euid = p->suid = id; return 0; }
+    if (id == p->cred.uid || id == p->suid) { p->cred.euid = id; return 0; }
+    return -(int64_t)EPERM;
+}
+static int64_t sc_setgid(uint64_t g) {
+    sc_proc_t *p = sc_cur(); uint32_t id = (uint32_t)g;
+    if (id == NOID) return -(int64_t)EINVAL;
+    if (sc_is_priv(p)) { p->cred.gid = p->cred.egid = p->sgid = id; return 0; }
+    if (id == p->cred.gid || id == p->sgid) { p->cred.egid = id; return 0; }
+    return -(int64_t)EPERM;
+}
+static int64_t sc_setreuid(uint64_t r, uint64_t e) {
+    sc_proc_t *p = sc_cur(); uint32_t ru = (uint32_t)r, eu = (uint32_t)e;
+    bool rs = ru != NOID, es = eu != NOID;
+    if (!sc_is_priv(p)) {
+        if (rs && ru != p->cred.uid && ru != p->cred.euid) return -(int64_t)EPERM;
+        if (es && eu != p->cred.uid && eu != p->cred.euid && eu != p->suid) return -(int64_t)EPERM;
+    }
+    uint32_t old_r = p->cred.uid;
+    if (rs) p->cred.uid = ru;
+    if (es) p->cred.euid = eu;
+    if (rs || (es && eu != old_r)) p->suid = p->cred.euid;
+    return 0;
+}
+static int64_t sc_setregid(uint64_t r, uint64_t e) {
+    sc_proc_t *p = sc_cur(); uint32_t rg = (uint32_t)r, eg = (uint32_t)e;
+    bool rs = rg != NOID, es = eg != NOID;
+    if (!sc_is_priv(p)) {
+        if (rs && rg != p->cred.gid && rg != p->cred.egid) return -(int64_t)EPERM;
+        if (es && eg != p->cred.gid && eg != p->cred.egid && eg != p->sgid) return -(int64_t)EPERM;
+    }
+    uint32_t old_r = p->cred.gid;
+    if (rs) p->cred.gid = rg;
+    if (es) p->cred.egid = eg;
+    if (rs || (es && eg != old_r)) p->sgid = p->cred.egid;
+    return 0;
+}
+static int64_t sc_setresuid(uint64_t r, uint64_t e, uint64_t s) {
+    sc_proc_t *p = sc_cur(); uint32_t v[3] = { (uint32_t)r, (uint32_t)e, (uint32_t)s };
+    if (!sc_is_priv(p))
+        for (int i = 0; i < 3; i++)
+            if (v[i] != NOID && v[i] != p->cred.uid && v[i] != p->cred.euid && v[i] != p->suid) return -(int64_t)EPERM;
+    if (v[0] != NOID) p->cred.uid = v[0];
+    if (v[1] != NOID) p->cred.euid = v[1];
+    if (v[2] != NOID) p->suid = v[2];
+    return 0;
+}
+static int64_t sc_setresgid(uint64_t r, uint64_t e, uint64_t s) {
+    sc_proc_t *p = sc_cur(); uint32_t v[3] = { (uint32_t)r, (uint32_t)e, (uint32_t)s };
+    if (!sc_is_priv(p))
+        for (int i = 0; i < 3; i++)
+            if (v[i] != NOID && v[i] != p->cred.gid && v[i] != p->cred.egid && v[i] != p->sgid) return -(int64_t)EPERM;
+    if (v[0] != NOID) p->cred.gid = v[0];
+    if (v[1] != NOID) p->cred.egid = v[1];
+    if (v[2] != NOID) p->sgid = v[2];
+    return 0;
+}
+static int64_t sc_getresuid(uint64_t rp, uint64_t ep, uint64_t sp) {
+    sc_proc_t *p = sc_cur();
+    if (!syscall_validate_ptr((void *)(uintptr_t)rp, 4) || !syscall_validate_ptr((void *)(uintptr_t)ep, 4) || !syscall_validate_ptr((void *)(uintptr_t)sp, 4)) return -(int64_t)EFAULT;
+    *(uint32_t *)(uintptr_t)rp = p->cred.uid; *(uint32_t *)(uintptr_t)ep = p->cred.euid; *(uint32_t *)(uintptr_t)sp = p->suid;
+    return 0;
+}
+static int64_t sc_getresgid(uint64_t rp, uint64_t ep, uint64_t sp) {
+    sc_proc_t *p = sc_cur();
+    if (!syscall_validate_ptr((void *)(uintptr_t)rp, 4) || !syscall_validate_ptr((void *)(uintptr_t)ep, 4) || !syscall_validate_ptr((void *)(uintptr_t)sp, 4)) return -(int64_t)EFAULT;
+    *(uint32_t *)(uintptr_t)rp = p->cred.gid; *(uint32_t *)(uintptr_t)ep = p->cred.egid; *(uint32_t *)(uintptr_t)sp = p->sgid;
+    return 0;
+}
+static int64_t sc_getgroups(uint64_t size, uint64_t list) {
+    sc_proc_t *p = sc_cur(); uint32_t n = p->cred.ngroups;
+    if (size == 0) return (int64_t)n;
+    if (size < n) return -(int64_t)EINVAL;
+    if (!syscall_validate_ptr((void *)(uintptr_t)list, (size_t)n * 4)) return -(int64_t)EFAULT;
+    for (uint32_t i = 0; i < n; i++) ((uint32_t *)(uintptr_t)list)[i] = p->cred.groups[i];
+    return (int64_t)n;
+}
+static int64_t sc_setgroups(uint64_t size, uint64_t list) {
+    sc_proc_t *p = sc_cur();
+    if (!sc_is_priv(p)) return -(int64_t)EPERM;
+    if (size > 32) return -(int64_t)EINVAL;
+    if (size && !syscall_validate_ptr((void *)(uintptr_t)list, (size_t)size * 4)) return -(int64_t)EFAULT;
+    for (uint64_t i = 0; i < size; i++) p->cred.groups[i] = ((const uint32_t *)(uintptr_t)list)[i];
+    p->cred.ngroups = (uint32_t)size;
+    return 0;
+}
+
+/* ---------------- paths ---------------- */
+/* Resolve (dirfd, user path) to an absolute kernel path. */
+static int64_t sc_getpath(uint64_t dirfd, uint64_t uptr, char *out, size_t sz) {
+    const char *u = (const char *)(uintptr_t)uptr;
+    if (!syscall_validate_ptr(u, 1)) return -(int64_t)EFAULT;
+    if (u[0] == '\0') return -(int64_t)ENOENT;
+    const char *base = NULL;
+    if (u[0] != '/' && (int32_t)dirfd != AT_FDCWD) {
+        sc_file_t *f = sc_get_file((int)(int32_t)dirfd);
+        if (!f) return -(int64_t)EBADF;
+        if (f->is_pipe_read || f->is_pipe_write || f->vfs_fd < 0 || f->vfs_fd >= VFS_MAX_FD || !g_vfs_path[f->vfs_fd])
+            return -(int64_t)ENOTDIR;
+        base = g_vfs_path[f->vfs_fd];
+    }
+    return sc_copy_path_base(base, u, out, sz) < 0 ? -(int64_t)SCE_ENAMETOOLONG : 0;
+}
+
+static int64_t sc_openat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags_arg, uint64_t mode) {
+    char path[VFS_MAX_PATH];
+    int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
+    int lx = (int)(uint32_t)flags_arg;
+    int vflags = lx & (O_ACCMODE | O_CREAT | O_TRUNC | O_APPEND | VFS_O_EXCL | VFS_O_NOFOLLOW | VFS_O_LXDIR);
+    int vfd = vfs_open2(path, vflags, (uint32_t)mode);
+    if (vfd < 0) return SC_ERR(vfd);
+    int fd = sc_alloc_fd();
+    if (fd < 0) { vfs_close(vfd); return -(int64_t)EMFILE; }
+    g_files[fd].open = true; g_files[fd].vfs_fd = vfd;
+    g_files[fd].flags = lx & ~(O_CREAT | O_TRUNC | LX_O_EXCL | LX_O_CLOEXEC);
+    g_files[fd].fd_flags = (lx & LX_O_CLOEXEC) ? FD_CLOEXEC : 0;
+    g_files[fd].is_pipe_read = false; g_files[fd].is_pipe_write = false; g_files[fd].pipe_idx = -1; g_files[fd].dir_pos = 0;
+    if (vfd < VFS_MAX_FD) {
+        g_vfs_refs[vfd] = 1;
+        if (g_vfs_path[vfd]) kfree(g_vfs_path[vfd]);
+        size_t l = strlen(path);
+        g_vfs_path[vfd] = (char *)kmalloc(l + 1);
+        if (g_vfs_path[vfd]) memcpy(g_vfs_path[vfd], path, l + 1);
+    }
+    return (int64_t)fd;
+}
+static int64_t sc_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) { return sc_openat((uint64_t)(int64_t)AT_FDCWD, path_ptr, flags, mode); }
+
+/* ---------------- stat ---------------- */
+static void sc_kstat_from_attr(sc_kstat_t *o, const vfs_attr_t *a) {
+    memset(o, 0, sizeof(*o));
+    o->st_dev = a->dev; o->st_ino = a->ino; o->st_nlink = a->nlink; o->st_mode = a->mode;
+    o->st_uid = a->uid; o->st_gid = a->gid; o->st_rdev = a->rdev;
+    o->st_size = (int64_t)a->size; o->st_blksize = a->blksize ? a->blksize : 4096; o->st_blocks = (int64_t)a->blocks;
+    o->st_atime_sec = (int64_t)(a->atime_ns / 1000000000ULL); o->st_atime_nsec = (int64_t)(a->atime_ns % 1000000000ULL);
+    o->st_mtime_sec = (int64_t)(a->mtime_ns / 1000000000ULL); o->st_mtime_nsec = (int64_t)(a->mtime_ns % 1000000000ULL);
+    o->st_ctime_sec = (int64_t)(a->ctime_ns / 1000000000ULL); o->st_ctime_nsec = (int64_t)(a->ctime_ns % 1000000000ULL);
+}
+/* attributes of an fd: files and directories through the VFS, pipes / consoles as FIFO / char device */
+static int sc_attr_of_fd(int fd, vfs_attr_t *a) {
+    sc_file_t *f = sc_get_file(fd);
+    if (!f) return -(int)EBADF;
+    memset(a, 0, sizeof(*a));
+    if (f->is_pipe_read || f->is_pipe_write) { a->mode = 0010600; a->nlink = 1; a->blksize = 4096; return 0; }
+    if (f->vfs_fd < 0) { a->mode = 0020620; a->nlink = 1; a->blksize = 1024; return 0; }
+    int r = vfs_fgetattr(f->vfs_fd, a);
+    return r ? (int)sc_vfs_errno(r) : 0;
+}
+static int64_t sc_fstatat(uint64_t dirfd, uint64_t path_ptr, uint64_t st_ptr, uint64_t flags) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)st_ptr, sizeof(sc_kstat_t))) return -(int64_t)EFAULT;
+    vfs_attr_t a;
+    const char *u = (const char *)(uintptr_t)path_ptr;
+    if ((flags & AT_EMPTY_PATH) && syscall_validate_ptr(u, 1) && u[0] == '\0') {
+        int r = sc_attr_of_fd((int)(int32_t)dirfd, &a); if (r) return r;
+    } else {
+        char path[VFS_MAX_PATH];
+        int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
+        int r = vfs_getattr(path, !(flags & AT_SYMLINK_NOFOLLOW), &a); if (r) return SC_ERR(r);
+    }
+    sc_kstat_from_attr((sc_kstat_t *)(uintptr_t)st_ptr, &a);
+    return 0;
+}
+static int64_t sc_stat_lx(uint64_t path_ptr, uint64_t st_ptr)  { return sc_fstatat((uint64_t)(int64_t)AT_FDCWD, path_ptr, st_ptr, 0); }
+static int64_t sc_lstat_lx(uint64_t path_ptr, uint64_t st_ptr) { return sc_fstatat((uint64_t)(int64_t)AT_FDCWD, path_ptr, st_ptr, AT_SYMLINK_NOFOLLOW); }
+static int64_t sc_fstat_lx(uint64_t fd_arg, uint64_t st_ptr) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)st_ptr, sizeof(sc_kstat_t))) return -(int64_t)EFAULT;
+    vfs_attr_t a; int r = sc_attr_of_fd((int)(uint32_t)fd_arg, &a); if (r) return r;
+    sc_kstat_from_attr((sc_kstat_t *)(uintptr_t)st_ptr, &a);
+    return 0;
+}
+typedef struct { int64_t sec; uint32_t nsec; int32_t pad; } sc_statx_ts_t;
+typedef struct {
+    uint32_t mask, blksize; uint64_t attributes; uint32_t nlink, uid, gid; uint16_t mode, pad1; uint64_t ino, size, blocks, attributes_mask;
+    sc_statx_ts_t atime, btime, ctime, mtime; uint32_t rdev_major, rdev_minor, dev_major, dev_minor; uint64_t spare[14];
+} sc_statx_t;
+static int64_t sc_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags, uint64_t mask, uint64_t buf) {
+    (void)mask;
+    if (!syscall_validate_ptr((void *)(uintptr_t)buf, sizeof(sc_statx_t))) return -(int64_t)EFAULT;
+    vfs_attr_t a; const char *u = (const char *)(uintptr_t)path_ptr;
+    if ((flags & AT_EMPTY_PATH) && syscall_validate_ptr(u, 1) && u[0] == '\0') { int r = sc_attr_of_fd((int)(int32_t)dirfd, &a); if (r) return r; }
+    else {
+        char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
+        int r = vfs_getattr(path, !(flags & AT_SYMLINK_NOFOLLOW), &a); if (r) return SC_ERR(r);
+    }
+    sc_statx_t *s = (sc_statx_t *)(uintptr_t)buf; memset(s, 0, sizeof(*s));
+    s->mask = 0x7FF; s->blksize = a.blksize ? a.blksize : 4096; s->nlink = a.nlink; s->uid = a.uid; s->gid = a.gid;
+    s->mode = (uint16_t)a.mode; s->ino = a.ino; s->size = a.size; s->blocks = a.blocks;
+    s->atime.sec = (int64_t)(a.atime_ns / 1000000000ULL); s->atime.nsec = (uint32_t)(a.atime_ns % 1000000000ULL);
+    s->mtime.sec = (int64_t)(a.mtime_ns / 1000000000ULL); s->mtime.nsec = (uint32_t)(a.mtime_ns % 1000000000ULL);
+    s->ctime.sec = (int64_t)(a.ctime_ns / 1000000000ULL); s->ctime.nsec = (uint32_t)(a.ctime_ns % 1000000000ULL);
+    s->btime.sec = (int64_t)(a.btime_ns / 1000000000ULL); s->btime.nsec = (uint32_t)(a.btime_ns % 1000000000ULL);
+    s->dev_major = 0; s->dev_minor = a.dev; s->rdev_major = (uint32_t)(a.rdev >> 8) & 0xFFF; s->rdev_minor = (uint32_t)(a.rdev & 0xFF);
+    return 0;
+}
+static int64_t sc_newfstatat(uint64_t dirfd, uint64_t path_ptr, uint64_t st_ptr, uint64_t flags) { return sc_fstatat(dirfd, path_ptr, st_ptr, flags); }
+
+/* ---------------- directories, links, names ---------------- */
+static int64_t sc_mkdirat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
+    return SC_ERR(vfs_mkdir2(path, (uint32_t)mode & 07777u));
+}
+static int64_t sc_mkdir(uint64_t path_ptr, uint64_t mode) { return sc_mkdirat((uint64_t)(int64_t)AT_FDCWD, path_ptr, mode); }
+static int64_t sc_mknodat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, uint64_t dev) {
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
+    uint32_t t = (uint32_t)mode & 0170000u;
+    if ((t == 0020000u || t == 0060000u) && !sc_is_priv(sc_cur())) return -(int64_t)EPERM;     /* device nodes: root only */
+    return SC_ERR(vfs_mknod2(path, (uint32_t)mode, dev));
+}
+static int64_t sc_mknod(uint64_t path_ptr, uint64_t mode, uint64_t dev) { return sc_mknodat((uint64_t)(int64_t)AT_FDCWD, path_ptr, mode, dev); }
+static int64_t sc_unlinkat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
+    return SC_ERR((flags & AT_REMOVEDIR) ? vfs_rmdir2(path) : vfs_unlink2(path));
+}
+static int64_t sc_unlink(uint64_t path_ptr) { return sc_unlinkat((uint64_t)(int64_t)AT_FDCWD, path_ptr, 0); }
+static int64_t sc_rmdir(uint64_t path_ptr)  { return sc_unlinkat((uint64_t)(int64_t)AT_FDCWD, path_ptr, AT_REMOVEDIR); }
+
+/* plain FAT volumes cannot rename natively: copy + delete (regular files only) */
+static int sc_rename_copy(const char *op, const char *np) {
+    vfs_stat_t st; if (vfs_stat(op, &st) != VFS_OK) return VFS_ERR_NOENT;
+    if (st.type == VFS_TYPE_DIR) return VFS_ERR_UNSUP;
+    int in = vfs_open(op, O_RDONLY); if (in < 0) return in;
+    int out = vfs_open(np, O_WRONLY | O_CREAT | O_TRUNC); if (out < 0) { vfs_close(in); return out; }
+    char *buf = (char *)kmalloc(4096); int r = buf ? VFS_OK : VFS_ERR_NOMEM;
+    while (!r) { int64_t n = vfs_read(in, buf, 4096); if (n < 0) { r = (int)n; break; } if (n == 0) break; if (vfs_write(out, buf, (uint64_t)n) != n) { r = VFS_ERR_IO; break; } }
+    if (buf) kfree(buf);
+    vfs_close(in); vfs_close(out);
+    if (!r) r = vfs_unlink(op);
+    return r;
+}
+static int64_t sc_renameat2(uint64_t odfd, uint64_t optr, uint64_t ndfd, uint64_t nptr, uint64_t flags) {
+    char op[VFS_MAX_PATH], np[VFS_MAX_PATH];
+    int64_t pr = sc_getpath(odfd, optr, op, sizeof op); if (pr) return pr;
+    pr = sc_getpath(ndfd, nptr, np, sizeof np); if (pr) return pr;
+    if (flags & ~1ULL) return -(int64_t)EINVAL;
+    int r = vfs_rename2(op, np, (uint32_t)flags);
+    if (r == VFS_ERR_UNSUP && !flags) r = sc_rename_copy(op, np);
+    return SC_ERR(r);
+}
+static int64_t sc_renameat(uint64_t odfd, uint64_t optr, uint64_t ndfd, uint64_t nptr) { return sc_renameat2(odfd, optr, ndfd, nptr, 0); }
+static int64_t sc_rename(uint64_t optr, uint64_t nptr) { return sc_renameat2((uint64_t)(int64_t)AT_FDCWD, optr, (uint64_t)(int64_t)AT_FDCWD, nptr, 0); }
+
+static int64_t sc_symlinkat(uint64_t target_ptr, uint64_t dirfd, uint64_t link_ptr) {
+    char tgt[VFS_MAX_PATH], path[VFS_MAX_PATH];
+    if (sc_copy_string((const char *)(uintptr_t)target_ptr, tgt, sizeof tgt) < 0) return -(int64_t)EFAULT;
+    if (tgt[0] == '\0') return -(int64_t)ENOENT;
+    int64_t pr = sc_getpath(dirfd, link_ptr, path, sizeof path); if (pr) return pr;
+    return SC_ERR(vfs_symlink2(tgt, path));
+}
+static int64_t sc_symlink(uint64_t target_ptr, uint64_t link_ptr) { return sc_symlinkat(target_ptr, (uint64_t)(int64_t)AT_FDCWD, link_ptr); }
+static int64_t sc_linkat(uint64_t odfd, uint64_t optr, uint64_t ndfd, uint64_t nptr, uint64_t flags) {
+    (void)flags;
+    char op[VFS_MAX_PATH], np[VFS_MAX_PATH];
+    int64_t pr = sc_getpath(odfd, optr, op, sizeof op); if (pr) return pr;
+    pr = sc_getpath(ndfd, nptr, np, sizeof np); if (pr) return pr;
+    return SC_ERR(vfs_link2(op, np));
+}
+static int64_t sc_link(uint64_t optr, uint64_t nptr) { return sc_linkat((uint64_t)(int64_t)AT_FDCWD, optr, (uint64_t)(int64_t)AT_FDCWD, nptr, 0); }
+static int64_t sc_readlinkat(uint64_t dirfd, uint64_t path_ptr, uint64_t buf_ptr, uint64_t size) {
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
+    if (size == 0) return -(int64_t)EINVAL;
+    if (size > VFS_MAX_PATH) size = VFS_MAX_PATH;
+    if (!syscall_validate_ptr((void *)(uintptr_t)buf_ptr, (size_t)size)) return -(int64_t)EFAULT;
+    char *tmp = (char *)kmalloc(VFS_MAX_PATH); if (!tmp) return -(int64_t)ENOMEM;
+    int r = vfs_readlink2(path, tmp, VFS_MAX_PATH);
+    if (r < 0) { kfree(tmp); return SC_ERR(r); }
+    size_t n = (size_t)r < size ? (size_t)r : (size_t)size;
+    memcpy((void *)(uintptr_t)buf_ptr, tmp, n);
+    kfree(tmp);
+    return (int64_t)n;
+}
+static int64_t sc_readlink(uint64_t path_ptr, uint64_t buf_ptr, uint64_t size) { return sc_readlinkat((uint64_t)(int64_t)AT_FDCWD, path_ptr, buf_ptr, size); }
+
+static int64_t sc_chdir(uint64_t path_ptr) {
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath((uint64_t)(int64_t)AT_FDCWD, path_ptr, path, sizeof path); if (pr) return pr;
+    vfs_attr_t a; int r = vfs_getattr(path, 1, &a); if (r) return SC_ERR(r);
+    if ((a.mode & 0170000u) != 0040000u) return -(int64_t)ENOTDIR;
+    r = vfs_access2(path, VFS_PERM_X, 0, 1); if (r) return SC_ERR(r);
+    strncpy(g_cwd, path, VFS_MAX_PATH - 1); g_cwd[VFS_MAX_PATH - 1] = '\0';
+    return 0;
+}
+static int64_t sc_fchdir(uint64_t fd_arg) {
+    sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg); if (!f) return -(int64_t)EBADF;
+    if (f->is_pipe_read || f->is_pipe_write || f->vfs_fd < 0 || f->vfs_fd >= VFS_MAX_FD || !g_vfs_path[f->vfs_fd]) return -(int64_t)ENOTDIR;
+    vfs_attr_t a; if (vfs_fgetattr(f->vfs_fd, &a) || (a.mode & 0170000u) != 0040000u) return -(int64_t)ENOTDIR;
+    strncpy(g_cwd, g_vfs_path[f->vfs_fd], VFS_MAX_PATH - 1); g_cwd[VFS_MAX_PATH - 1] = '\0';
+    return 0;
+}
+
+static int64_t sc_truncate(uint64_t path_ptr, uint64_t length) {
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath((uint64_t)(int64_t)AT_FDCWD, path_ptr, path, sizeof path); if (pr) return pr;
+    if ((int64_t)length < 0) return -(int64_t)EINVAL;
+    return SC_ERR(vfs_truncate2(path, length));
+}
+static int64_t sc_ftruncate(uint64_t fd_arg, uint64_t length) {
+    sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
+    if (!f || f->is_pipe_read || f->is_pipe_write || f->vfs_fd < 0) return -(int64_t)EBADF;
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return -(int64_t)EINVAL;
+    if ((int64_t)length < 0) return -(int64_t)EINVAL;
+    return SC_ERR(vfs_ftruncate2(f->vfs_fd, length));
+}
+
+static int64_t sc_faccessat2(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, uint64_t flags) {
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
+    if (mode & ~7ULL) return -(int64_t)EINVAL;
+    return SC_ERR(vfs_access2(path, (uint32_t)mode, !(flags & SC_AT_EACCESS), !(flags & AT_SYMLINK_NOFOLLOW)));
+}
+static int64_t sc_access(uint64_t path_ptr, uint64_t mode) { return sc_faccessat2((uint64_t)(int64_t)AT_FDCWD, path_ptr, mode, 0); }
+static int64_t sc_faccessat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) { return sc_faccessat2(dirfd, path_ptr, mode, 0); }
+
+/* ---------------- ownership, mode, times ---------------- */
+static int64_t sc_set_common(const char *path, int fd, int follow, const vfs_setattr_t *sa) {
+    if (fd >= 0) {
+        sc_file_t *f = sc_get_file(fd);
+        if (!f || f->is_pipe_read || f->is_pipe_write || f->vfs_fd < 0) return -(int64_t)EBADF;
+        return SC_ERR(vfs_fsetattr(f->vfs_fd, sa));
+    }
+    return SC_ERR(vfs_setattr(path, follow, sa));
+}
+static int64_t sc_chmod_impl(uint64_t dirfd, uint64_t path_ptr, int fd, uint64_t mode, int follow) {
+    vfs_setattr_t sa; memset(&sa, 0, sizeof sa); sa.valid = VFS_SET_MODE; sa.mode = (uint32_t)mode & 07777u;
+    char path[VFS_MAX_PATH];
+    if (fd < 0) { int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr; }
+    return sc_set_common(path, fd, follow, &sa);
+}
+static int64_t sc_chmod(uint64_t p, uint64_t m) { return sc_chmod_impl((uint64_t)(int64_t)AT_FDCWD, p, -1, m, 1); }
+static int64_t sc_fchmod(uint64_t fd, uint64_t m) { return sc_chmod_impl(0, 0, (int)(uint32_t)fd, m, 1); }
+static int64_t sc_fchmodat(uint64_t dfd, uint64_t p, uint64_t m, uint64_t flags) { return sc_chmod_impl(dfd, p, -1, m, !(flags & AT_SYMLINK_NOFOLLOW)); }
+static int64_t sc_chown_impl(uint64_t dirfd, uint64_t path_ptr, int fd, uint64_t uid, uint64_t gid, int follow) {
+    vfs_setattr_t sa; memset(&sa, 0, sizeof sa);
+    if ((uint32_t)uid != NOID) { sa.valid |= VFS_SET_UID; sa.uid = (uint32_t)uid; }
+    if ((uint32_t)gid != NOID) { sa.valid |= VFS_SET_GID; sa.gid = (uint32_t)gid; }
+    char path[VFS_MAX_PATH];
+    if (fd < 0) { int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr; }
+    if (!sa.valid) return 0;
+    return sc_set_common(path, fd, follow, &sa);
+}
+static int64_t sc_chown(uint64_t p, uint64_t u, uint64_t g)  { return sc_chown_impl((uint64_t)(int64_t)AT_FDCWD, p, -1, u, g, 1); }
+static int64_t sc_lchown(uint64_t p, uint64_t u, uint64_t g) { return sc_chown_impl((uint64_t)(int64_t)AT_FDCWD, p, -1, u, g, 0); }
+static int64_t sc_fchown(uint64_t fd, uint64_t u, uint64_t g) { return sc_chown_impl(0, 0, (int)(uint32_t)fd, u, g, 1); }
+static int64_t sc_fchownat(uint64_t dfd, uint64_t p, uint64_t u, uint64_t g, uint64_t flags) { return sc_chown_impl(dfd, p, -1, u, g, !(flags & AT_SYMLINK_NOFOLLOW)); }
+
+/* times[0] = atime, times[1] = mtime; each {sec, nsec} (UTIME_NOW / UTIME_OMIT understood) */
+static int64_t sc_utimens_apply(const char *path, int fd, int follow, const sc_timespec_t *ts) {
+    vfs_setattr_t sa; memset(&sa, 0, sizeof sa);
+    uint64_t now = (uint64_t)sc_realtime_ns();
+    if (!ts) { sa.valid = VFS_SET_ATIME | VFS_SET_MTIME; sa.atime_ns = sa.mtime_ns = now; }
+    else {
+        for (int i = 0; i < 2; i++) {
+            if (ts[i].tv_nsec == SC_UTIME_OMIT) continue;
+            uint64_t v;
+            if (ts[i].tv_nsec == SC_UTIME_NOW) v = now;
+            else { if (ts[i].tv_nsec < 0 || ts[i].tv_nsec >= 1000000000LL || ts[i].tv_sec < 0) return -(int64_t)EINVAL; v = (uint64_t)ts[i].tv_sec * 1000000000ULL + (uint64_t)ts[i].tv_nsec; }
+            if (i == 0) { sa.valid |= VFS_SET_ATIME; sa.atime_ns = v; } else { sa.valid |= VFS_SET_MTIME; sa.mtime_ns = v; }
+        }
+    }
+    if (!sa.valid) return 0;
+    return sc_set_common(path, fd, follow, &sa);
+}
+static int64_t sc_utimensat(uint64_t dirfd, uint64_t path_ptr, uint64_t times_ptr, uint64_t flags) {
+    const sc_timespec_t *ts = NULL;
+    if (times_ptr) { if (!syscall_validate_ptr((void *)(uintptr_t)times_ptr, 2 * sizeof(sc_timespec_t))) return -(int64_t)EFAULT; ts = (const sc_timespec_t *)(uintptr_t)times_ptr; }
+    if (!path_ptr) return sc_utimens_apply(NULL, (int)(int32_t)dirfd, 1, ts);              /* futimens() */
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
+    return sc_utimens_apply(path, -1, !(flags & AT_SYMLINK_NOFOLLOW), ts);
+}
+static int64_t sc_utimes_tv(uint64_t dirfd, uint64_t path_ptr, uint64_t tv_ptr) {
+    sc_timespec_t ts[2]; sc_timespec_t *pt = NULL;
+    if (tv_ptr) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)tv_ptr, 2 * sizeof(sc_timeval_t))) return -(int64_t)EFAULT;
+        const sc_timeval_t *tv = (const sc_timeval_t *)(uintptr_t)tv_ptr;
+        for (int i = 0; i < 2; i++) { ts[i].tv_sec = tv[i].tv_sec; ts[i].tv_nsec = tv[i].tv_usec * 1000; }
+        pt = ts;
+    }
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
+    return sc_utimens_apply(path, -1, 1, pt);
+}
+static int64_t sc_utimes(uint64_t p, uint64_t tv) { return sc_utimes_tv((uint64_t)(int64_t)AT_FDCWD, p, tv); }
+static int64_t sc_utime(uint64_t path_ptr, uint64_t buf_ptr) {
+    sc_timespec_t ts[2]; sc_timespec_t *pt = NULL;
+    if (buf_ptr) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)buf_ptr, 16)) return -(int64_t)EFAULT;
+        const int64_t *b = (const int64_t *)(uintptr_t)buf_ptr;
+        ts[0].tv_sec = b[0]; ts[0].tv_nsec = 0; ts[1].tv_sec = b[1]; ts[1].tv_nsec = 0; pt = ts;
+    }
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath((uint64_t)(int64_t)AT_FDCWD, path_ptr, path, sizeof path); if (pr) return pr;
+    return sc_utimens_apply(path, -1, 1, pt);
+}
+
+/* fallocate(fd, 0, off, len): grow the file (space is allocated lazily by the RoW allocator) */
+static int64_t sc_fallocate(uint64_t fd_arg, uint64_t mode, uint64_t off, uint64_t len) {
+    sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
+    if (!f || f->is_pipe_read || f->is_pipe_write || f->vfs_fd < 0) return -(int64_t)EBADF;
+    if ((f->flags & O_ACCMODE) == O_RDONLY) return -(int64_t)EBADF;
+    if (mode != 0) return -(int64_t)SCE_ENOTSUP;
+    if ((int64_t)off < 0 || (int64_t)len <= 0) return -(int64_t)EINVAL;
+    vfs_attr_t a; int r = vfs_fgetattr(f->vfs_fd, &a); if (r) return SC_ERR(r);
+    if (off + len > a.size) { r = vfs_ftruncate2(f->vfs_fd, off + len); if (r) return SC_ERR(r); }
+    return 0;
+}
+
+/* ---------------- sync ---------------- */
+static int64_t sc_fsync(uint64_t fd_arg) {
+    sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
+    if (!f) return -(int64_t)EBADF;
+    if (f->is_pipe_read || f->is_pipe_write) return -(int64_t)EINVAL;
+    if (f->vfs_fd < 0) return 0;
+    return SC_ERR(vfs_fsync2(f->vfs_fd));
+}
+static int64_t sc_sync_all(void) { vfs_sync_all(); return 0; }
+
+/* ---------------- extended attributes + ACL ---------------- */
+static int node_attr_of(vfs_node_t *n, vfs_attr_t *a) {
+    const vfs_node_xops_t *x = n->ops ? n->ops->x : NULL;
+    return (x && x->getattr) ? x->getattr(n, a) : -1;
+}
+
+static int64_t sc_xattr_node(uint64_t target, int is_fd, int follow, vfs_node_t **node, int *owned) {
+    *owned = 0;
+    if (is_fd) {
+        sc_file_t *f = sc_get_file((int)(uint32_t)target);
+        if (!f || f->is_pipe_read || f->is_pipe_write || f->vfs_fd < 0) return -(int64_t)EBADF;
+        *node = vfs_fd_node(f->vfs_fd);
+        return *node ? 0 : -(int64_t)EBADF;
+    }
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath((uint64_t)(int64_t)AT_FDCWD, target, path, sizeof path); if (pr) return pr;
+    int err; *node = vfs_lookup_node(path, follow, &err);
+    if (!*node) return SC_ERR(err);
+    *owned = 1;
+    return 0;
+}
+static bool sc_has_prefix(const char *s, const char *p) { while (*p) { if (*s++ != *p++) return false; } return true; }
+/* which namespaces may the caller touch? returns 0 or -errno; write=1 for set/remove */
+static int64_t sc_xattr_policy(vfs_node_t *n, const char *name, int write) {
+    sc_proc_t *p = sc_cur();
+    const vfs_node_xops_t *x = n->ops ? n->ops->x : NULL;
+    if (!x || !x->getxattr) return -(int64_t)SCE_ENOTSUP;
+    if (sc_has_prefix(name, "user.") || sc_has_prefix(name, "security.")) {
+        if (n->stat.type != VFS_TYPE_FILE && n->stat.type != VFS_TYPE_DIR) return -(int64_t)(write ? EPERM : SCE_ENODATA);
+        int r = x->permission ? x->permission(n, vfs_cred(), write ? VFS_PERM_W : VFS_PERM_R) : 0;
+        return r ? SC_ERR(r) : 0;
+    }
+    if (sc_has_prefix(name, "trusted.")) return sc_is_priv(p) ? 0 : -(int64_t)(write ? EPERM : SCE_ENODATA);
+    if (!strcmp(name, "system.posix_acl_access") || !strcmp(name, "system.posix_acl_default")) {
+        if (!write) return 0;
+        vfs_attr_t a; if (node_attr_of(n, &a)) return -(int64_t)EIO;
+        return (sc_is_priv(p) || p->cred.euid == a.uid) ? 0 : -(int64_t)EPERM;                /* owner (or root) only */
+    }
+    return -(int64_t)SCE_ENOTSUP;
+}
+static int64_t sc_getxattr_impl(uint64_t target, int is_fd, int follow, uint64_t name_ptr, uint64_t val, uint64_t size) {
+    char name[256]; if (sc_copy_string((const char *)(uintptr_t)name_ptr, name, sizeof name) < 0) return -(int64_t)EFAULT;
+    if (size && !syscall_validate_ptr((void *)(uintptr_t)val, (size_t)size)) return -(int64_t)EFAULT;
+    vfs_node_t *n; int owned; int64_t r = sc_xattr_node(target, is_fd, follow, &n, &owned); if (r) return r;
+    r = sc_xattr_policy(n, name, 0);
+    if (!r) { int g = n->ops->x->getxattr(n, name, size ? (void *)(uintptr_t)val : NULL, (size_t)size); r = g < 0 ? SC_ERR(g) : g; }
+    if (owned) vfs_node_put(n);
+    return r;
+}
+static int64_t sc_setxattr_impl(uint64_t target, int is_fd, int follow, uint64_t name_ptr, uint64_t val, uint64_t size, uint64_t flags) {
+    char name[256]; if (sc_copy_string((const char *)(uintptr_t)name_ptr, name, sizeof name) < 0) return -(int64_t)EFAULT;
+    if (size && !syscall_validate_ptr((void *)(uintptr_t)val, (size_t)size)) return -(int64_t)EFAULT;
+    vfs_node_t *n; int owned; int64_t r = sc_xattr_node(target, is_fd, follow, &n, &owned); if (r) return r;
+    r = sc_xattr_policy(n, name, 1);
+    if (!r) { if (!n->ops->x->setxattr) r = -(int64_t)SCE_ENOTSUP; else r = SC_ERR(n->ops->x->setxattr(n, name, (const void *)(uintptr_t)val, (size_t)size, (int)flags)); }
+    if (owned) vfs_node_put(n);
+    return r;
+}
+static int64_t sc_listxattr_impl(uint64_t target, int is_fd, int follow, uint64_t list, uint64_t size) {
+    if (size && !syscall_validate_ptr((void *)(uintptr_t)list, (size_t)size)) return -(int64_t)EFAULT;
+    vfs_node_t *n; int owned; int64_t r = sc_xattr_node(target, is_fd, follow, &n, &owned); if (r) return r;
+    const vfs_node_xops_t *x = n->ops ? n->ops->x : NULL;
+    if (!x || !x->listxattr) r = -(int64_t)SCE_ENOTSUP;
+    else { int g = x->listxattr(n, size ? (char *)(uintptr_t)list : NULL, (size_t)size); r = g < 0 ? SC_ERR(g) : g; }
+    if (owned) vfs_node_put(n);
+    return r;
+}
+static int64_t sc_removexattr_impl(uint64_t target, int is_fd, int follow, uint64_t name_ptr) {
+    char name[256]; if (sc_copy_string((const char *)(uintptr_t)name_ptr, name, sizeof name) < 0) return -(int64_t)EFAULT;
+    vfs_node_t *n; int owned; int64_t r = sc_xattr_node(target, is_fd, follow, &n, &owned); if (r) return r;
+    r = sc_xattr_policy(n, name, 1);
+    if (!r) r = n->ops->x->removexattr ? SC_ERR(n->ops->x->removexattr(n, name)) : -(int64_t)SCE_ENOTSUP;
+    if (owned) vfs_node_put(n);
+    return r;
+}
+
+/* ---------------- statfs ---------------- */
+typedef struct { int64_t f_type, f_bsize; uint64_t f_blocks, f_bfree, f_bavail, f_files, f_ffree; int32_t f_fsid[2]; int64_t f_namelen, f_frsize, f_flags, f_spare[4]; } sc_statfs_t;
+static int64_t sc_statfs_node(vfs_node_t *n, uint64_t out) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)out, sizeof(sc_statfs_t))) return -(int64_t)EFAULT;
+    sc_statfs_t *s = (sc_statfs_t *)(uintptr_t)out; memset(s, 0, sizeof *s);
+    s->f_bsize = 4096; s->f_frsize = 4096; s->f_namelen = 255; s->f_type = 0x4D44;                    /* MSDOS_SUPER_MAGIC for FAT */
+    fhfs_stat_t st;
+    if (fhfs_node_statfs(n, &st) == 0) {
+        s->f_type = 0x46485346; s->f_blocks = st.total_blocks; s->f_bfree = st.free_blocks; s->f_bavail = st.free_blocks;
+        s->f_files = 1u << 20; s->f_ffree = (1u << 20);
+    }
+    return 0;
+}
+static int64_t sc_statfs(uint64_t path_ptr, uint64_t out) {
+    char path[VFS_MAX_PATH]; int64_t pr = sc_getpath((uint64_t)(int64_t)AT_FDCWD, path_ptr, path, sizeof path); if (pr) return pr;
+    int err; vfs_node_t *n = vfs_lookup_node(path, 1, &err); if (!n) return SC_ERR(err);
+    int64_t r = sc_statfs_node(n, out); vfs_node_put(n); return r;
+}
+static int64_t sc_fstatfs(uint64_t fd_arg, uint64_t out) {
+    sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
+    if (!f || f->is_pipe_read || f->is_pipe_write || f->vfs_fd < 0) return -(int64_t)EBADF;
+    vfs_node_t *n = vfs_fd_node(f->vfs_fd); return n ? sc_statfs_node(n, out) : -(int64_t)EBADF;
+}
+
+/* ---------------- FICLONE (cp --reflink) + snapshots ---------------- */
+#define SC_FICLONE 0x40049409UL
+static int64_t sc_ficlone(uint64_t dst_fd, uint64_t src_fd) {
+    sc_file_t *d = sc_get_file((int)(uint32_t)dst_fd), *s = sc_get_file((int)(uint32_t)src_fd);
+    if (!d || !s || d->vfs_fd < 0 || s->vfs_fd < 0 || d->is_pipe_read || d->is_pipe_write || s->is_pipe_read || s->is_pipe_write) return -(int64_t)EBADF;
+    if ((d->flags & O_ACCMODE) == O_RDONLY) return -(int64_t)EBADF;
+    vfs_node_t *dn = vfs_fd_node(d->vfs_fd), *sn = vfs_fd_node(s->vfs_fd);
+    const vfs_node_xops_t *x = (dn && dn->ops) ? dn->ops->x : NULL;
+    if (!dn || !sn || !x || !x->reflink) return -(int64_t)SCE_ENOTSUP;
+    return SC_ERR(x->reflink(sn, dn));
+}
+/* cmd 1 create(path,name)  2 delete(path,name)  3 list(path, idx -> buf[48])  4 mount(path,name -> mountpoint) */
+static int64_t sc_fhfs_snapshot(uint64_t cmd, uint64_t path_ptr, uint64_t name_ptr, uint64_t a4, uint64_t a5) {
+    char path[VFS_MAX_PATH], name[64], at[VFS_MAX_PATH]; char out48[48];
+    int64_t pr = sc_getpath((uint64_t)(int64_t)AT_FDCWD, path_ptr, path, sizeof path); if (pr) return pr;
+    name[0] = '\0';
+    if (cmd != 3 && sc_copy_string((const char *)(uintptr_t)name_ptr, name, sizeof name) < 0) return -(int64_t)EFAULT;
+    if (cmd == 4) { pr = sc_getpath((uint64_t)(int64_t)AT_FDCWD, a4, at, sizeof at); if (pr) return pr; }
+    int r = fhfs_vfs_snapshot((int)cmd, path, name, cmd == 4 ? at : NULL, (uint32_t)a4, out48);
+    if (r) return SC_ERR(r);
+    if (cmd == 3) {
+        if (!syscall_validate_ptr((void *)(uintptr_t)a5, 48)) return -(int64_t)EFAULT;
+        memcpy((void *)(uintptr_t)a5, out48, 48);
+    }
+    return 0;
+}
 
 static int64_t sc_dispatch_inner(uint64_t nr,
                          uint64_t a1, uint64_t a2, uint64_t a3,
@@ -3714,11 +4103,12 @@ static int64_t sc_dispatch_inner(uint64_t nr,
                          
     case SYS_READ:          return sc_read(a1, a2, a3);
     case SYS_WRITE:         return sc_write(a1, a2, a3);
-    case SYS_OPEN:          return sc_open(a1, a2);
+    case SYS_OPEN:          return sc_open(a1, a2, a3);
     case SYS_OPENAT:        return sc_openat(a1, a2, a3, a4);
     case SYS_CLOSE:         return sc_close(a1);
-    case SYS_STAT:
-    case SYS_LSTAT:         return sc_stat_lx(a1, a2);
+    case SYS_STAT:          return sc_stat_lx(a1, a2);
+    case SYS_LSTAT:         return sc_lstat_lx(a1, a2);
+    case SYS_STATX:         return sc_statx(a1, a2, a3, a4, a5);
     case SYS_FSTAT:         return sc_fstat_lx(a1, a2);
     case SYS_NEWFSTATAT:    return sc_newfstatat(a1, a2, a3, a4);
     case SYS_STAT_FEX:      return sc_stat_fex(a1, a2);                                    
@@ -3737,8 +4127,8 @@ static int64_t sc_dispatch_inner(uint64_t nr,
     case SYS_UNLINK:        return sc_unlink(a1);
     case SYS_UNLINKAT:      return sc_unlinkat(a1, a2, a3);
     case SYS_RENAME:        return sc_rename(a1, a2);
-    case SYS_RENAMEAT:      return sc_renameat(a1, a2, a3, a4, 0);
-    case SYS_RENAMEAT2:     return sc_renameat(a1, a2, a3, a4, a5);
+    case SYS_RENAMEAT:      return sc_renameat(a1, a2, a3, a4);
+    case SYS_RENAMEAT2:     return sc_renameat2(a1, a2, a3, a4, a5);
     case SYS_CHDIR:         return sc_chdir(a1);
     case SYS_PREAD64:       return sc_pread64(a1, a2, a3, a4);
     case SYS_PWRITE64:      return sc_pwrite64(a1, a2, a3, a4);
@@ -3746,8 +4136,8 @@ static int64_t sc_dispatch_inner(uint64_t nr,
     case SYS_WRITEV:
     case SYS_WRITEV_LEGACY: return sc_writev(a1, a2, a3);
     case SYS_ACCESS:        return sc_access(a1, a2);
-    case SYS_FACCESSAT:
-    case SYS_FACCESSAT2:    return sc_faccessat(a1, a2, a3);
+    case SYS_FACCESSAT:     return sc_faccessat(a1, a2, a3);
+    case SYS_FACCESSAT2:    return sc_faccessat2(a1, a2, a3, a4);
     case SYS_DUP:           return sc_dup(a1);
     case SYS_DUP2:          return sc_dup2(a1, a2);
     case SYS_DUP3:          return sc_dup3(a1, a2, a3);
@@ -3759,15 +4149,59 @@ static int64_t sc_dispatch_inner(uint64_t nr,
     case SYS_PIPE_LEGACY:   return sc_pipe(a1);
     case SYS_PIPE2:         return sc_pipe2(a1, a2);
     case SYS_FSYNC:
-    case SYS_FDATASYNC:     return sc_perm_fd(a1);                                               
-    case SYS_SYNC:          return 0;
-    case SYS_FADVISE64:     return sc_perm_fd(a1);
-    case SYS_CHMOD:
-    case SYS_CHOWN:
-    case SYS_LCHOWN:        return sc_perm_path(a1);                                           
-    case SYS_FCHMOD:
-    case SYS_FCHOWN:        return sc_perm_fd(a1);
-    case SYS_FCHMODAT:      return sc_at_ok(a1, a2) ? sc_perm_path(a2) : -(int64_t)ENOSYS;
+    case SYS_FDATASYNC:     return sc_fsync(a1);                                               
+    case SYS_SYNC:
+    case SYS_SYNCFS:        return sc_sync_all();
+    case SYS_FADVISE64:     return sc_fsync(a1) < 0 ? -(int64_t)EBADF : 0;
+    case SYS_CHMOD:         return sc_chmod(a1, a2);
+    case SYS_CHOWN:         return sc_chown(a1, a2, a3);
+    case SYS_LCHOWN:        return sc_lchown(a1, a2, a3);
+    case SYS_FCHMOD:        return sc_fchmod(a1, a2);
+    case SYS_FCHOWN:        return sc_fchown(a1, a2, a3);
+    case SYS_FCHMODAT:      return sc_fchmodat(a1, a2, a3, 0);
+    case SYS_FCHMODAT2:     return sc_fchmodat(a1, a2, a3, a4);
+    case SYS_FCHOWNAT:      return sc_fchownat(a1, a2, a3, a4, a5);
+    case SYS_FCHDIR:        return sc_fchdir(a1);
+    case SYS_SYMLINK:       return sc_symlink(a1, a2);
+    case SYS_SYMLINKAT:     return sc_symlinkat(a1, a2, a3);
+    case SYS_LINK:          return sc_link(a1, a2);
+    case SYS_LINKAT:        return sc_linkat(a1, a2, a3, a4, a5);
+    case SYS_MKNOD:         return sc_mknod(a1, a2, a3);
+    case SYS_MKNODAT:       return sc_mknodat(a1, a2, a3, a4);
+    case SYS_UTIME:         return sc_utime(a1, a2);
+    case SYS_UTIMES:        return sc_utimes(a1, a2);
+    case SYS_FUTIMESAT:     return sc_utimes_tv(a1, a2, a3);
+    case SYS_UTIMENSAT:     return sc_utimensat(a1, a2, a3, a4);
+    case SYS_STATFS:        return sc_statfs(a1, a2);
+    case SYS_FSTATFS:       return sc_fstatfs(a1, a2);
+    case SYS_FLOCK:         return 0;
+    case SYS_SETXATTR:      return sc_setxattr_impl(a1, 0, 1, a2, a3, a4, a5);
+    case SYS_LSETXATTR:     return sc_setxattr_impl(a1, 0, 0, a2, a3, a4, a5);
+    case SYS_FSETXATTR:     return sc_setxattr_impl(a1, 1, 1, a2, a3, a4, a5);
+    case SYS_GETXATTR:      return sc_getxattr_impl(a1, 0, 1, a2, a3, a4);
+    case SYS_LGETXATTR:     return sc_getxattr_impl(a1, 0, 0, a2, a3, a4);
+    case SYS_FGETXATTR:     return sc_getxattr_impl(a1, 1, 1, a2, a3, a4);
+    case SYS_LISTXATTR:     return sc_listxattr_impl(a1, 0, 1, a2, a3);
+    case SYS_LLISTXATTR:    return sc_listxattr_impl(a1, 0, 0, a2, a3);
+    case SYS_FLISTXATTR:    return sc_listxattr_impl(a1, 1, 1, a2, a3);
+    case SYS_REMOVEXATTR:   return sc_removexattr_impl(a1, 0, 1, a2);
+    case SYS_LREMOVEXATTR:  return sc_removexattr_impl(a1, 0, 0, a2);
+    case SYS_FREMOVEXATTR:  return sc_removexattr_impl(a1, 1, 1, a2);
+    case SYS_SETUID:        return sc_setuid(a1);
+    case SYS_SETGID:        return sc_setgid(a1);
+    case SYS_SETREUID:      return sc_setreuid(a1, a2);
+    case SYS_SETREGID:      return sc_setregid(a1, a2);
+    case SYS_SETRESUID:     return sc_setresuid(a1, a2, a3);
+    case SYS_SETRESGID:     return sc_setresgid(a1, a2, a3);
+    case SYS_GETRESUID:     return sc_getresuid(a1, a2, a3);
+    case SYS_GETRESGID:     return sc_getresgid(a1, a2, a3);
+    case SYS_GETGROUPS:     return sc_getgroups(a1, a2);
+    case SYS_SETGROUPS:     return sc_setgroups(a1, a2);
+    case SYS_SETFSUID:      return sc_geteuid();
+    case SYS_SETFSGID:      return sc_getegid();
+    case SYS_FHFS_SNAPSHOT: return sc_fhfs_snapshot(a1, a2, a3, a4, a5);
+    case SYS_FALLOCATE:     return sc_fallocate(a1, a2, a3, a4);
+                                          
     case SYS_UMASK:         return sc_umask(a1);
                           
     case SYS_BRK:           return sc_brk(a1);
@@ -3790,8 +4224,10 @@ static int64_t sc_dispatch_inner(uint64_t nr,
     case SYS_GETPPID:       return sc_getppid();
     case SYS_GETTID:        return sc_gettid();
     case SYS_SET_TID_ADDRESS: return sc_set_tid_address(a1);
-    case SYS_GETUID: case SYS_GETEUID: case SYS_GETGID: case SYS_GETEGID:
-        return 0;                                                                                          
+    case SYS_GETUID:        return sc_getuid();
+    case SYS_GETEUID:       return sc_geteuid();
+    case SYS_GETGID:        return sc_getgid();
+    case SYS_GETEGID:       return sc_getegid();
     case SYS_SETPGID:       return 0;
     case SYS_GETPGRP:
     case SYS_GETPGID:
@@ -3865,6 +4301,7 @@ void syscall_init(void) {
                                                                         
                                                                       
 
+    vfs_set_cred_provider(sc_cred_provider);
     DBG_MSG("SC", "syscall_init ok");
 }
 

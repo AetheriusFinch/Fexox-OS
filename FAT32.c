@@ -4,6 +4,7 @@
 
 #include "VFS.h"
 #include "debug_out.h"
+#include "UsbDiag.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>

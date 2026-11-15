@@ -4,6 +4,7 @@
 
 #include "VFS.h"
 #include "debug_out.h"
+#include "UsbDiag.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -237,6 +238,14 @@ int blkdev_register(blkdev_t *dev) {
     DBG_VAL("BLK", "sector_count", dev->sector_count);
     return idx;
 }
+
+int blkdev_flush(blkdev_t *dev) {
+    if (!dev || !dev->ops || !dev->ops->flush) return VFS_OK;
+    return dev->ops->flush(dev);
+}
+
+int blkdev_count(void) { return g_blkdev_count; }
+blkdev_t *blkdev_at(int idx) { return (idx >= 0 && idx < g_blkdev_count) ? g_blkdevs[idx] : NULL; }
 
 blkdev_t *blkdev_find(const char *name) {
     for (int i = 0; i < g_blkdev_count; i++) {
@@ -1212,6 +1221,8 @@ int vfs_close(int fd) {
     return VFS_OK;
 }
 
+static void vfs_refresh_size(vfs_node_t *n);
+
 int64_t vfs_read(int fd, void *buf, uint64_t size) {
     vfs_fd_t *f = fd_get(fd);
     if (!f) return VFS_ERR_BADF;
@@ -1224,7 +1235,7 @@ int64_t vfs_read(int fd, void *buf, uint64_t size) {
 int64_t vfs_write(int fd, const void *buf, uint64_t size) {
     vfs_fd_t *f = fd_get(fd);
     if (!f) return VFS_ERR_BADF;
-    if (f->flags & O_APPEND) f->offset = f->node->stat.size;
+    if (f->flags & O_APPEND) { vfs_refresh_size(f->node); f->offset = f->node->stat.size; }
     if (!f->node->ops->write) return VFS_ERR_UNSUP;
     int64_t r = f->node->ops->write(f->node, f->offset, size, buf);
     if (r > 0) f->offset += (uint64_t)r;
@@ -1238,7 +1249,7 @@ int64_t vfs_seek(int fd, int64_t offset, int whence) {
     switch (whence) {
         case 0: new_off = offset; break;
         case 1: new_off = (int64_t)f->offset + offset; break;
-        case 2: new_off = (int64_t)f->node->stat.size + offset; break;
+        case 2: vfs_refresh_size(f->node); new_off = (int64_t)f->node->stat.size + offset; break;
         default: return VFS_ERR_INVAL;
     }
     if (new_off < 0) return VFS_ERR_INVAL;
@@ -1257,6 +1268,7 @@ int vfs_stat(const char *path, vfs_stat_t *out) {
 int vfs_fstat(int fd, vfs_stat_t *out) {
     vfs_fd_t *f = fd_get(fd);
     if (!f) return VFS_ERR_BADF;
+    vfs_refresh_size(f->node);
     *out = f->node->stat;
     return VFS_OK;
 }
@@ -1315,4 +1327,395 @@ int vfs_ftruncate(int fd, uint64_t size) {
     if (!f) return VFS_ERR_BADF;
     if (!f->node->ops->truncate) return VFS_ERR_UNSUP;
     return f->node->ops->truncate(f->node, size);
+}
+
+/* ================================================================== */
+/* POSIX layer: credentials, symlink-aware path walk, attributes,      */
+/* links, rename, xattr access.  Used by the Linux/musl syscalls; the  */
+/* classic vfs_open()/vfs_stat()/... above keep working unchanged and  */
+/* behave as root (kernel-internal callers).                           */
+/* ================================================================== */
+
+#define VFS_SYMLOOP 40
+#define V_S_IFMT   0170000u
+#define V_S_IFDIR  0040000u
+#define V_S_IFREG  0100000u
+#define V_S_IFLNK  0120000u
+
+static const vfs_cred_t g_root_cred = { 0, 0, 0, 0, 022, 0, { 0 } };
+static const vfs_cred_t *(*g_cred_provider)(void);
+
+void vfs_set_cred_provider(const vfs_cred_t *(*fn)(void)) { g_cred_provider = fn; }
+const vfs_cred_t *vfs_cred(void) {
+    const vfs_cred_t *c = g_cred_provider ? g_cred_provider() : NULL;
+    return c ? c : &g_root_cred;
+}
+
+static inline const vfs_node_xops_t *nx(vfs_node_t *n) { return (n && n->ops) ? n->ops->x : NULL; }
+static void node_put(vfs_node_t *n) { if (n && n->ops && n->ops->release) n->ops->release(n); }
+void vfs_node_put(vfs_node_t *n) { node_put(n); }
+
+/* Walk `in` component by component.
+     want_parent : stop before the last component, return the parent, name in `last`
+     follow_last : resolve a symbolic link in the last component too
+   Search (x) permission is required on every directory that is traversed.            */
+static vfs_node_t *vfs_walk(const char *in, bool want_parent, bool follow_last, char *last,
+                            const vfs_cred_t *cr, int *err) {
+    char *buf = (char *)kmalloc(VFS_MAX_PATH), *tgt = (char *)kmalloc(VFS_MAX_PATH), *nb = (char *)kmalloc(VFS_MAX_PATH);
+    vfs_node_t *result = NULL;
+    *err = VFS_ERR_NOMEM;
+    if (!buf || !tgt || !nb) goto out;
+    if (kstr_len(in) >= VFS_MAX_PATH) { *err = VFS_ERR_NAMETOOLONG; goto out; }
+    kstr_cpy(buf, in, VFS_MAX_PATH);
+    int loops = 0;
+    for (;;) {
+        vfs_mount_t *mnt = vfs_find_mount(buf);
+        if (!mnt) { *err = VFS_ERR_NOENT; goto out; }
+        const char *rel = buf + kstr_len(mnt->path);
+        while (*rel == '/') rel++;
+        vfs_node_t *cur = mnt->root;
+        cur->refcount++;
+        if (!*rel) {
+            if (want_parent && last) { last[0] = '.'; last[1] = '\0'; }
+            result = cur; *err = VFS_OK; goto out;
+        }
+        char comp[VFS_MAX_NAME + 1];
+        const char *p = rel;
+        bool restart = false;
+        while (*p) {
+            const char *cs = p;
+            int ci = 0;
+            while (*p && *p != '/') { if (ci < VFS_MAX_NAME) comp[ci++] = *p; p++; }
+            comp[ci] = '\0';
+            const char *ce = p;
+            while (*p == '/') p++;
+            bool is_last = (*p == '\0');
+            if (ci == VFS_MAX_NAME && *ce != '/' && ce - cs > VFS_MAX_NAME) { node_put(cur); *err = VFS_ERR_NAMETOOLONG; goto out; }
+            if (want_parent && is_last) {
+                if (last) kstr_cpy(last, comp, VFS_MAX_NAME + 1);
+                result = cur; *err = VFS_OK; goto out;
+            }
+            if (cur->stat.type != VFS_TYPE_DIR) { node_put(cur); *err = VFS_ERR_NOTDIR; goto out; }
+            const vfs_node_xops_t *x = nx(cur);
+            if (cr && x && x->permission) {
+                int r = x->permission(cur, cr, VFS_PERM_X);
+                if (r) { node_put(cur); *err = r; goto out; }
+            }
+            if (!cur->ops->lookup) { node_put(cur); *err = VFS_ERR_UNSUP; goto out; }
+            vfs_node_t *next = cur->ops->lookup(cur, comp);
+            node_put(cur);
+            if (!next) { *err = VFS_ERR_NOENT; goto out; }
+            if (next->stat.type == VFS_TYPE_LINK && (!is_last || follow_last)) {
+                const vfs_node_xops_t *lx = nx(next);
+                if (!lx || !lx->readlink) { node_put(next); *err = VFS_ERR_INVAL; goto out; }
+                if (++loops > VFS_SYMLOOP) { node_put(next); *err = VFS_ERR_LOOP; goto out; }
+                int tl = lx->readlink(next, tgt, VFS_MAX_PATH - 1);
+                node_put(next);
+                if (tl <= 0) { *err = VFS_ERR_IO; goto out; }
+                tgt[tl] = '\0';
+                size_t pre = (size_t)(cs - buf), rest = (size_t)kstr_len(ce);
+                size_t o = 0;
+                if (tgt[0] != '/') { if (pre + (size_t)tl + rest + 1 > VFS_MAX_PATH) { *err = VFS_ERR_NAMETOOLONG; goto out; } for (; o < pre; o++) nb[o] = buf[o]; }
+                else if ((size_t)tl + rest + 1 > VFS_MAX_PATH) { *err = VFS_ERR_NAMETOOLONG; goto out; }
+                for (int k = 0; k < tl; k++) nb[o++] = tgt[k];
+                for (size_t k = 0; k < rest; k++) nb[o++] = ce[k];
+                nb[o] = '\0';
+                kstr_cpy(buf, nb, VFS_MAX_PATH);
+                restart = true;
+                break;
+            }
+            cur = next;
+        }
+        if (!restart) { result = cur; *err = VFS_OK; goto out; }
+    }
+out:
+    if (buf) kfree(buf);
+    if (tgt) kfree(tgt);
+    if (nb) kfree(nb);
+    return result;
+}
+
+static int node_perm(vfs_node_t *n, const vfs_cred_t *cr, uint32_t want) {
+    const vfs_node_xops_t *x = nx(n);
+    if (x && x->permission) return x->permission(n, cr, want);
+    if ((want & VFS_PERM_W) && (n->stat.attr & 1u)) return VFS_ERR_ACCES;      /* FAT read-only bit */
+    return VFS_OK;
+}
+
+static void attr_synth(vfs_node_t *n, vfs_attr_t *a) {
+    kmem_set(a, 0, sizeof(*a));
+    bool dir = n->stat.type == VFS_TYPE_DIR;
+    a->ino = n->stat.cluster ? n->stat.cluster : 1;
+    a->mode = dir ? (V_S_IFDIR | 0755) : (V_S_IFREG | ((n->stat.attr & 1u) ? 0444 : 0644));
+    a->nlink = dir ? 2 : 1;
+    a->size = n->stat.size;
+    a->blocks = (n->stat.alloc_size ? n->stat.alloc_size : n->stat.size + 511) / 512;
+    a->blksize = 4096; a->dev = 1;
+    a->atime_ns = (uint64_t)n->stat.atime * 1000000000ULL;
+    a->mtime_ns = (uint64_t)n->stat.mtime * 1000000000ULL;
+    a->ctime_ns = (uint64_t)n->stat.ctime * 1000000000ULL;
+    a->btime_ns = a->ctime_ns;
+}
+static int node_getattr(vfs_node_t *n, vfs_attr_t *a) {
+    const vfs_node_xops_t *x = nx(n);
+    if (x && x->getattr) return x->getattr(n, a);
+    attr_synth(n, a);
+    return VFS_OK;
+}
+static void vfs_refresh_size(vfs_node_t *n) {
+    const vfs_node_xops_t *x = nx(n);
+    vfs_attr_t a;
+    if (x && x->getattr && x->getattr(n, &a) == VFS_OK) { n->stat.size = a.size; n->stat.alloc_size = a.blocks * 512; }
+}
+
+int vfs_open2(const char *path, int flags, uint32_t mode) {
+    const vfs_cred_t *cr = vfs_cred();
+    int acc = flags & O_ACCMODE;
+    bool want_r = (acc != O_WRONLY), want_w = (acc == O_WRONLY || acc == O_RDWR || (flags & O_TRUNC));
+    bool created = false;
+    int err;
+    vfs_node_t *node = vfs_walk(path, false, !(flags & VFS_O_NOFOLLOW), NULL, cr, &err);
+    if (!node) {
+        if (err != VFS_ERR_NOENT || !(flags & O_CREAT)) return err;
+        char last[VFS_MAX_NAME + 1];
+        /* creating through a dangling symbolic link creates the link's target */
+        char *cpath = (char *)kmalloc(VFS_MAX_PATH), *ltgt = (char *)kmalloc(VFS_MAX_PATH);
+        if (!cpath || !ltgt) { if (cpath) kfree(cpath); if (ltgt) kfree(ltgt); return VFS_ERR_NOMEM; }
+        kstr_cpy(cpath, path, VFS_MAX_PATH);
+        if (!(flags & VFS_O_NOFOLLOW)) {
+            for (int hop = 0;; hop++) {
+                int e2; vfs_node_t *ln = vfs_walk(cpath, false, false, NULL, cr, &e2);
+                if (!ln) break;
+                const vfs_node_xops_t *lx = nx(ln);
+                if (ln->stat.type != VFS_TYPE_LINK || !lx || !lx->readlink) { node_put(ln); break; }
+                if (hop >= VFS_SYMLOOP) { node_put(ln); kfree(cpath); kfree(ltgt); return VFS_ERR_LOOP; }
+                int tl = lx->readlink(ln, ltgt, VFS_MAX_PATH - 1);
+                node_put(ln);
+                if (tl <= 0) break;
+                ltgt[tl] = '\0';
+                if (ltgt[0] == '/') kstr_cpy(cpath, ltgt, VFS_MAX_PATH);
+                else {
+                    int cut = kstr_len(cpath); while (cut > 0 && cpath[cut - 1] != '/') cut--;
+                    if (cut + tl + 1 > VFS_MAX_PATH) { kfree(cpath); kfree(ltgt); return VFS_ERR_NAMETOOLONG; }
+                    for (int k = 0; k <= tl; k++) cpath[cut + k] = ltgt[k];
+                }
+            }
+        }
+        vfs_node_t *parent = vfs_walk(cpath, true, true, last, cr, &err);
+        kfree(cpath); kfree(ltgt);
+        if (!parent) return err;
+        if (parent->stat.type != VFS_TYPE_DIR) { node_put(parent); return VFS_ERR_NOTDIR; }
+        const vfs_node_xops_t *x = nx(parent);
+        uint32_t eff = (mode & 07777u) & ~(cr->umask & 0777u);
+        vfs_node_t *nn = NULL;
+        if (x && x->create2) err = x->create2(parent, last, V_S_IFREG | eff, 0, cr, &nn);
+        else if (parent->ops->create) { nn = parent->ops->create(parent, last, VFS_TYPE_FILE); err = nn ? VFS_OK : VFS_ERR_IO; }
+        else err = VFS_ERR_UNSUP;
+        node_put(parent);
+        if (err) return err;
+        node = nn; created = true;
+    } else {
+        if ((flags & O_CREAT) && (flags & VFS_O_EXCL)) { node_put(node); return VFS_ERR_EXIST; }
+        if (node->stat.type == VFS_TYPE_LINK) { node_put(node); return VFS_ERR_LOOP; }       /* O_NOFOLLOW on a link */
+    }
+    if ((flags & VFS_O_LXDIR) && node->stat.type != VFS_TYPE_DIR) { node_put(node); return VFS_ERR_NOTDIR; }
+    if (node->stat.type == VFS_TYPE_DIR && want_w) { node_put(node); return VFS_ERR_ISDIR; }
+    if (!created) {
+        uint32_t need = (want_r ? VFS_PERM_R : 0) | (want_w ? VFS_PERM_W : 0);
+        int r = need ? node_perm(node, cr, need) : VFS_OK;
+        if (r) { node_put(node); return r; }
+    }
+    if ((flags & O_TRUNC) && node->stat.type == VFS_TYPE_FILE && !created && node->ops->truncate) {
+        int r = node->ops->truncate(node, 0);
+        if (r) { node_put(node); return r; }
+    }
+    int fd = fd_alloc(node, flags & (O_ACCMODE | O_APPEND));
+    if (fd < 0) node_put(node);
+    return fd;
+}
+
+vfs_node_t *vfs_lookup_node(const char *path, int follow, int *err) {
+    int e; vfs_node_t *n = vfs_walk(path, false, follow != 0, NULL, vfs_cred(), &e);
+    if (err) *err = e;
+    return n;
+}
+vfs_node_t *vfs_fd_node(int fd) { vfs_fd_t *f = fd_get(fd); return f ? f->node : NULL; }
+vfs_mount_t *vfs_mount_of_path(const char *path) { return vfs_find_mount(path); }
+
+int vfs_getattr(const char *path, int follow, vfs_attr_t *out) {
+    int err; vfs_node_t *n = vfs_walk(path, false, follow != 0, NULL, vfs_cred(), &err);
+    if (!n) return err;
+    int r = node_getattr(n, out);
+    node_put(n);
+    return r;
+}
+int vfs_fgetattr(int fd, vfs_attr_t *out) {
+    vfs_fd_t *f = fd_get(fd); if (!f) return VFS_ERR_BADF;
+    return node_getattr(f->node, out);
+}
+
+static int node_setattr(vfs_node_t *n, const vfs_setattr_t *sa, const vfs_cred_t *cr) {
+    const vfs_node_xops_t *x = nx(n);
+    if (x && x->setattr) return x->setattr(n, sa, cr);
+    if (sa->valid & (VFS_SET_MODE | VFS_SET_UID | VFS_SET_GID)) return VFS_ERR_PERM;   /* FAT has no owners/modes */
+    if ((sa->valid & VFS_SET_SIZE) && n->ops->truncate) return n->ops->truncate(n, sa->size);
+    return VFS_OK;                                                                    /* times: ignored */
+}
+int vfs_setattr(const char *path, int follow, const vfs_setattr_t *sa) {
+    const vfs_cred_t *cr = vfs_cred(); int err;
+    vfs_node_t *n = vfs_walk(path, false, follow != 0, NULL, cr, &err);
+    if (!n) return err;
+    int r = node_setattr(n, sa, cr);
+    node_put(n);
+    return r;
+}
+int vfs_fsetattr(int fd, const vfs_setattr_t *sa) {
+    vfs_fd_t *f = fd_get(fd); if (!f) return VFS_ERR_BADF;
+    return node_setattr(f->node, sa, vfs_cred());
+}
+
+int vfs_access2(const char *path, uint32_t mode, int use_real_ids, int follow) {
+    vfs_cred_t c = *vfs_cred();
+    if (use_real_ids) { c.euid = c.uid; c.egid = c.gid; }
+    int err; vfs_node_t *n = vfs_walk(path, false, follow != 0, NULL, &c, &err);
+    if (!n) return err;
+    int r = (mode & 7u) ? node_perm(n, &c, mode & 7u) : VFS_OK;
+    node_put(n);
+    return r;
+}
+
+static int create_in(const char *path, uint32_t mode_with_type, uint64_t rdev, bool is_dir_legacy) {
+    const vfs_cred_t *cr = vfs_cred(); int err; char last[VFS_MAX_NAME + 1];
+    vfs_node_t *parent = vfs_walk(path, true, true, last, cr, &err);
+    if (!parent) return err;
+    if (parent->stat.type != VFS_TYPE_DIR) { node_put(parent); return VFS_ERR_NOTDIR; }
+    if ((last[0] == '.' && last[1] == '\0') || (last[0] == '.' && last[1] == '.' && last[2] == '\0')) { node_put(parent); return VFS_ERR_EXIST; }
+    vfs_node_t *ex = parent->ops->lookup ? parent->ops->lookup(parent, last) : NULL;
+    if (ex) { node_put(ex); node_put(parent); return VFS_ERR_EXIST; }
+    const vfs_node_xops_t *x = nx(parent);
+    vfs_node_t *nn = NULL;
+    uint32_t eff = (mode_with_type & V_S_IFMT) | ((mode_with_type & 07777u) & ~(cr->umask & 0777u));
+    if (x && x->create2) err = x->create2(parent, last, eff, rdev, cr, &nn);
+    else if (parent->ops->create) { nn = parent->ops->create(parent, last, is_dir_legacy ? VFS_TYPE_DIR : VFS_TYPE_FILE); err = nn ? VFS_OK : VFS_ERR_IO; }
+    else err = VFS_ERR_UNSUP;
+    node_put(parent);
+    if (!err) node_put(nn);
+    return err;
+}
+int vfs_mkdir2(const char *path, uint32_t mode) { return create_in(path, V_S_IFDIR | (mode & 07777u), 0, true); }
+int vfs_mknod2(const char *path, uint32_t mode, uint64_t rdev) {
+    if (!(mode & V_S_IFMT)) mode |= V_S_IFREG;
+    return create_in(path, mode, rdev, false);
+}
+
+static int unlink_in(const char *path, int rmdir) {
+    const vfs_cred_t *cr = vfs_cred(); int err; char last[VFS_MAX_NAME + 1];
+    vfs_node_t *parent = vfs_walk(path, true, true, last, cr, &err);
+    if (!parent) return err;
+    int r;
+    const vfs_node_xops_t *x = nx(parent);
+    if (x && x->unlink2) r = x->unlink2(parent, last, cr, rmdir);
+    else if (parent->ops->unlink) {
+        vfs_node_t *t = parent->ops->lookup ? parent->ops->lookup(parent, last) : NULL;
+        if (!t) r = VFS_ERR_NOENT;
+        else {
+            bool isdir = t->stat.type == VFS_TYPE_DIR; node_put(t);
+            r = (rmdir && !isdir) ? VFS_ERR_NOTDIR : (!rmdir && isdir) ? VFS_ERR_ISDIR : parent->ops->unlink(parent, last);
+        }
+    } else r = VFS_ERR_UNSUP;
+    node_put(parent);
+    return r;
+}
+int vfs_unlink2(const char *path) { return unlink_in(path, 0); }
+int vfs_rmdir2(const char *path) { return unlink_in(path, 1); }
+
+int vfs_symlink2(const char *target, const char *linkpath) {
+    const vfs_cred_t *cr = vfs_cred(); int err; char last[VFS_MAX_NAME + 1];
+    vfs_node_t *parent = vfs_walk(linkpath, true, true, last, cr, &err);
+    if (!parent) return err;
+    const vfs_node_xops_t *x = nx(parent);
+    vfs_node_t *nn = NULL;
+    int r = (x && x->symlink) ? x->symlink(parent, last, target, cr, &nn) : VFS_ERR_PERM;
+    node_put(parent);
+    if (!r) node_put(nn);
+    return r;
+}
+int vfs_readlink2(const char *path, char *buf, size_t sz) {
+    int err; vfs_node_t *n = vfs_walk(path, false, false, NULL, vfs_cred(), &err);
+    if (!n) return err;
+    int r;
+    const vfs_node_xops_t *x = nx(n);
+    if (n->stat.type != VFS_TYPE_LINK || !x || !x->readlink) r = VFS_ERR_INVAL;
+    else r = x->readlink(n, buf, sz);
+    node_put(n);
+    return r;
+}
+int vfs_link2(const char *oldp, const char *newp) {
+    const vfs_cred_t *cr = vfs_cred(); int err; char last[VFS_MAX_NAME + 1];
+    if (vfs_find_mount(oldp) != vfs_find_mount(newp)) return VFS_ERR_XDEV;
+    vfs_node_t *t = vfs_walk(oldp, false, false, NULL, cr, &err);
+    if (!t) return err;
+    vfs_node_t *parent = vfs_walk(newp, true, true, last, cr, &err);
+    if (!parent) { node_put(t); return err; }
+    const vfs_node_xops_t *x = nx(parent);
+    int r = (x && x->link) ? x->link(parent, last, t, cr) : VFS_ERR_PERM;
+    node_put(parent); node_put(t);
+    return r;
+}
+int vfs_rename2(const char *oldp, const char *newp, uint32_t flags) {
+    if (flags & ~1u) return VFS_ERR_INVAL;
+    const vfs_cred_t *cr = vfs_cred(); int err; char on[VFS_MAX_NAME + 1], nn[VFS_MAX_NAME + 1];
+    if (vfs_find_mount(oldp) != vfs_find_mount(newp)) return VFS_ERR_XDEV;
+    vfs_node_t *od = vfs_walk(oldp, true, true, on, cr, &err); if (!od) return err;
+    vfs_node_t *nd = vfs_walk(newp, true, true, nn, cr, &err); if (!nd) { node_put(od); return err; }
+    const vfs_node_xops_t *x = nx(od);
+    int r;
+    if (!x || !x->rename) r = VFS_ERR_UNSUP;
+    else {
+        r = VFS_OK;
+        if (flags & 1u) { vfs_node_t *e = nd->ops->lookup ? nd->ops->lookup(nd, nn) : NULL; if (e) { node_put(e); r = VFS_ERR_EXIST; } }
+        if (!r) r = x->rename(od, on, nd, nn, cr);
+    }
+    node_put(nd); node_put(od);
+    return r;
+}
+
+int vfs_truncate2(const char *path, uint64_t size) {
+    const vfs_cred_t *cr = vfs_cred(); int err;
+    vfs_node_t *n = vfs_walk(path, false, true, NULL, cr, &err);
+    if (!n) return err;
+    int r;
+    if (n->stat.type == VFS_TYPE_DIR) r = VFS_ERR_ISDIR;
+    else if ((r = node_perm(n, cr, VFS_PERM_W)) == VFS_OK) r = n->ops->truncate ? n->ops->truncate(n, size) : VFS_ERR_UNSUP;
+    node_put(n);
+    return r;
+}
+int vfs_ftruncate2(int fd, uint64_t size) {
+    vfs_fd_t *f = fd_get(fd); if (!f) return VFS_ERR_BADF;
+    if (f->node->stat.type == VFS_TYPE_DIR) return VFS_ERR_ISDIR;
+    return f->node->ops->truncate ? f->node->ops->truncate(f->node, size) : VFS_ERR_UNSUP;
+}
+int vfs_fsync2(int fd) {
+    vfs_fd_t *f = fd_get(fd); if (!f) return VFS_ERR_BADF;
+    return f->node->ops->sync ? f->node->ops->sync(f->node) : VFS_OK;
+}
+
+int vfs_attach(const char *path, vfs_node_t *root, fs_ops_t *fs, blkdev_t *dev, uint32_t flags) {
+    spin_lock(&g_mount_lock);
+    if (g_mount_count >= VFS_MAX_MOUNTS) { spin_unlock(&g_mount_lock); return VFS_ERR_BUSY; }
+    for (int i = 0; i < g_mount_count; i++)
+        if (kstr_cmp(g_mounts[i].path, path) == 0) { spin_unlock(&g_mount_lock); return VFS_ERR_BUSY; }
+    vfs_mount_t *mnt = &g_mounts[g_mount_count++];
+    kstr_cpy(mnt->path, path, VFS_MAX_PATH);
+    mnt->root = root; mnt->dev = dev; mnt->fs = fs; mnt->flags = flags;
+    root->mount = mnt;
+    spin_unlock(&g_mount_lock);
+    return VFS_OK;
+}
+
+void vfs_sync_all(void) {
+    for (int i = 0; i < g_mount_count; i++) {
+        vfs_node_t *r = g_mounts[i].root;
+        if (r && r->ops && r->ops->sync) r->ops->sync(r);
+    }
 }

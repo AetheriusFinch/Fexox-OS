@@ -32,11 +32,11 @@ Run the following scripts from the repository root, in this order:
 
 4. ./make_usb_image.sh
 
-   Creates build/usb.img, a FAT32 superfloppy image without an MBR or a partition table. This image contains the UEFI loader, kernel, and available UI and application files. It is an intermediate USB image and is not the universal BIOS and UEFI image.
+   Creates build/usb.img with an MBR, a FAT32 EFI System partition, and an FHFS partition. It contains the UEFI loader, kernel, and available UI and application files. Use this image for UEFI-only USB testing.
 
 5. ./make_bios_image.sh
 
-   Packages the BIOS boot stages, UEFI loader, kernel, and available UI and application files into build/usb_bios.img. This step requires the outputs from the previous scripts.
+   Packages the BIOS boot stages, UEFI loader, kernel, and available UI and application files into build/usb_bios.img. This is the recommended image for a USB drive that should support both legacy BIOS and UEFI. This step requires the outputs from the previous scripts.
 
 The order matters. make_usb_image.sh requires build/kernel.bin and build/bootloader.efi. make_bios_image.sh requires build/bios/stage1.bin, build/bios/stage2.bin, build/kernel.bin, and build/bootloader.efi.
 
@@ -62,21 +62,7 @@ Writing the Image to a USB Drive
 
 Writing a raw image overwrites the selected device. Verify the USB drive by its model and capacity before starting. Do not select the system disk.
 
-On Windows, macOS, or Linux, you can use balenaEtcher. Select build/usb_bios.img as the image, select the verified USB drive as the target, and start the flash operation. Confirm that the selected target is the USB drive because flashing erases its contents.
-
-On Linux, identify the USB device with lsblk, unmount its partitions, and write the image to the whole device, not to an individual partition:
-
-sudo dd if=build/usb_bios.img of=/dev/sdX bs=4M status=progress conv=fsync
-
-Replace /dev/sdX with the verified USB device.
-
-On macOS, identify the USB device with diskutil list, unmount it, then write to the corresponding raw device. Verify the device path before running dd:
-
-diskutil unmountDisk /dev/diskN
-sudo dd if=build/usb_bios.img of=/dev/rdiskN bs=4m
-sync
-
-Replace diskN with the verified USB device.
+On Windows, macOS, or Linux, open balenaEtcher, select "Flash from file", choose build/usb_bios.img, select the verified USB drive as the target, and click "Flash". Verify the target by its model and capacity. Flashing erases the selected drive's contents.
 
 Testing on a Real PC
 

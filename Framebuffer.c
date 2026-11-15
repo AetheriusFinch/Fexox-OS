@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include "Framebuffer.h"
+#include "FexoxDriverDisplay.h"
 #include "png.h"
 #include "debug_out.h"
 #include "AcpiControl.h"
@@ -307,6 +308,7 @@ int fb_init(const fb_info_t *info) {
 
         g_fb.front      = (uint8_t *)(uintptr_t)(info->phys_addr + DIRECT_MAP_OFFSET);
         g_fb.phys_addr  = info->phys_addr;
+        (void)fdd_init(info, g_fb.front);      /* FexoxDriverDisplay: physical side */
 
         if (info->red_mask || info->green_mask || info->blue_mask) {
             g_fb.r_shift = mask_to_shift(info->red_mask);
@@ -364,6 +366,18 @@ int fb_enable_double_buffer(void) {
     if (g_fb.mode != FB_MODE_LINEAR) return -1;
     if (g_fb.back) return 0;
 
+    /* FexoxDriverDisplay: the back buffer is the LOGICAL surface; pitch is fixed for the whole run
+       (a pointer already given to a user process stays valid when the resolution changes). */
+    uint8_t *fdd_surf = fdd_alloc_surface();
+    if (fdd_surf) {
+        g_fb.back   = fdd_surf;
+        g_fb.pitch  = fdd_surface_pitch();
+        g_fb.width  = fdd_logical_w();
+        g_fb.height = fdd_logical_h();
+        DBG_MSG("FB", "double-buffer enabled (FDD logical surface)");
+        return 0;
+    }
+
     uint64_t size = (uint64_t)g_fb.pitch * g_fb.height;
     g_fb.back = (uint8_t *)kmalloc(size);
     if (!g_fb.back) { DBG_MSG("FB", "double-buffer: kmalloc failed"); return -1; }
@@ -377,7 +391,7 @@ int fb_enable_double_buffer(void) {
 }
 
 void fb_disable_double_buffer(void) {
-    if (g_fb.back) { kfree(g_fb.back); g_fb.back = 0; }
+    if (g_fb.back && g_fb.back != fdd_surface()) { kfree(g_fb.back); g_fb.back = 0; }
 }
 
  
@@ -421,6 +435,7 @@ static void memcpy_nt(void *dst, const void *src, size_t n) {
 }
 
 void fb_flip(void) {
+    if (fdd_active()) { fdd_present(); return; }
     if (!g_fb.back || !g_fb.front) return;
      
 
@@ -447,6 +462,12 @@ void fb_flip(void) {
 static bool fb_apply_virtual_resolution(uint32_t w, uint32_t h) {
     if (g_fb.mode != FB_MODE_LINEAR) return false;
     if (!w || !h) return false;
+    if (fdd_active()) {            /* real run-time mode switch through FexoxDriverDisplay */
+        if (fdd_set_mode(w, h, fdd_rotation(), fdd_filter(), fdd_fit()) != 0) return false;
+        g_fb.width  = fdd_logical_w();
+        g_fb.height = fdd_logical_h();
+        return true;
+    }
     if (w > g_fb.native_width)  w = g_fb.native_width;
     if (h > g_fb.native_height) h = g_fb.native_height;
 
@@ -484,6 +505,7 @@ static bool fb_apply_virtual_resolution(uint32_t w, uint32_t h) {
 
 
 void fb_flip_rect(int32_t x, int32_t y, uint32_t w, uint32_t h) {
+    if (fdd_active()) { fdd_present_rect(x, y, w, h); return; }
     if (!g_fb.back || !g_fb.front) return;
     if (w == 0 || h == 0) return;
 
@@ -3580,9 +3602,116 @@ static void ui_load_mode_list(void) {
 
 
 
+/* ---- FexoxDriverDisplay glue: saved mode, rotation/scaling labels, relayout after a mode change ---- */
+#define FDD_CFG_PATH "/etc/fdd.cfg"
+extern void ui_set_mouse_pos(int32_t x, int32_t y);
+extern void ui_get_mouse_pos(int32_t *out_x, int32_t *out_y);
+
+static void fdd_cfg_save(void) {
+    if (!fdd_active()) return;
+    uint32_t v[5] = { fdd_logical_w(), fdd_logical_h(), (uint32_t)fdd_rotation(),
+                      (uint32_t)fdd_filter(), (uint32_t)fdd_fit() };
+    char b[64]; int n = 0;
+    for (int k = 0; k < 5; k++) {
+        char t[12]; int tn = 0; uint32_t x = v[k];
+        if (!x) t[tn++] = '0';
+        while (x) { t[tn++] = (char)('0' + x % 10); x /= 10; }
+        while (tn) b[n++] = t[--tn];
+        b[n++] = (k < 4) ? ' ' : '\n';
+    }
+    int fd = vfs_open(FDD_CFG_PATH, O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) fd = vfs_open("/fdd.cfg", O_WRONLY | O_CREAT | O_TRUNC);
+    if (fd < 0) { DBG_MSG("FDD", "fdd.cfg: cannot write"); return; }
+    (void)vfs_write(fd, b, (uint64_t)n);
+    vfs_close(fd);
+}
+
+/* applies "W H rot filter fit" from fdd.cfg; returns true when a mode was applied */
+static bool fdd_cfg_load(void) {
+    if (!fdd_active()) return false;
+    int fd = vfs_open(FDD_CFG_PATH, O_RDONLY);
+    if (fd < 0) fd = vfs_open("/fdd.cfg", O_RDONLY);
+    if (fd < 0) return false;
+    char b[64];
+    int64_t got = vfs_read(fd, b, sizeof(b) - 1);
+    vfs_close(fd);
+    if (got <= 0) return false;
+    b[got] = '\0';
+    uint32_t v[5] = {0, 0, 0, 0, 0}; int k = 0; int64_t i = 0;
+    while (i < got && k < 5) {
+        while (i < got && (b[i] == ' ' || b[i] == '\n' || b[i] == '\r')) i++;
+        if (i >= got || b[i] < '0' || b[i] > '9') break;
+        uint32_t x = 0;
+        while (i < got && b[i] >= '0' && b[i] <= '9') { x = x * 10u + (uint32_t)(b[i] - '0'); i++; }
+        v[k++] = x;
+    }
+    if (k < 5) return false;
+    if (fdd_set_mode(v[0], v[1], (int)v[2], (int)v[3], (int)v[4]) != 0) return false;
+    g_fb.width = fdd_logical_w();
+    g_fb.height = fdd_logical_h();
+    (void)res_add(g_fb.width, g_fb.height);
+    return true;
+}
+
+static const char *fdd_rot_label(void) {
+    static const char *const l[4] = { "0 deg", "90 deg", "180 deg", "270 deg" };
+    return l[fdd_rotation() & 3];
+}
+static int fdd_scale_idx(void) {
+    return (fdd_filter() == FDD_FILTER_BILINEAR ? 0 : 1) + (fdd_fit() == FDD_FIT_STRETCH ? 2 : 0);
+}
+static const char *fdd_scale_label(void) {
+    static const char *const l[4] = { "Smooth", "Sharp", "Smooth fill", "Sharp fill" };
+    return l[fdd_scale_idx() & 3];
+}
+static void fdd_apply_scale_idx(int i) {
+    (void)fdd_set_filter((i & 1) ? FDD_FILTER_NEAREST : FDD_FILTER_BILINEAR,
+                         (i & 2) ? FDD_FIT_STRETCH : FDD_FIT_LETTERBOX);
+}
+
+/* After the logical resolution / rotation changed: keep windows and the pointer on screen, redraw. */
+static void ui_after_mode_change(void) {
+    g_fb.width  = fdd_logical_w();
+    g_fb.height = fdd_logical_h();
+    int32_t usable_h = (int32_t)((g_fb.height > TASKBAR_H) ? g_fb.height - TASKBAR_H : g_fb.height);
+    for (int i = 0; i < (int)UI_MAX_WINDOWS; i++) {
+        ui_window_t *w = &g_windows[i];
+        if (!w->used || !w->open) continue;
+        if (w->x + (int32_t)w->w > (int32_t)g_fb.width) w->x = (int32_t)g_fb.width - (int32_t)w->w;
+        if (w->y + (int32_t)w->h > usable_h)            w->y = usable_h - (int32_t)w->h;
+        if (w->x < 0) w->x = 0;
+        if (w->y < 0) w->y = 0;
+        w->redraw_gen++;                       /* user-space windows repaint themselves */
+    }
+    int32_t mx, my;
+    ui_get_mouse_pos(&mx, &my);
+    ui_set_mouse_pos(mx, my);                  /* clamps to the new logical size */
+    ui_draw_desktop();
+}
+
 static void ui_load_persisted_resolution(void) {
     ui_load_mode_list();
-    (void)res_add(g_fb.native_width, g_fb.native_height);    
+    (void)res_add(g_fb.native_width, g_fb.native_height);
+    if (fdd_active()) {
+        uint32_t sm[16][2];
+        int n = fdd_standard_modes(sm, 16);
+        for (int i = 0; i < n; i++) (void)res_add(sm[i][0], sm[i][1]);
+        uint32_t mw, mh; fdd_surface_max(&mw, &mh);
+        int o = 0;                              /* drop modes the surface cannot hold */
+        for (int i = 0; i < g_res_count; i++) {
+            const ui_resolution_t *r = &g_resolutions[i];
+            if (r->w < FDD_MIN_W || r->h < FDD_MIN_H || r->w > mw || r->h > mh) continue;
+            if (o != i) g_resolutions[o] = g_resolutions[i];
+            o++;
+        }
+        g_res_count = o;
+        (void)fdd_cfg_load();
+        res_sort();
+        int cur = res_find(g_fb.width, g_fb.height);
+        g_res_cur_idx = (cur >= 0) ? cur : 0;
+        g_res_idx     = g_res_cur_idx;
+        return;
+    }
     res_sort();
     int cur = res_find(g_fb.native_width, g_fb.native_height);
     g_res_cur_idx = (cur >= 0) ? cur : 0;
@@ -3639,7 +3768,7 @@ static void res_show_message(const char *msg) {
     fb_flip();
 }
 
-static void apply_resolution(int idx) {
+static void apply_resolution_legacy(int idx) {
     if (idx < 0 || idx >= g_res_count) return;
     const ui_resolution_t *r = &g_resolutions[idx];
 
@@ -3673,6 +3802,18 @@ static void apply_resolution(int idx) {
     fb_apply_virtual_resolution(r->w, r->h);
     ui_draw_desktop();
 }
+static void apply_resolution(int idx) {
+    if (idx < 0 || idx >= g_res_count) return;
+    if (!fdd_active()) { apply_resolution_legacy(idx); return; }
+    const ui_resolution_t *r = &g_resolutions[idx];
+    if (fdd_set_mode(r->w, r->h, fdd_rotation(), fdd_filter(), fdd_fit()) != 0) {
+        DBG_MSG("UI", "resolution: FDD refused the mode");
+        return;
+    }
+    g_res_idx = g_res_cur_idx = idx;
+    ui_after_mode_change();
+    fdd_cfg_save();
+}
 
  
 
@@ -3687,11 +3828,13 @@ static void apply_resolution(int idx) {
 
 
 #define THEME_WIN_W          300u
-#define THEME_WIN_H          196u
+#define THEME_WIN_H          276u
 
 #define THEME_ROW_THEME          0
 #define THEME_ROW_DISPLAY        1
-#define THEME_ROW_COUNT           2
+#define THEME_ROW_ROTATE         3
+#define THEME_ROW_SCALE          4
+#define THEME_ROW_COUNT          5
 
 #define THEME_LABEL_X          16
 #define THEME_ROW_Y             16    
@@ -3710,6 +3853,8 @@ static void apply_resolution(int idx) {
 
 
 static const char *theme_row_label(int row) {
+    if (row == THEME_ROW_ROTATE) return "Rotate";
+    if (row == THEME_ROW_SCALE)  return "Scaling";
     return (row == THEME_ROW_DISPLAY) ? "Display" : "Theme";
 }
 
@@ -3790,6 +3935,10 @@ static void theme_win_draw(int win_id) {
 
     theme_row_draw(win_id, THEME_ROW_THEME,   g_themes[g_theme_idx].name);
     theme_row_draw(win_id, THEME_ROW_DISPLAY, g_resolutions[g_res_idx].label);
+    if (fdd_active()) {
+        theme_row_draw(win_id, THEME_ROW_ROTATE, fdd_rot_label());
+        theme_row_draw(win_id, THEME_ROW_SCALE,  fdd_scale_label());
+    }
 
      
 
@@ -3797,7 +3946,7 @@ static void theme_win_draw(int win_id) {
     theme_apply_rect(win_id, &bx, &by, &bw, &bh);
     bool pending = (g_res_idx != g_res_cur_idx);
     fb_color_t bg = pending ? 0x2266CCU : 0xB0B0B0U;
-    const char *txt = pending ? "Apply & restart" : "Current mode";
+    const char *txt = pending ? (fdd_active() ? "Apply" : "Apply & restart") : "Current mode";
     fb_fill_rect(bx, by, bw, bh, bg);
     fb_draw_rect(bx, by, bw, bh, THEME_BOX_BORDER, 1);
     int32_t ttw = (int32_t)fb_text_width(txt);
@@ -3815,6 +3964,19 @@ static void theme_win_handle_click(int win_id, int32_t x, int32_t y) {
     if (point_in_rect(x, y, ax, ay, aw, ah)) {
         apply_theme((g_theme_idx + 1) % UI_THEME_COUNT);
         return;
+    }
+    if (fdd_active()) {
+        theme_arrow_rect(win_id, THEME_ROW_ROTATE, &ax, &ay, &aw, &ah);
+        if (point_in_rect(x, y, ax, ay, aw, ah)) {
+            if (fdd_set_rotation((fdd_rotation() + 1) & 3) == 0) { ui_after_mode_change(); fdd_cfg_save(); }
+            return;
+        }
+        theme_arrow_rect(win_id, THEME_ROW_SCALE, &ax, &ay, &aw, &ah);
+        if (point_in_rect(x, y, ax, ay, aw, ah)) {
+            fdd_apply_scale_idx((fdd_scale_idx() + 1) & 3);
+            ui_after_mode_change(); fdd_cfg_save();
+            return;
+        }
     }
 
     theme_arrow_rect(win_id, THEME_ROW_DISPLAY, &ax, &ay, &aw, &ah);

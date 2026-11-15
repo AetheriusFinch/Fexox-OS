@@ -38,18 +38,23 @@ $CC $CFLAGS_KERN -c Scheduler.c        -o build/Scheduler.o
 $CC $CFLAGS_KERN -c Syscall.c          -o build/Syscall.o
 $CC $CFLAGS_KERN -c VFS.c              -o build/VFS.o
 $CC $CFLAGS_KERN -c FAT32.c            -o build/FAT32.o
+$CC ${CFLAGS_KERN/-O0/-O2} -c FexoxHybridFS.c   -o build/FexoxHybridFS.o
+$CC $CFLAGS_KERN -c Storage.c          -o build/Storage.o
 $CC $CFLAGS_KERN -c IDE.c              -o build/IDE.o
 $CC $CFLAGS_KERN -c AHCI.c             -o build/AHCI.o
 $CC $CFLAGS_KERN -c NVMe.c             -o build/NVMe.o
 $CC $CFLAGS_KERN -c klibc.c            -o build/klibc.o
 $CC $CFLAGS_KERN -c ELF64.c            -o build/ELF64.o
 $CC $CFLAGS_KERN -c Framebuffer.c      -o build/Framebuffer.o
+# FexoxDriverDisplay: software scaler/rotator, hot pixel loops -> -O2
+$CC ${CFLAGS_KERN/-O0/-O2} -c FexoxDriverDisplay.c -o build/FexoxDriverDisplay.o
 $CC $CFLAGS_KERN -c png.c              -o build/png.o
 $CC $CFLAGS_KERN -c ui_extra.c         -o build/ui_extra.o
 $CC $CFLAGS_KERN -c PS2Mouse.c         -o build/PS2Mouse.o
 $CC $CFLAGS_KERN -c AcpiControl.c      -o build/AcpiControl.o
 $CC $CFLAGS_KERN -c Resources/fxapp.c  -o build/fxapp.o
 $CC $CFLAGS_KERN -c Resources/USB.c    -o build/USB.o
+$CC $CFLAGS_KERN -c Resources/UsbDiag.c -o build/UsbDiag.o
 $CC $CFLAGS_KERN -c Resources/xHCI.c  -o build/xHCI.o
 $CC $CFLAGS_KERN -c Resources/UHCI.c   -o build/UHCI.o
 $CC $CFLAGS_KERN -c Resources/EHCI.c   -o build/EHCI.o
@@ -79,18 +84,22 @@ $LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
     build/Syscall.o        \
     build/VFS.o            \
     build/FAT32.o          \
+    build/FexoxHybridFS.o  \
+    build/Storage.o        \
     build/IDE.o            \
     build/AHCI.o           \
     build/NVMe.o           \
     build/klibc.o          \
     build/ELF64.o          \
     build/Framebuffer.o    \
+    build/FexoxDriverDisplay.o \
     build/png.o            \
     build/ui_extra.o        \
     build/PS2Mouse.o        \
 	build/AcpiControl.o     \
 	build/fxapp.o           \
     build/USB.o             \
+    build/UsbDiag.o         \
     build/xHCI.o            \
     build/UHCI.o            \
     build/EHCI.o             \
@@ -193,26 +202,53 @@ if command -v mformat >/dev/null; then
 
 
 
-    echo "[*] Диск build/data.img (virtio-blk data disk)..."
-    dd if=/dev/zero of=build/data.img bs=1M count=64 status=none
-    mformat -i build/data.img -F -v FEXDATA ::
+    echo "[*] Диск build/data.img (virtio-blk): MBR, p1 = FAT32 (boot/seed), p2 = FHFS (тип 0xDA)..."
+    DATA_IMG="build/data.img"
+    P1_START=2048;   P1_SECT=131072
+    P2_START=133120; P2_SECT=524288
+    DATA_MB=321
+    DATA_FAT="$DATA_IMG@@$((P1_START * 512))"
+
+    le32() {
+        printf "$(printf '\\x%02x\\x%02x\\x%02x\\x%02x' $(($1 & 255)) $((($1 >> 8) & 255)) $((($1 >> 16) & 255)) $((($1 >> 24) & 255)))"
+    }
+
+    NEED_NEW=1
+    if [ -f "$DATA_IMG" ] && [ "$(stat -c%s "$DATA_IMG")" = "$((DATA_MB * 1024 * 1024))" ]; then
+        NEED_NEW=0
+    fi
+    if [ "$NEED_NEW" = "1" ]; then
+        rm -f "$DATA_IMG"
+        dd if=/dev/zero of="$DATA_IMG" bs=1M count=0 seek=$DATA_MB status=none
+        {
+            head -c 446 /dev/zero
+            printf '\x00\xfe\xff\xff\x0c\xfe\xff\xff'; le32 $P1_START; le32 $P1_SECT
+            printf '\x00\xfe\xff\xff\xda\xfe\xff\xff'; le32 $P2_START; le32 $P2_SECT
+            head -c 32 /dev/zero
+            printf '\x55\xaa'
+        } | dd of="$DATA_IMG" conv=notrunc status=none
+        echo "[OK] новый $DATA_IMG (FHFS-раздел будет создан при первой загрузке)"
+    fi
+    mformat -i "$DATA_FAT" -F -T $P1_SECT -h 255 -s 63 -v FEXDATA ::
+    echo "Fexox OS seed volume" > build/FEXOX.SEED
+    mcopy -o -i "$DATA_FAT" build/FEXOX.SEED ::FEXOX.SEED
 
 
     if [ -f "init" ]; then
         echo "[*] Добавляем /init на data.img..."
-        mcopy -i build/data.img init ::init
+        mcopy -i "$DATA_FAT" init ::init
         echo "[OK] /init добавлен"
     fi
 
-    echo "[OK] build/data.img готов"
+    echo "[OK] $DATA_IMG готов"
 
 
     if [ -d "UI" ]; then
         echo "[*] Добавляем папку UI/ на data.img..."
-        mmd -i build/data.img ::UI 2>/dev/null || true
+        mmd -i "$DATA_FAT" ::UI 2>/dev/null || true
         for f in UI/*; do
             [ -f "$f" ] || continue
-            mcopy -i build/data.img "$f" "::UI/$(basename "$f")"
+            mcopy -i "$DATA_FAT" "$f" "::UI/$(basename "$f")"
             echo "[OK] $f -> ::UI/$(basename "$f")"
         done
     else
@@ -224,10 +260,10 @@ if command -v mformat >/dev/null; then
 
     if [ -d "APPS" ]; then
         echo "[*] Добавляем папку APPS/ на data.img..."
-        mmd -i build/data.img ::APPS 2>/dev/null || true
+        mmd -i "$DATA_FAT" ::APPS 2>/dev/null || true
         for f in APPS/*; do
             [ -f "$f" ] || continue
-            mcopy -i build/data.img "$f" "::APPS/$(basename "$f")"
+            mcopy -i "$DATA_FAT" "$f" "::APPS/$(basename "$f")"
             echo "[OK] $f -> ::APPS/$(basename "$f")"
         done
     else
@@ -237,20 +273,20 @@ if command -v mformat >/dev/null; then
 
 
 
-    mmd -i build/data.img ::APPS 2>/dev/null || true
+    mmd -i "$DATA_FAT" ::APPS 2>/dev/null || true
     if [ -f build/calc.elf ]; then
-        mcopy -o -i build/data.img build/calc.elf ::APPS/calc.elf
+        mcopy -o -i "$DATA_FAT" build/calc.elf ::APPS/calc.elf
         echo "[OK] build/calc.elf -> ::APPS/calc.elf"
     fi
 
-    mcopy -i build/data.img build/syslogs.elf ::APPS/syslogs.elf
+    mcopy -i "$DATA_FAT" build/syslogs.elf ::APPS/syslogs.elf
     echo "[OK] build/syslogs.elf -> ::APPS/syslogs.elf"
 
-    mcopy -i build/data.img build/browser.elf ::APPS/browser.elf
+    mcopy -i "$DATA_FAT" build/browser.elf ::APPS/browser.elf
     echo "[OK] build/browser.elf -> ::APPS/browser.elf"
 
     if [ "$MUSL_OK" = "1" ]; then
-        mcopy -i build/data.img build/musltest.elf ::APPS/musltest.elf
+        mcopy -i "$DATA_FAT" build/musltest.elf ::APPS/musltest.elf
         echo "[OK] build/musltest.elf -> ::APPS/musltest.elf"
     fi
 else
@@ -258,4 +294,16 @@ else
 fi
 
 echo "[+] build/kernel.bin  build/bootloader.efi  build/esp.img  build/data.img  build/calc.elf  build/syslogs.elf  build/browser.elf"
+if [ "${BUILD_USB_IMG:-1}" = "1" ] && [ -f make_usb_image.sh ] && command -v mformat >/dev/null; then
+    echo "[*] Creating build/usb.img for USB..."
+    QUIET=1 bash ./make_usb_image.sh | tail -n 3
+fi
+
+if [ "${BUILD_BIOS_IMG:-1}" = "1" ] && [ -f build_bios.sh ] && [ -f make_bios_image.sh ] && [ -f BIOS/stage1.S ] && command -v mformat >/dev/null; then
+    echo "[*] Creating build/usb_bios.img (BIOS + UEFI)..."
+    if bash ./build_bios.sh >/dev/null && QUIET=1 bash ./make_bios_image.sh | tail -n 3; then :; else
+        echo "[!] usb_bios.img was not created (see build_bios.sh). This is not a fatal error."
+    fi
+fi
+
 echo "=== Готово ==="

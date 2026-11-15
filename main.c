@@ -9,12 +9,14 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include "debug_out.h"
+#include "UsbDiag.h"
 #include "Scheduler.h"
 #include "VFS.h"
 #include "ELF64.h"
 #include "Syscall.h"
 #include "Framebuffer.h"
 #include "ui_extra.h"
+#include "Storage.h"
 #include "PS2Mouse.h"
 #include "USB.h"           
 #include "Network/net.h"   
@@ -83,6 +85,7 @@ extern blkdev_t *nvme_find_drive(const char *name);
 
 
 extern void usb_init(void);
+extern void usb_hotplug_poll(void);
 
 typedef struct __attribute__((packed)) {
     uint64_t magic;
@@ -173,6 +176,15 @@ static void kout_dec(const char *label, uint64_t v) {
     while (n > 0) out[o++] = t[--n];
     out[o] = '\0';
     kout(label); kout(out); kout("\n");
+}
+/* kout + copy into the diagnostic ring (partial pieces are joined until '\n') */
+static char g_klog_line[96]; static int g_klog_len;
+static void klog(const char *s) {
+    kout(s);
+    for (; *s; s++) {
+        if (*s == '\n') { g_klog_line[g_klog_len] = 0; if (g_klog_len) usbdiag_log("BOOT", g_klog_line, 0, 0); g_klog_len = 0; }
+        else if (g_klog_len < 90) g_klog_line[g_klog_len++] = *s;
+    }
 }
 static void kout_hex16(uint16_t v) {
     static const char hx[] = "0123456789ABCDEF";
@@ -281,8 +293,11 @@ void fexox_os_isr_heartbeat(void) {
 
     uint32_t kf = 0; uint64_t ks = 0, ku = 0;
     kmalloc_get_diag(&kf, &ks, &ku);
-    d = dbg_s(b, "km fail="); d = dbg_u(d, kf);
-    d = dbg_s(d, " sz="); d = dbg_u(d, ks);
+    /* Self-explanatory allocator status (the old "sz=0" looked like a fault to readers:
+       it only meant "size of the last FAILED allocation: none"). */
+    d = dbg_s(b, kf ? "heap FAIL" : "heap OK");
+    d = dbg_s(d, " fails="); d = dbg_u(d, kf);
+    d = dbg_s(d, " last_fail="); if (kf) d = dbg_u(d, ks); else d = dbg_s(d, "none");
     d = dbg_s(d, " used="); d = dbg_u(d, ku / 1024u); d = dbg_s(d, "K");
     d = dbg_s(d, " wp="); d = dbg_i(d, fexox_os_dbg_wp_reason);
     d = dbg_s(d, "/"); d = dbg_i(d, fexox_os_dbg_wp_rc);
@@ -359,201 +374,8 @@ static int ps2_controller_present(void) {
 
 
 
-typedef struct { blkdev_t *base; uint64_t first_lba; } part_priv_t;
+/* Volume discovery / mounting lives in Storage.c (FHFS root, FAT32 for removable media). */
 
-static int part_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf) {
-    part_priv_t *p = (part_priv_t *)dev->priv;
-    if (lba + count > dev->sector_count) return VFS_ERR_OVERFLOW;
-     
-
-
-    return p->base->ops->read_sectors(p->base, p->first_lba + lba, count, buf);
-}
-static int part_write(blkdev_t *dev, uint64_t lba, uint32_t count, const void *buf) {
-    part_priv_t *p = (part_priv_t *)dev->priv;
-    if (lba + count > dev->sector_count) return VFS_ERR_OVERFLOW;
-    return p->base->ops->write_sectors(p->base, p->first_lba + lba, count, buf);
-}
-static void part_destroy(blkdev_t *dev) { (void)dev; }
-static blkdev_ops_t g_part_ops = { part_read, part_write, part_destroy };
-
-#define BOOT_MAX_PARTS 4
-static blkdev_t    g_part_dev[BOOT_MAX_PARTS * 2];
-static part_priv_t g_part_priv[BOOT_MAX_PARTS * 2];
-static int         g_part_used = 0;
-
-static uint32_t rd_le32(const uint8_t *p) {
-    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
-}
-static uint64_t rd_le64(const uint8_t *p) {
-    return (uint64_t)rd_le32(p) | ((uint64_t)rd_le32(p + 4) << 32);
-}
-
- 
-static int sector_is_fat_bpb(const uint8_t *s) {
-    if (s[510] != 0x55 || s[511] != 0xAA) return 0;
-    if (s[0] != 0xEB && s[0] != 0xE9) return 0;               
-    uint16_t bps = (uint16_t)(s[11] | (s[12] << 8));
-    if (bps != 512 && bps != 1024 && bps != 2048 && bps != 4096) return 0;
-    uint8_t spc = s[13];
-    if (spc == 0 || (spc & (spc - 1))) return 0;               
-    if (s[16] == 0) return 0;                                  
-    return 1;
-}
-
-static int root_has_boot_marker(void) {
-    vfs_stat_t st;
-    static const char *marks[] = { "/kernel.bin", "/EFI", "/UI", "/APPS", NULL };
-    for (int i = 0; marks[i]; i++)
-        if (vfs_stat(marks[i], &st) == VFS_OK) return 1;
-    return 0;
-}
-
- 
-static int try_mount_root(blkdev_t *dev) {
-    int r = vfs_mount(dev->name, "fat32", "/", 0);
-    if (r != VFS_OK) {
-        kout("  FAT32 mount failed: "); kout(dev->name); kout("\n");
-        return 0;
-    }
-    if (!root_has_boot_marker()) {
-        kout("  no kernel.bin/EFI/UI on "); kout(dev->name); kout(" - not our boot volume, unmounted\n");
-        vfs_umount("/");
-        return 0;
-    }
-    kout("[OK] / mounted (FAT32, dev="); kout(dev->name); kout(")\n");
-    return 1;
-}
-
-static int mount_boot_volume(blkdev_t *bd) {
-    uint32_t ss = bd->sector_size ? bd->sector_size : 512u;
-    if (ss > 4096u) { kout("  sector size > 4096, skip\n"); return 0; }
-
-    uint8_t *sec = (uint8_t *)kmalloc(4096);
-    if (!sec) return 0;
-
-    if (blkdev_read(bd, 0, 1, sec) != VFS_OK) {
-        kout("  read LBA 0 failed on "); kout(bd->name); kout("\n");
-        kfree(sec);
-        return 0;
-    }
-
-    int mounted = 0;
-
-    if (sector_is_fat_bpb(sec)) {
-         
-        kout("  layout: FAT32 without partition table\n");
-        kfree(sec);
-        return try_mount_root(bd);
-    }
-
-    if (sec[510] != 0x55 || sec[511] != 0xAA) {
-        kout("  no FAT and no MBR/GPT signature on "); kout(bd->name); kout("\n");
-        kfree(sec);
-        return 0;
-    }
-
-     
-    uint64_t starts[BOOT_MAX_PARTS], sizes[BOOT_MAX_PARTS];
-    int ncand = 0;
-    int is_gpt = 0;
-    for (int i = 0; i < 4; i++)
-        if (sec[0x1BE + 16 * i + 4] == 0xEE) is_gpt = 1;
-
-    if (!is_gpt) {
-        kout("  layout: MBR\n");
-        for (int i = 0; i < 4 && ncand < BOOT_MAX_PARTS; i++) {
-            const uint8_t *e = sec + 0x1BE + 16 * i;
-            uint8_t type = e[4];
-            if (type != 0x0B && type != 0x0C && type != 0xEF) continue;    
-            uint32_t lba = rd_le32(e + 8), n = rd_le32(e + 12);
-            if (lba == 0 || n == 0) continue;
-            starts[ncand] = lba; sizes[ncand] = n; ncand++;
-        }
-    } else {
-        kout("  layout: GPT\n");
-        if (blkdev_read(bd, 1, 1, sec) == VFS_OK && sec[0] == 'E' && sec[1] == 'F' && sec[2] == 'I' &&
-            sec[3] == ' ' && sec[4] == 'P' && sec[5] == 'A' && sec[6] == 'R' && sec[7] == 'T') {
-            uint64_t ent_lba = rd_le64(sec + 72);
-            uint32_t nent    = rd_le32(sec + 80);
-            uint32_t esz     = rd_le32(sec + 84);
-            if (nent > 128) nent = 128;
-            if (esz >= 128 && esz <= 512 && ent_lba != 0) {
-                 
-
-
-                static const uint8_t g_esp[16]  = {0x28,0x73,0x2A,0xC1,0x1F,0xF8,0xD2,0x11,0xBA,0x4B,0x00,0xA0,0xC9,0x3E,0xC9,0x3B};
-                static const uint8_t g_data[16] = {0xA2,0xA0,0xD0,0xEB,0xE5,0xB9,0x33,0x44,0x87,0xC0,0x68,0xB6,0xB7,0x26,0x99,0xC7};
-                uint64_t cur_sector = (uint64_t)-1;
-                for (uint32_t i = 0; i < nent && ncand < BOOT_MAX_PARTS; i++) {
-                    uint64_t byte_off = (uint64_t)i * esz;
-                    uint64_t s_lba = ent_lba + byte_off / ss;
-                    uint32_t in_s  = (uint32_t)(byte_off % ss);
-                    if (in_s + esz > ss) continue;    
-                    if (s_lba != cur_sector) {
-                        if (blkdev_read(bd, s_lba, 1, sec) != VFS_OK) break;
-                        cur_sector = s_lba;
-                    }
-                    const uint8_t *e = sec + in_s;
-                    int is_esp = 1, is_data = 1;
-                    for (int k = 0; k < 16; k++) {
-                        if (e[k] != g_esp[k])  is_esp = 0;
-                        if (e[k] != g_data[k]) is_data = 0;
-                    }
-                    if (!is_esp && !is_data) continue;
-                    uint64_t first = rd_le64(e + 32), last = rd_le64(e + 40);
-                    if (first == 0 || last < first) continue;
-                    starts[ncand] = first; sizes[ncand] = last - first + 1; ncand++;
-                }
-            }
-        } else {
-            kout("  GPT header not found\n");
-        }
-    }
-    kfree(sec);
-
-    if (ncand == 0) { kout("  no FAT partitions found\n"); return 0; }
-
-    for (int i = 0; i < ncand && !mounted; i++) {
-        if (starts[i] + sizes[i] > bd->sector_count) continue;    
-        if (g_part_used >= BOOT_MAX_PARTS * 2) break;
-
-        blkdev_t   *pd = &g_part_dev[g_part_used];
-        part_priv_t *pp = &g_part_priv[g_part_used];
-        g_part_used++;
-
-        pp->base = bd; pp->first_lba = starts[i];
-        int nl = 0;
-        for (const char *q = bd->name; *q && nl < 20; q++) pd->name[nl++] = *q;
-        pd->name[nl++] = 'p'; pd->name[nl++] = (char)('1' + i); pd->name[nl] = '\0';
-        pd->sector_size  = bd->sector_size;
-        pd->sector_count = sizes[i];
-        pd->priv         = pp;
-        pd->ops          = &g_part_ops;
-        pd->readonly     = bd->readonly;
-
-        if (blkdev_register(pd) < 0) { kout("  blkdev_register failed for partition\n"); break; }
-        kout("  trying partition "); kout(pd->name); kout("\n");
-        mounted = try_mount_root(pd);
-    }
-    return mounted;
-}
-
- 
-
-
-
-
-
-
-
-
-
-
-
-
-
- 
 typedef struct __attribute__((packed)) {
     uint32_t reserved0;
     uint64_t rsp0;        
@@ -1117,7 +939,7 @@ void kernel_entry(BOOT_INFO *info) {
     kout("[OK] vfs\n");
 
      
-    fat32_register();
+    /* fhfs_register()/fat32_register() are called inside storage_init() */
 
      
 
@@ -1260,40 +1082,8 @@ void kernel_entry(BOOT_INFO *info) {
 
 
     {
-        int mounted = 0;
-
-         
-
-        static const char *usb_devs[] = { "uda", "udb", "udc", "udd", NULL };
-        for (int di = 0; usb_devs[di] != NULL && !mounted; di++) {
-            blkdev_t *bd = blkdev_find(usb_devs[di]);
-            if (!bd) continue;
-            kout("[BOOT] USB disk "); kout(usb_devs[di]); kout("\n");
-            DBG_MSG("KR", "24 mount boot volume from USB...");
-            mounted = mount_boot_volume(bd);
-        }
-
-         
-        if (!mounted && blkdev_find("vda")) {
-            DBG_MSG("KR", "24 vfs_mount / (vda)...");
-             
-
-
-
-            blkdev_t *vd = blkdev_find("vda");
-            if (mount_boot_volume(vd)) {
-                mounted = 1;
-            } else {
-                ret = vfs_mount("vda", "fat32", "/", 0);
-                if (ret == 0) {
-                    kout("[OK] / mounted (FAT32, dev=vda)\n");
-                    mounted = 1;
-                } else {
-                    kprint_err("[WARN] vfs_mount failed for vda", ret);
-                }
-            }
-        }
-
+        /* FHFS is the system root; FAT32 volumes (USB flash, boot ESP) go to /boot and /mnt/<dev>. */
+        int mounted = storage_init(klog);
         if (mounted) {
              
             int dfd = vfs_open("/", O_DIRECTORY);
@@ -1339,9 +1129,34 @@ void kernel_entry(BOOT_INFO *info) {
                 kout("  -> no xHCI/EHCI/UHCI controller came up\n");
             else if (us->msc == 0)
                 kout("  -> flash drive not seen as mass storage; try another USB 2.0 port\n");
-            ehci_diag_dump(kout);
-            kout("Continuing in 60 s...\n");
-            usb_delay_ms(60000);
+            {
+                extern void xhci_diag_dump(void (*out)(const char *));
+                extern void fbcon_clear(void);
+                #ifndef FEXOX_DIAG_PAGE_SEC
+                #define FEXOX_DIAG_PAGE_SEC 25
+                #endif
+                const uint32_t pg = FEXOX_DIAG_PAGE_SEC * 1000u;
+                kout("Page 1/5 (summary). Photograph every page; next in "); kout_dec("", FEXOX_DIAG_PAGE_SEC);
+                usb_delay_ms(pg);
+
+                fbcon_clear(); kout("=== DIAG 2/5: xHCI controller + root ports ===\n");
+                xhci_diag_dump(kout);
+                ehci_diag_dump(kout);
+                usb_delay_ms(pg);
+
+                fbcon_clear(); kout("=== DIAG 3/5: USB event log (newest at bottom) ===\n");
+                usbdiag_dump(kout, USBDIAG_VIEW_USB, 24);
+                usb_delay_ms(pg);
+
+                fbcon_clear(); kout("=== DIAG 4/5: USB event log, older part ===\n");
+                usbdiag_dump(kout, USBDIAG_VIEW_USB, 52);          /* 52 newest; first lines = older */
+                usb_delay_ms(pg);
+
+                fbcon_clear(); kout("=== DIAG 5/5: storage / mount log ===\n");
+                usbdiag_dump(kout, USBDIAG_VIEW_STORAGE, 24);
+                kout("(+ms since first log line; value after ': 0x' is hex)\n");
+                usb_delay_ms(pg);
+            }
         }
     }
 
@@ -1390,6 +1205,7 @@ skip_fs:;
         DBG_PANIC("KR", "sched_init");
     }
     kout("[OK] scheduler\n");
+    if (storage_start_services() != 0) kout("[WARN] storage services not fully started\n");
     DBG_MSG("KR", "19 sched ok");
     boot_mark("stage 6: sched ok");
 

@@ -29,6 +29,16 @@
 #define VFS_ERR_OVERFLOW (-14)  
 #define VFS_ERR_CORRUPT (-15)   
 #define VFS_ERR_UNSUP   (-16)   
+#define VFS_ERR_LOOP    (-17)   /* too many symbolic links      -> ELOOP        */
+#define VFS_ERR_ACCES   (-18)   /* permission denied            -> EACCES       */
+#define VFS_ERR_PERM    (-19)   /* operation not permitted      -> EPERM        */
+#define VFS_ERR_NAMETOOLONG (-20)
+#define VFS_ERR_NODATA  (-21)   /* no such xattr                -> ENODATA      */
+#define VFS_ERR_RANGE   (-22)   /* buffer too small             -> ERANGE       */
+#define VFS_ERR_XDEV    (-23)   /* cross-device link            -> EXDEV        */
+#define VFS_ERR_NOTEMPTY (-24)  /* directory not empty          -> ENOTEMPTY    */
+#define VFS_ERR_MLINK   (-25)   /* too many links               -> EMLINK       */
+#define VFS_ERR_2BIG    (-26)
 
  
 
@@ -56,7 +66,7 @@
 #define VFS_MAX_PATH      4096
 #define VFS_MAX_FD        256     
 #define VFS_MAX_MOUNTS    16
-#define VFS_MAX_BLKDEVS   8
+#define VFS_MAX_BLKDEVS   24
 
  
 
@@ -103,6 +113,8 @@ typedef struct blkdev_ops {
                          uint32_t count, const void *buf);
      
     void (*destroy)(struct blkdev *dev);
+     /* optional: write-back cache flush (NULL = device has no volatile cache / unsupported) */
+    int (*flush)(struct blkdev *dev);
 } blkdev_ops_t;
 
  
@@ -120,6 +132,10 @@ int  blkdev_register(blkdev_t *dev);
 
  
 blkdev_t *blkdev_find(const char *name);
+
+/* enumeration of registered block devices (Storage.c) */
+int       blkdev_count(void);
+blkdev_t *blkdev_at(int idx);
 
  
 int blkdev_read(blkdev_t *dev, uint64_t lba, uint32_t count, void *buf);
@@ -165,6 +181,9 @@ typedef struct vfs_node_ops {
 
      
     int (*truncate)(struct vfs_node *node, uint64_t new_size);
+
+     
+    const struct vfs_node_xops *x;     /* optional POSIX extensions (NULL = plain FAT-like fs) */
 } vfs_node_ops_t;
 
  
@@ -277,5 +296,99 @@ int fat32_register(void);
 
 
 int virtio_blk_init(void);
+
+
+ 
+
+/* ===================== POSIX layer: credentials, attributes, symlinks, xattr ===================== */
+
+#define VFS_PERM_X  1u
+#define VFS_PERM_W  2u
+#define VFS_PERM_R  4u
+
+typedef struct {
+    uint32_t uid, gid, euid, egid;    /* real / effective ids of the calling process */
+    uint32_t umask;
+    uint32_t ngroups;
+    uint32_t groups[32];              /* supplementary groups */
+} vfs_cred_t;
+
+/* The syscall layer registers a function returning the credentials of the current process.
+   Without a provider (early boot, kernel threads) every caller is root. */
+void              vfs_set_cred_provider(const vfs_cred_t *(*fn)(void));
+const vfs_cred_t *vfs_cred(void);
+
+typedef struct {
+    uint64_t ino, size, blocks;                 /* blocks in 512-byte units */
+    uint64_t rdev;
+    uint64_t atime_ns, mtime_ns, ctime_ns, btime_ns;
+    uint32_t mode, uid, gid, nlink, blksize, dev;
+} vfs_attr_t;
+
+#define VFS_SET_MODE  0x01u
+#define VFS_SET_UID   0x02u
+#define VFS_SET_GID   0x04u
+#define VFS_SET_SIZE  0x08u
+#define VFS_SET_ATIME 0x10u
+#define VFS_SET_MTIME 0x20u
+typedef struct {
+    uint32_t valid;
+    uint32_t mode, uid, gid;
+    uint64_t size, atime_ns, mtime_ns;
+} vfs_setattr_t;
+
+/* Optional table of a filesystem with full POSIX semantics (FexoxHybridFS). */
+typedef struct vfs_node_xops {
+    int (*getattr)(struct vfs_node *n, vfs_attr_t *out);
+    int (*setattr)(struct vfs_node *n, const vfs_setattr_t *sa, const vfs_cred_t *cr);
+    int (*permission)(struct vfs_node *n, const vfs_cred_t *cr, uint32_t want);   /* VFS_PERM_* */
+    int (*create2)(struct vfs_node *parent, const char *name, uint32_t mode, uint64_t rdev,
+                   const vfs_cred_t *cr, struct vfs_node **out);                  /* mode incl. S_IF* */
+    int (*symlink)(struct vfs_node *parent, const char *name, const char *target,
+                   const vfs_cred_t *cr, struct vfs_node **out);
+    int (*readlink)(struct vfs_node *n, char *buf, size_t sz);                    /* returns length */
+    int (*link)(struct vfs_node *parent, const char *name, struct vfs_node *target, const vfs_cred_t *cr);
+    int (*unlink2)(struct vfs_node *parent, const char *name, const vfs_cred_t *cr, int rmdir);
+    int (*rename)(struct vfs_node *od, const char *on, struct vfs_node *nd, const char *nn,
+                  const vfs_cred_t *cr);
+    int (*getxattr)(struct vfs_node *n, const char *name, void *buf, size_t sz);
+    int (*setxattr)(struct vfs_node *n, const char *name, const void *val, size_t sz, int flags);
+    int (*listxattr)(struct vfs_node *n, char *buf, size_t sz);
+    int (*removexattr)(struct vfs_node *n, const char *name);
+    int (*reflink)(struct vfs_node *src, struct vfs_node *dst);
+} vfs_node_xops_t;
+
+/* Linux open(2) flag values accepted by vfs_open2() (musl passes them unchanged). */
+#define VFS_O_EXCL      0x00080
+#define VFS_O_NOFOLLOW  0x20000
+#define VFS_O_LXDIR     0x10000      /* Linux O_DIRECTORY */
+
+int  vfs_open2(const char *path, int flags, uint32_t mode);
+int  vfs_getattr(const char *path, int follow, vfs_attr_t *out);
+int  vfs_fgetattr(int fd, vfs_attr_t *out);
+int  vfs_setattr(const char *path, int follow, const vfs_setattr_t *sa);
+int  vfs_fsetattr(int fd, const vfs_setattr_t *sa);
+int  vfs_access2(const char *path, uint32_t mode, int use_real_ids, int follow);
+int  vfs_mkdir2(const char *path, uint32_t mode);
+int  vfs_unlink2(const char *path);                  /* not for directories */
+int  vfs_rmdir2(const char *path);
+int  vfs_symlink2(const char *target, const char *linkpath);
+int  vfs_readlink2(const char *path, char *buf, size_t sz);   /* length, or negative VFS_ERR_* */
+int  vfs_link2(const char *oldpath, const char *newpath);
+int  vfs_rename2(const char *oldpath, const char *newpath, uint32_t flags);   /* flags: 1 = NOREPLACE */
+int  vfs_truncate2(const char *path, uint64_t size);
+int  vfs_ftruncate2(int fd, uint64_t size);
+int  vfs_fsync2(int fd);
+int  vfs_mknod2(const char *path, uint32_t mode, uint64_t rdev);
+
+/* node access for extended calls (xattr, reflink, snapshots, statfs) */
+vfs_node_t *vfs_lookup_node(const char *path, int follow, int *err);   /* caller must vfs_node_put() */
+vfs_node_t *vfs_fd_node(int fd);                                        /* borrowed */
+void        vfs_node_put(vfs_node_t *n);
+vfs_mount_t *vfs_mount_of_path(const char *path);
+int         vfs_attach(const char *path, vfs_node_t *root, fs_ops_t *fs, blkdev_t *dev, uint32_t flags);
+void        vfs_sync_all(void);
+
+int fhfs_register(void);            /* FexoxHybridFS */
 
 #endif  
