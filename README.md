@@ -8,6 +8,6 @@ Fexox OS исходный код / Source Code
 -ФС: FAT32, FHFS
 -Планировщик задач: CFS-подобный (В будущем будет заменен на кастомный)
 -library c: Musl (usermode), klibc (kernel mode)
--Стадия разработки: Alpha2
+-Стадия разработки: Alpha3
 
 About Developer: известен под ником/псевдонимом Aetherius Finch, Tobias Forester!ПРОШЛЫЙ АККАУНТ BREAKFASTKITCHEN6249 был забанен за "неполадки в аккаунте" НОВЫЙ: u/Content_Grass4077!!!. !ИСПОЛЬЗУЕТСЯ БИБЛИОТЕКА LIBC MUSL ПОД РАЗРЕШИТЕЛЬНОЙ ЛИЦЕНЗИЕЙ MIT, АВТОР БИБЛИОТЕКИ: Rich Felker!
