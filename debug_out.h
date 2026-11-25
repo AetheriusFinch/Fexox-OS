@@ -13,6 +13,13 @@
 typedef void (*fexox_os_klog_hook_t)(char);
 __attribute__((weak)) fexox_os_klog_hook_t fexox_os_klog_hook = 0;
 
+/* Boot splash hooks (set by BootSplash.c): idle = called from long waits / decoders so the
+   animation keeps running, panic = shows the kernel log on screen before the CPU halts. */
+typedef void (*fexox_os_idle_hook_t)(void);
+typedef void (*fexox_os_panic_hook_t)(const char *msg);
+__attribute__((weak)) fexox_os_idle_hook_t  fexox_os_idle_hook  = 0;
+__attribute__((weak)) fexox_os_panic_hook_t fexox_os_panic_hook = 0;
+
 static inline void dbg_outb(uint16_t port, uint8_t val) {
     __asm__ volatile ("outb %0, %1" : : "a"(val), "Nd"(port));
 }
@@ -127,6 +134,7 @@ static inline void dbg_dec64(uint64_t v) {
     dbg_puts("\n*** PANIC [" tag "] "); \
     dbg_puts(msg); \
     dbg_puts(" ***\n"); \
+    if (fexox_os_panic_hook) fexox_os_panic_hook(msg); \
     for (;;) __asm__ volatile ("hlt"); \
 } while(0)
 

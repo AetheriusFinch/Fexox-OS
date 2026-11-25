@@ -3,6 +3,7 @@
 
 
 #include "png.h"
+#include "debug_out.h"
 
 extern void *kmalloc(uint64_t size);
 extern void  kfree(void *ptr);
@@ -146,7 +147,9 @@ static int inflate_stored(bitstream_t *bs, outbuf_t *out) {
  
 static int inflate_block_data(bitstream_t *bs, outbuf_t *out,
                                const huffman_t *lc, const huffman_t *dc) {
+    uint32_t idle_n = 0;
     for (;;) {
+        if ((++idle_n & 0x3FFFu) == 0 && fexox_os_idle_hook) fexox_os_idle_hook();
         int sym = huffman_decode(bs, lc);
         if (sym < 0) return PNG_ERR_INFLATE;
         if (sym < 256) {
@@ -455,6 +458,7 @@ int png_decode(const uint8_t *data, size_t size, png_image_t *out) {
     uint32_t maxval = (1u << bit_depth) - 1;  
 
     for (uint32_t y = 0; y < height; y++) {
+        if ((y & 15u) == 0 && fexox_os_idle_hook) fexox_os_idle_hook();
         const uint8_t *src_row = raw + (size_t)y * row_bytes;
         uint8_t filter = src_row[0];
         const uint8_t *filt = src_row + 1;

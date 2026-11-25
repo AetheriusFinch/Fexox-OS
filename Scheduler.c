@@ -1020,3 +1020,5 @@ bool sched_task_alive(uint32_t tid) {
 }
 
 uint32_t sched_task_count(void) { return g_sched.task_count; }
+/* DEBUG helper used by the timer ISR frame check */
+uint32_t sched_current_tid_dbg(void) { return g_sched.current ? g_sched.current->tid : 0xFFFFFFFFu; }

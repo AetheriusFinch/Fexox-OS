@@ -10,7 +10,7 @@ command -v $CC >/dev/null || { echo "[!] clang не найден"; exit 1; }
 
 mkdir -p build
 
-CFLAGS_KERN="-I. -IResources -target x86_64-unknown-none-elf -ffreestanding -fno-builtin -mno-red-zone -mcmodel=kernel -fno-pie -fno-stack-protector -mgeneral-regs-only -O0 -g -Wall -Wextra -std=c11"
+CFLAGS_KERN="-I. -IResources -IGUI -target x86_64-unknown-none-elf -ffreestanding -fno-builtin -mno-red-zone -mcmodel=kernel -fno-pie -fno-stack-protector -mgeneral-regs-only -O0 -g -Wall -Wextra -std=c11"
 LDFLAGS_KERN="-m elf_x86_64 -nostdlib -T kernel.ld"
 
 
@@ -38,6 +38,7 @@ $CC $CFLAGS_KERN -c Scheduler.c        -o build/Scheduler.o
 $CC $CFLAGS_KERN -c Syscall.c          -o build/Syscall.o
 $CC $CFLAGS_KERN -c VFS.c              -o build/VFS.o
 $CC $CFLAGS_KERN -c FAT32.c            -o build/FAT32.o
+# FHFS считает CRC и сжимает на каждом блоке - при -O0 это в разы медленнее; оптимизируем только его
 $CC ${CFLAGS_KERN/-O0/-O2} -c FexoxHybridFS.c   -o build/FexoxHybridFS.o
 $CC $CFLAGS_KERN -c Storage.c          -o build/Storage.o
 $CC $CFLAGS_KERN -c IDE.c              -o build/IDE.o
@@ -45,10 +46,13 @@ $CC $CFLAGS_KERN -c AHCI.c             -o build/AHCI.o
 $CC $CFLAGS_KERN -c NVMe.c             -o build/NVMe.o
 $CC $CFLAGS_KERN -c klibc.c            -o build/klibc.o
 $CC $CFLAGS_KERN -c ELF64.c            -o build/ELF64.o
-$CC $CFLAGS_KERN -c Framebuffer.c      -o build/Framebuffer.o
-$CC ${CFLAGS_KERN/-O0/-O2} -c FexoxDriverDisplay.c -o build/FexoxDriverDisplay.o
+$CC $CFLAGS_KERN -c GUI/Framebuffer.c  -o build/Framebuffer.o
+# FexoxDriverDisplay: software scaler/rotator, hot pixel loops -> -O2
+$CC ${CFLAGS_KERN/-O0/-O2} -c GUI/FexoxDriverDisplay.c -o build/FexoxDriverDisplay.o
 $CC $CFLAGS_KERN -c png.c              -o build/png.o
-$CC $CFLAGS_KERN -c ui_extra.c         -o build/ui_extra.o
+$CC ${CFLAGS_KERN/-O0/-O2} -c jpeg.c  -o build/jpeg.o      # JPEG decoder: hot loops -> -O2
+$CC $CFLAGS_KERN -c GUI/ui_extra.c     -o build/ui_extra.o
+$CC ${CFLAGS_KERN/-O0/-O2} -c GUI/BootSplash.c   -o build/BootSplash.o
 $CC $CFLAGS_KERN -c PS2Mouse.c         -o build/PS2Mouse.o
 $CC $CFLAGS_KERN -c AcpiControl.c      -o build/AcpiControl.o
 $CC $CFLAGS_KERN -c Resources/fxapp.c  -o build/fxapp.o
@@ -93,7 +97,9 @@ $LD_KERN $LDFLAGS_KERN -o build/kernel.bin \
     build/Framebuffer.o    \
     build/FexoxDriverDisplay.o \
     build/png.o            \
+    build/jpeg.o           \
     build/ui_extra.o        \
+    build/BootSplash.o      \
     build/PS2Mouse.o        \
 	build/AcpiControl.o     \
 	build/fxapp.o           \
@@ -139,6 +145,18 @@ elif [ -f SysApps/calc_bare.c ]; then
     ls -lh build/calc.elf
 else
     echo "[!] musl не собран ($MUSL_OUT/lib/libc.a) - запусти ./build_musl.sh, калькулятор пропущен"
+fi
+
+rm -f build/mypc.elf
+if [ -f "$MUSL_OUT/lib/libc.a" ] && [ -f SysApps/MyPC.c ]; then
+    echo "[*] My Computer (userspace, musl libc)..."
+    $CC $CFLAGS_MUSL -c SysApps/MyPC.c -o build/mypc.o
+    $LD_KERN $LDFLAGS_MUSL -o build/mypc.elf \
+        $MUSL_OUT/lib/crt1.o $MUSL_OUT/lib/crti.o build/mypc.o \
+        $MUSL_OUT/lib/libc.a $MUSL_OUT/lib/crtn.o
+    ls -lh build/mypc.elf
+else
+    echo "[!] MyPC не собран (нужны musl и SysApps/MyPC.c) - иконка My Computer на панели ничего не запустит"
 fi
 
 echo "[*] SysLogs (userspace, отдельно от ядра)..."
@@ -202,6 +220,9 @@ if command -v mformat >/dev/null; then
 
 
     echo "[*] Диск build/data.img (virtio-blk): MBR, p1 = FAT32 (boot/seed), p2 = FHFS (тип 0xDA)..."
+    # Раскладка: p1 FAT32 64 МиБ с 1 МиБ; p2 (тип 0xDA, "Fexox") 256 МиБ - ядро само форматирует её в FHFS
+    # при первой загрузке. p2 при пересборке НЕ трогается (данные FHFS сохраняются).
+    # Чтобы сбросить FHFS: rm build/data.img
     DATA_IMG="build/data.img"
     P1_START=2048;   P1_SECT=131072
     P2_START=133120; P2_SECT=524288
@@ -278,6 +299,11 @@ if command -v mformat >/dev/null; then
         echo "[OK] build/calc.elf -> ::APPS/calc.elf"
     fi
 
+    if [ -f build/mypc.elf ]; then
+        mcopy -o -i "$DATA_FAT" build/mypc.elf ::APPS/mypc.elf
+        echo "[OK] build/mypc.elf -> ::APPS/mypc.elf"
+    fi
+
     mcopy -i "$DATA_FAT" build/syslogs.elf ::APPS/syslogs.elf
     echo "[OK] build/syslogs.elf -> ::APPS/syslogs.elf"
 
@@ -293,15 +319,17 @@ else
 fi
 
 echo "[+] build/kernel.bin  build/bootloader.efi  build/esp.img  build/data.img  build/calc.elf  build/syslogs.elf  build/browser.elf"
+# Образ для реальной флешки (MBR: FAT32 + раздел FHFS). Отключить: BUILD_USB_IMG=0 ./Compile.sh
 if [ "${BUILD_USB_IMG:-1}" = "1" ] && [ -f make_usb_image.sh ] && command -v mformat >/dev/null; then
-    echo "[*] Creating build/usb.img for USB..."
+    echo "[*] build/usb.img (для флешки)..."
     QUIET=1 bash ./make_usb_image.sh | tail -n 3
 fi
 
+# Образ BIOS+UEFI (MBR-загрузчик stage1/stage2 + FAT32 + FHFS). Отключить: BUILD_BIOS_IMG=0 ./Compile.sh
 if [ "${BUILD_BIOS_IMG:-1}" = "1" ] && [ -f build_bios.sh ] && [ -f make_bios_image.sh ] && [ -f BIOS/stage1.S ] && command -v mformat >/dev/null; then
-    echo "[*] Creating build/usb_bios.img (BIOS + UEFI)..."
+    echo "[*] build/usb_bios.img (BIOS + UEFI)..."
     if bash ./build_bios.sh >/dev/null && QUIET=1 bash ./make_bios_image.sh | tail -n 3; then :; else
-        echo "[!] usb_bios.img was not created (see build_bios.sh). This is not a fatal error."
+        echo "[!] usb_bios.img не собран (см. build_bios.sh) - не критично"
     fi
 fi
 

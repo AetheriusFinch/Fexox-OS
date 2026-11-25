@@ -16,6 +16,8 @@ extern "C" {
 #include "Scheduler.h"
 #include "ELF64.h"
 #include "debug_out.h"
+#include "png.h"
+#include "jpeg.h"
 
  
 
@@ -57,6 +59,7 @@ extern uint8_t usb_hid_mouse_buttons(void);
 extern bool    usb_hid_kbd_read_char(char *out_ch);   
 extern bool    ui_kbd_focus_owned_by(int32_t pid);    
 extern void    ui_get_mouse_pos(int32_t *out_x, int32_t *out_y);
+extern uint32_t ui_click_latch(uint8_t *bits, int32_t *x, int32_t *y);
 extern uint64_t pmm_alloc_frames(size_t count, size_t align);
 extern void     pmm_free_frames(uint64_t pa, size_t count);
 extern int      vmm_map_user(uint64_t va, uint64_t pa, bool rw, bool exec);
@@ -196,8 +199,8 @@ typedef struct sc_proc {
     struct sc_proc *leader;
     bool            exit_set;                                                                        
     uint32_t        vm_owner;                                                                          
-    vfs_cred_t cred;                  
-    uint32_t   suid, sgid;            
+    vfs_cred_t cred;                 /* uid/gid/euid/egid/groups (zero = root) */
+    uint32_t   suid, sgid;           /* saved set-user/group-id */
 } sc_proc_t;
 
 static sc_proc_t *g_procs[SC_PROC_MAX];
@@ -1059,8 +1062,8 @@ static int64_t sc_execve(uint64_t path_ptr, uint64_t argv_ptr, uint64_t envp_ptr
                                                                               
                                                                                           
     sc_proc_t *p = sc_cur();
-    if (xa.mode & 04000u) p->cred.euid = xa.uid;                       
-    if (xa.mode & 02000u) p->cred.egid = xa.gid;                       
+    if (xa.mode & 04000u) p->cred.euid = xa.uid;                      /* set-user-ID program */
+    if (xa.mode & 02000u) p->cred.egid = xa.gid;                      /* set-group-ID program */
     p->suid = p->cred.euid; p->sgid = p->cred.egid;
     {                                                                    
         task_t *self = sched_current();
@@ -1959,8 +1962,8 @@ static int64_t sc_get_framebuffer(uint64_t fb_ptr) {
         uint32_t pitch     = fb_pitch();
         uint32_t height    = fb_height();
         uint64_t fb_bytes  = (uint64_t)pitch * (uint64_t)height;
-        {   
-
+        {   /* FexoxDriverDisplay: map the whole fixed-size logical surface, so the mapping stays
+               valid when the resolution is switched at run time */
             extern uint64_t fdd_surface_bytes(void);
             uint64_t sb = fdd_surface_bytes();
             if (sb > fb_bytes) fb_bytes = sb;
@@ -2102,6 +2105,157 @@ static int64_t sc_win_get_rect(uint64_t win_id, uint64_t rect_ptr) {
  
 
 
+/* ---- display control (FexoxDriverDisplay) ---- */
+extern bool     fdd_active(void);
+extern uint32_t fdd_generation(void);
+extern uint32_t fdd_logical_w(void);
+extern uint32_t fdd_logical_h(void);
+extern int      fdd_rotation(void);
+extern int      fdd_filter(void);
+extern int      fdd_fit(void);
+extern void     fdd_phys_size(uint32_t *w, uint32_t *h);
+extern void     fdd_surface_max(uint32_t *w, uint32_t *h);
+extern uint32_t fdd_surface_pitch(void);
+extern int      fb_set_display_mode(uint32_t w, uint32_t h, int rotation, int filter, int fit);
+
+static int64_t sc_display_get(uint64_t ptr) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)ptr, sizeof(sc_display_info_t)))
+        return -(int64_t)EFAULT;
+    sc_display_info_t *o = (sc_display_info_t *)(uintptr_t)ptr;
+    uint8_t *z = (uint8_t *)o;
+    for (size_t i = 0; i < sizeof(*o); i++) z[i] = 0;
+    o->version = 1;
+    o->generation = fdd_generation();
+    o->width  = fb_width();
+    o->height = fb_height();
+    o->pitch  = fb_pitch();
+    uint32_t pw = o->width, ph = o->height;
+    o->phys_w = pw; o->phys_h = ph; o->max_w = pw; o->max_h = ph;
+    if (fdd_active()) {
+        fdd_phys_size(&o->phys_w, &o->phys_h);
+        fdd_surface_max(&o->max_w, &o->max_h);
+        o->pitch    = fdd_surface_pitch();
+        o->rotation = (uint32_t)fdd_rotation();
+        o->filter   = (uint32_t)fdd_filter();
+        o->fit      = (uint32_t)fdd_fit();
+        o->flags    = SC_DISPLAY_F_FDD;
+    }
+    return 0;
+}
+
+static int64_t sc_display_set(uint64_t ptr) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)ptr, sizeof(sc_display_mode_t)))
+        return -(int64_t)EFAULT;
+    if (!fdd_active()) return -(int64_t)ENOSYS;
+    const sc_display_mode_t *m = (const sc_display_mode_t *)(uintptr_t)ptr;
+    uint32_t w  = m->width    == SC_DISPLAY_KEEP ? fdd_logical_w()          : m->width;
+    uint32_t h  = m->height   == SC_DISPLAY_KEEP ? fdd_logical_h()          : m->height;
+    uint32_t r  = m->rotation == SC_DISPLAY_KEEP ? (uint32_t)fdd_rotation() : m->rotation;
+    uint32_t fl = m->filter   == SC_DISPLAY_KEEP ? (uint32_t)fdd_filter()   : m->filter;
+    uint32_t ft = m->fit      == SC_DISPLAY_KEEP ? (uint32_t)fdd_fit()      : m->fit;
+    if (r > 3 || fl > 1 || ft > 1) return -(int64_t)EINVAL;
+    return fb_set_display_mode(w, h, (int)r, (int)fl, (int)ft) == 0 ? 0 : -(int64_t)EINVAL;
+}
+
+static uint64_t sc_mono_ns(void);      /* defined further down */
+/* returns the new generation as soon as it differs from `known`, 0 on timeout */
+static int64_t sc_display_wait(uint64_t known, uint64_t timeout_ms) {
+    if (timeout_ms > 3600000ULL) timeout_ms = 3600000ULL;
+    uint64_t deadline = sc_mono_ns() + timeout_ms * 1000000ULL;
+    for (;;) {
+        uint32_t g = fdd_generation();
+        if (g != (uint32_t)known) return (int64_t)g;
+        if (sc_mono_ns() >= deadline) return 0;
+        sc_check_exit_request();
+        sched_yield();
+    }
+}
+
+/* ---- file-manager helpers: mount list and image loading ---- */
+extern size_t strlcpy(char *dst, const char *src, size_t n);
+static int64_t sc_mount_info(uint64_t idx, uint64_t ptr) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)ptr, sizeof(sc_mount_info_t))) return -(int64_t)EFAULT;
+    sc_mount_info_t *o = (sc_mount_info_t *)(uintptr_t)ptr;
+    uint8_t *z = (uint8_t *)o;
+    for (size_t i = 0; i < sizeof(*o); i++) z[i] = 0;
+    if (idx >= (uint64_t)vfs_mount_count()) return -(int64_t)ENOENT;
+    if (!vfs_mount_info((int)idx, o->path, sizeof(o->path), o->dev, sizeof(o->dev))) return -(int64_t)ENOENT;
+    vfs_mount_t *m = vfs_mount_of_path(o->path);
+    if (m) {
+        if (m->fs && m->fs->name) strlcpy(o->fs, m->fs->name, sizeof(o->fs));
+        if (m->flags & MS_RDONLY) o->flags |= 1u;
+        fhfs_stat_t st;
+        if (m->root && fhfs_node_statfs(m->root, &st) == 0) {
+            o->total_bytes = st.total_blocks * (uint64_t)st.block_size;
+            o->free_bytes  = st.free_blocks  * (uint64_t)st.block_size;
+        }
+    }
+    blkdev_t *bd = blkdev_find(o->dev);
+    if (bd) o->dev_bytes = bd->sector_count * (uint64_t)bd->sector_size;
+    return 0;
+}
+
+static int64_t sc_image_load(uint64_t path_ptr, uint64_t req_ptr) {
+    if (!syscall_validate_ptr((void *)(uintptr_t)req_ptr, sizeof(sc_image_req_t))) return -(int64_t)EFAULT;
+    sc_image_req_t *rq = (sc_image_req_t *)(uintptr_t)req_ptr;
+    if (!rq->cap_w || !rq->cap_h || rq->cap_w > 2048u || rq->cap_h > 2048u) return -(int64_t)EINVAL;
+    uint64_t need = (uint64_t)rq->cap_w * rq->cap_h * 4u;
+    if (!syscall_validate_ptr((void *)(uintptr_t)rq->pixels, need)) return -(int64_t)EFAULT;
+    char *kpath = (char *)kmalloc(VFS_MAX_PATH);
+    if (!kpath) return -(int64_t)ENOMEM;
+    if (sc_copy_path((const char *)(uintptr_t)path_ptr, kpath, VFS_MAX_PATH) < 0) { kfree(kpath); return -(int64_t)EFAULT; }
+    int fd = vfs_open(kpath, O_RDONLY);
+    kfree(kpath);
+    if (fd < 0) return -(int64_t)ENOENT;
+    const uint64_t cap = 16u * 1024u * 1024u;
+    uint8_t *buf = (uint8_t *)kmalloc(cap);
+    if (!buf) { vfs_close(fd); return -(int64_t)ENOMEM; }
+    uint64_t total = 0;
+    for (;;) {
+        int64_t got = vfs_read(fd, buf + total, cap - total);
+        if (got <= 0) break;
+        total += (uint64_t)got;
+        if (total >= cap) break;
+    }
+    vfs_close(fd);
+    png_image_t img = {0};
+    int rc;
+    if (total >= 3 && buf[0] == 0xFF && buf[1] == 0xD8) rc = jpeg_decode(buf, (size_t)total, rq->cap_w, rq->cap_h, &img);
+    else                                                 rc = png_decode(buf, (size_t)total, &img);
+    kfree(buf);
+    if (rc != 0 || !img.pixels) return -(int64_t)EINVAL;
+
+    uint32_t ow = img.width, oh = img.height;                    /* fit, never enlarge */
+    if (ow > rq->cap_w) { oh = (uint32_t)((uint64_t)oh * rq->cap_w / ow); ow = rq->cap_w; }
+    if (oh > rq->cap_h) { ow = (uint32_t)((uint64_t)ow * rq->cap_h / oh); oh = rq->cap_h; }
+    if (!ow) ow = 1;
+    if (!oh) oh = 1;
+    uint8_t *dst = (uint8_t *)(uintptr_t)rq->pixels;
+    for (uint32_t y = 0; y < oh; y++) {
+        uint32_t sy0 = (uint32_t)((uint64_t)y * img.height / oh), sy1 = (uint32_t)((uint64_t)(y + 1) * img.height / oh);
+        if (sy1 <= sy0) sy1 = sy0 + 1;
+        if (sy1 > img.height) sy1 = img.height;
+        for (uint32_t x = 0; x < ow; x++) {
+            uint32_t sx0 = (uint32_t)((uint64_t)x * img.width / ow), sx1 = (uint32_t)((uint64_t)(x + 1) * img.width / ow);
+            if (sx1 <= sx0) sx1 = sx0 + 1;
+            if (sx1 > img.width) sx1 = img.width;
+            uint64_t sr = 0, sg = 0, sb = 0, sa = 0, cnt = 0;
+            for (uint32_t sy = sy0; sy < sy1; sy++)
+                for (uint32_t sx = sx0; sx < sx1; sx++) {
+                    const uint8_t *p = img.pixels + ((size_t)sy * img.width + sx) * 4;
+                    sr += (uint64_t)p[0] * p[3]; sg += (uint64_t)p[1] * p[3]; sb += (uint64_t)p[2] * p[3];
+                    sa += p[3]; cnt++;
+                }
+            uint8_t *o = dst + ((size_t)y * ow + x) * 4;
+            if (!sa || !cnt) { o[0] = o[1] = o[2] = o[3] = 0; continue; }
+            o[0] = (uint8_t)(sr / sa); o[1] = (uint8_t)(sg / sa); o[2] = (uint8_t)(sb / sa); o[3] = (uint8_t)(sa / cnt);
+        }
+    }
+    kfree(img.pixels);
+    rq->out_w = ow; rq->out_h = oh;
+    return 0;
+}
+
 static int64_t sc_input_poll(uint64_t input_ptr) {
     if (!syscall_validate_ptr((void *)(uintptr_t)input_ptr, sizeof(sc_input_t)))
         return -(int64_t)EFAULT;
@@ -2118,6 +2272,40 @@ static int64_t sc_input_poll(uint64_t input_ptr) {
 
 
     out->buttons = (uint8_t)(ps2_mouse_buttons() | usb_hid_mouse_buttons());
+
+    /* A press that came and went between two polls of this task is reported once, at the
+       position where it happened (otherwise a short click never reaches the application). */
+    {
+        static uint32_t s_seen[64];
+        task_t *t = sched_current();
+        uint32_t slot = t ? (t->tid & 63u) : 0;
+        uint8_t lb; int32_t lx, ly;
+        uint32_t seq = ui_click_latch(&lb, &lx, &ly);
+        if (seq != s_seen[slot]) {
+            s_seen[slot] = seq;
+            if (lb & (uint8_t)~out->buttons) {      /* that press is already over */
+                out->buttons = (uint8_t)(out->buttons | lb);
+                out->x = lx;
+                out->y = ly;
+                static uint32_t s_dbg_latched = 0;      /* DEBUG: how often a click would have been lost */
+                if (s_dbg_latched < 20) {
+                    s_dbg_latched++;
+                    DBG_VAL("IN", "latched click delivered, tid", t ? t->tid : 0);
+                }
+            }
+        }
+    }
+    {
+        static uint32_t s_dbg_seen = 0;                 /* DEBUG: first presses seen by polling tasks */
+        static uint8_t  s_dbg_prev[64];
+        task_t *t2 = sched_current();
+        uint32_t sl = t2 ? (t2->tid & 63u) : 0;
+        if ((out->buttons & 1) && !(s_dbg_prev[sl] & 1) && s_dbg_seen < 20) {
+            s_dbg_seen++;
+            DBG_VAL("IN", "task sees LMB press, tid", t2 ? t2->tid : 0);
+        }
+        s_dbg_prev[sl] = out->buttons;
+    }
     return 0;
 }
 
@@ -3308,7 +3496,7 @@ static sc_ktermios_t g_ktermios = {
 static int64_t sc_ioctl(uint64_t fd_arg, uint64_t req, uint64_t arg) {
     sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
     if (!f) return -(int64_t)EBADF;
-    if ((uint32_t)req == 0x40049409u) return sc_ficlone(fd_arg, arg);           
+    if ((uint32_t)req == 0x40049409u) return sc_ficlone(fd_arg, arg);          /* FICLONE: cp --reflink */
 
     switch ((uint32_t)req) {
     case SC_FIONBIO:
@@ -3477,12 +3665,12 @@ static int64_t sc_prctl(uint64_t option, uint64_t a2) {
 
 
 
- 
- 
- 
- 
- 
- 
+/* ===================================================================== */
+/* POSIX file API for musl on FexoxHybridFS                              */
+/*   credentials (uid/gid/groups/setuid), *at() paths, symlinks, hard    */
+/*   links, chmod/chown, timestamps, xattr + ACL, statfs, reflink,       */
+/*   snapshots.  Every call is checked against the caller's credentials. */
+/* ===================================================================== */
 
 #define SCE_E2BIG         7
 #define SCE_ENOTTY        25
@@ -3509,7 +3697,7 @@ static int64_t sc_vfs_errno(int r) {
     case VFS_ERR_INVAL:  return -(int64_t)EINVAL;
     case VFS_ERR_BADF:   return -(int64_t)EBADF;
     case VFS_ERR_NFILE:  return -(int64_t)ENFILE;
-    case VFS_ERR_BUSY:   return -(int64_t)16;                
+    case VFS_ERR_BUSY:   return -(int64_t)16;               /* EBUSY */
     case VFS_ERR_NOTEMPTY: return -(int64_t)ENOTEMPTY;
     case VFS_ERR_UNSUP:  return -(int64_t)ENOSYS;
     case VFS_ERR_LOOP:   return -(int64_t)SCE_ELOOP;
@@ -3526,7 +3714,7 @@ static int64_t sc_vfs_errno(int r) {
 }
 #define SC_ERR(r) sc_vfs_errno(r)
 
- 
+/* ---------------- credentials ---------------- */
 static const vfs_cred_t *sc_cred_provider(void) {
     sc_proc_t *p = sc_cur();
     p->cred.umask = p->umask_val;
@@ -3630,8 +3818,8 @@ static int64_t sc_setgroups(uint64_t size, uint64_t list) {
     return 0;
 }
 
- 
- 
+/* ---------------- paths ---------------- */
+/* Resolve (dirfd, user path) to an absolute kernel path. */
 static int64_t sc_getpath(uint64_t dirfd, uint64_t uptr, char *out, size_t sz) {
     const char *u = (const char *)(uintptr_t)uptr;
     if (!syscall_validate_ptr(u, 1)) return -(int64_t)EFAULT;
@@ -3671,7 +3859,7 @@ static int64_t sc_openat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags_arg, 
 }
 static int64_t sc_open(uint64_t path_ptr, uint64_t flags, uint64_t mode) { return sc_openat((uint64_t)(int64_t)AT_FDCWD, path_ptr, flags, mode); }
 
- 
+/* ---------------- stat ---------------- */
 static void sc_kstat_from_attr(sc_kstat_t *o, const vfs_attr_t *a) {
     memset(o, 0, sizeof(*o));
     o->st_dev = a->dev; o->st_ino = a->ino; o->st_nlink = a->nlink; o->st_mode = a->mode;
@@ -3681,7 +3869,7 @@ static void sc_kstat_from_attr(sc_kstat_t *o, const vfs_attr_t *a) {
     o->st_mtime_sec = (int64_t)(a->mtime_ns / 1000000000ULL); o->st_mtime_nsec = (int64_t)(a->mtime_ns % 1000000000ULL);
     o->st_ctime_sec = (int64_t)(a->ctime_ns / 1000000000ULL); o->st_ctime_nsec = (int64_t)(a->ctime_ns % 1000000000ULL);
 }
- 
+/* attributes of an fd: files and directories through the VFS, pipes / consoles as FIFO / char device */
 static int sc_attr_of_fd(int fd, vfs_attr_t *a) {
     sc_file_t *f = sc_get_file(fd);
     if (!f) return -(int)EBADF;
@@ -3739,7 +3927,7 @@ static int64_t sc_statx(uint64_t dirfd, uint64_t path_ptr, uint64_t flags, uint6
 }
 static int64_t sc_newfstatat(uint64_t dirfd, uint64_t path_ptr, uint64_t st_ptr, uint64_t flags) { return sc_fstatat(dirfd, path_ptr, st_ptr, flags); }
 
- 
+/* ---------------- directories, links, names ---------------- */
 static int64_t sc_mkdirat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) {
     char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
     return SC_ERR(vfs_mkdir2(path, (uint32_t)mode & 07777u));
@@ -3748,7 +3936,7 @@ static int64_t sc_mkdir(uint64_t path_ptr, uint64_t mode) { return sc_mkdirat((u
 static int64_t sc_mknodat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, uint64_t dev) {
     char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
     uint32_t t = (uint32_t)mode & 0170000u;
-    if ((t == 0020000u || t == 0060000u) && !sc_is_priv(sc_cur())) return -(int64_t)EPERM;      
+    if ((t == 0020000u || t == 0060000u) && !sc_is_priv(sc_cur())) return -(int64_t)EPERM;     /* device nodes: root only */
     return SC_ERR(vfs_mknod2(path, (uint32_t)mode, dev));
 }
 static int64_t sc_mknod(uint64_t path_ptr, uint64_t mode, uint64_t dev) { return sc_mknodat((uint64_t)(int64_t)AT_FDCWD, path_ptr, mode, dev); }
@@ -3759,7 +3947,7 @@ static int64_t sc_unlinkat(uint64_t dirfd, uint64_t path_ptr, uint64_t flags) {
 static int64_t sc_unlink(uint64_t path_ptr) { return sc_unlinkat((uint64_t)(int64_t)AT_FDCWD, path_ptr, 0); }
 static int64_t sc_rmdir(uint64_t path_ptr)  { return sc_unlinkat((uint64_t)(int64_t)AT_FDCWD, path_ptr, AT_REMOVEDIR); }
 
- 
+/* plain FAT volumes cannot rename natively: copy + delete (regular files only) */
 static int sc_rename_copy(const char *op, const char *np) {
     vfs_stat_t st; if (vfs_stat(op, &st) != VFS_OK) return VFS_ERR_NOENT;
     if (st.type == VFS_TYPE_DIR) return VFS_ERR_UNSUP;
@@ -3852,7 +4040,7 @@ static int64_t sc_faccessat2(uint64_t dirfd, uint64_t path_ptr, uint64_t mode, u
 static int64_t sc_access(uint64_t path_ptr, uint64_t mode) { return sc_faccessat2((uint64_t)(int64_t)AT_FDCWD, path_ptr, mode, 0); }
 static int64_t sc_faccessat(uint64_t dirfd, uint64_t path_ptr, uint64_t mode) { return sc_faccessat2(dirfd, path_ptr, mode, 0); }
 
- 
+/* ---------------- ownership, mode, times ---------------- */
 static int64_t sc_set_common(const char *path, int fd, int follow, const vfs_setattr_t *sa) {
     if (fd >= 0) {
         sc_file_t *f = sc_get_file(fd);
@@ -3884,7 +4072,7 @@ static int64_t sc_lchown(uint64_t p, uint64_t u, uint64_t g) { return sc_chown_i
 static int64_t sc_fchown(uint64_t fd, uint64_t u, uint64_t g) { return sc_chown_impl(0, 0, (int)(uint32_t)fd, u, g, 1); }
 static int64_t sc_fchownat(uint64_t dfd, uint64_t p, uint64_t u, uint64_t g, uint64_t flags) { return sc_chown_impl(dfd, p, -1, u, g, !(flags & AT_SYMLINK_NOFOLLOW)); }
 
- 
+/* times[0] = atime, times[1] = mtime; each {sec, nsec} (UTIME_NOW / UTIME_OMIT understood) */
 static int64_t sc_utimens_apply(const char *path, int fd, int follow, const sc_timespec_t *ts) {
     vfs_setattr_t sa; memset(&sa, 0, sizeof sa);
     uint64_t now = (uint64_t)sc_realtime_ns();
@@ -3904,7 +4092,7 @@ static int64_t sc_utimens_apply(const char *path, int fd, int follow, const sc_t
 static int64_t sc_utimensat(uint64_t dirfd, uint64_t path_ptr, uint64_t times_ptr, uint64_t flags) {
     const sc_timespec_t *ts = NULL;
     if (times_ptr) { if (!syscall_validate_ptr((void *)(uintptr_t)times_ptr, 2 * sizeof(sc_timespec_t))) return -(int64_t)EFAULT; ts = (const sc_timespec_t *)(uintptr_t)times_ptr; }
-    if (!path_ptr) return sc_utimens_apply(NULL, (int)(int32_t)dirfd, 1, ts);               
+    if (!path_ptr) return sc_utimens_apply(NULL, (int)(int32_t)dirfd, 1, ts);              /* futimens() */
     char path[VFS_MAX_PATH]; int64_t pr = sc_getpath(dirfd, path_ptr, path, sizeof path); if (pr) return pr;
     return sc_utimens_apply(path, -1, !(flags & AT_SYMLINK_NOFOLLOW), ts);
 }
@@ -3931,7 +4119,7 @@ static int64_t sc_utime(uint64_t path_ptr, uint64_t buf_ptr) {
     return sc_utimens_apply(path, -1, 1, pt);
 }
 
- 
+/* fallocate(fd, 0, off, len): grow the file (space is allocated lazily by the RoW allocator) */
 static int64_t sc_fallocate(uint64_t fd_arg, uint64_t mode, uint64_t off, uint64_t len) {
     sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
     if (!f || f->is_pipe_read || f->is_pipe_write || f->vfs_fd < 0) return -(int64_t)EBADF;
@@ -3943,7 +4131,7 @@ static int64_t sc_fallocate(uint64_t fd_arg, uint64_t mode, uint64_t off, uint64
     return 0;
 }
 
- 
+/* ---------------- sync ---------------- */
 static int64_t sc_fsync(uint64_t fd_arg) {
     sc_file_t *f = sc_get_file((int)(uint32_t)fd_arg);
     if (!f) return -(int64_t)EBADF;
@@ -3953,7 +4141,7 @@ static int64_t sc_fsync(uint64_t fd_arg) {
 }
 static int64_t sc_sync_all(void) { vfs_sync_all(); return 0; }
 
- 
+/* ---------------- extended attributes + ACL ---------------- */
 static int node_attr_of(vfs_node_t *n, vfs_attr_t *a) {
     const vfs_node_xops_t *x = n->ops ? n->ops->x : NULL;
     return (x && x->getattr) ? x->getattr(n, a) : -1;
@@ -3974,7 +4162,7 @@ static int64_t sc_xattr_node(uint64_t target, int is_fd, int follow, vfs_node_t 
     return 0;
 }
 static bool sc_has_prefix(const char *s, const char *p) { while (*p) { if (*s++ != *p++) return false; } return true; }
- 
+/* which namespaces may the caller touch? returns 0 or -errno; write=1 for set/remove */
 static int64_t sc_xattr_policy(vfs_node_t *n, const char *name, int write) {
     sc_proc_t *p = sc_cur();
     const vfs_node_xops_t *x = n->ops ? n->ops->x : NULL;
@@ -3988,7 +4176,7 @@ static int64_t sc_xattr_policy(vfs_node_t *n, const char *name, int write) {
     if (!strcmp(name, "system.posix_acl_access") || !strcmp(name, "system.posix_acl_default")) {
         if (!write) return 0;
         vfs_attr_t a; if (node_attr_of(n, &a)) return -(int64_t)EIO;
-        return (sc_is_priv(p) || p->cred.euid == a.uid) ? 0 : -(int64_t)EPERM;                 
+        return (sc_is_priv(p) || p->cred.euid == a.uid) ? 0 : -(int64_t)EPERM;                /* owner (or root) only */
     }
     return -(int64_t)SCE_ENOTSUP;
 }
@@ -4028,12 +4216,12 @@ static int64_t sc_removexattr_impl(uint64_t target, int is_fd, int follow, uint6
     return r;
 }
 
- 
+/* ---------------- statfs ---------------- */
 typedef struct { int64_t f_type, f_bsize; uint64_t f_blocks, f_bfree, f_bavail, f_files, f_ffree; int32_t f_fsid[2]; int64_t f_namelen, f_frsize, f_flags, f_spare[4]; } sc_statfs_t;
 static int64_t sc_statfs_node(vfs_node_t *n, uint64_t out) {
     if (!syscall_validate_ptr((void *)(uintptr_t)out, sizeof(sc_statfs_t))) return -(int64_t)EFAULT;
     sc_statfs_t *s = (sc_statfs_t *)(uintptr_t)out; memset(s, 0, sizeof *s);
-    s->f_bsize = 4096; s->f_frsize = 4096; s->f_namelen = 255; s->f_type = 0x4D44;                     
+    s->f_bsize = 4096; s->f_frsize = 4096; s->f_namelen = 255; s->f_type = 0x4D44;                    /* MSDOS_SUPER_MAGIC for FAT */
     fhfs_stat_t st;
     if (fhfs_node_statfs(n, &st) == 0) {
         s->f_type = 0x46485346; s->f_blocks = st.total_blocks; s->f_bfree = st.free_blocks; s->f_bavail = st.free_blocks;
@@ -4052,7 +4240,7 @@ static int64_t sc_fstatfs(uint64_t fd_arg, uint64_t out) {
     vfs_node_t *n = vfs_fd_node(f->vfs_fd); return n ? sc_statfs_node(n, out) : -(int64_t)EBADF;
 }
 
- 
+/* ---------------- FICLONE (cp --reflink) + snapshots ---------------- */
 #define SC_FICLONE 0x40049409UL
 static int64_t sc_ficlone(uint64_t dst_fd, uint64_t src_fd) {
     sc_file_t *d = sc_get_file((int)(uint32_t)dst_fd), *s = sc_get_file((int)(uint32_t)src_fd);
@@ -4063,7 +4251,7 @@ static int64_t sc_ficlone(uint64_t dst_fd, uint64_t src_fd) {
     if (!dn || !sn || !x || !x->reflink) return -(int64_t)SCE_ENOTSUP;
     return SC_ERR(x->reflink(sn, dn));
 }
- 
+/* cmd 1 create(path,name)  2 delete(path,name)  3 list(path, idx -> buf[48])  4 mount(path,name -> mountpoint) */
 static int64_t sc_fhfs_snapshot(uint64_t cmd, uint64_t path_ptr, uint64_t name_ptr, uint64_t a4, uint64_t a5) {
     char path[VFS_MAX_PATH], name[64], at[VFS_MAX_PATH]; char out48[48];
     int64_t pr = sc_getpath((uint64_t)(int64_t)AT_FDCWD, path_ptr, path, sizeof path); if (pr) return pr;
@@ -4269,6 +4457,11 @@ static int64_t sc_dispatch_inner(uint64_t nr,
     case SYS_WIN_MOVE:        return sc_win_move(a1, a2, a3);
     case SYS_WIN_GET_RECT:    return sc_win_get_rect(a1, a2);
     case SYS_INPUT_POLL:      return sc_input_poll(a1);
+    case SYS_DISPLAY_GET:     return sc_display_get(a1);
+    case SYS_DISPLAY_SET:     return sc_display_set(a1);
+    case SYS_DISPLAY_WAIT:    return sc_display_wait(a1, a2);
+    case SYS_MOUNT_INFO:      return sc_mount_info(a1, a2);
+    case SYS_IMAGE_LOAD:      return sc_image_load(a1, a2);
     case SYS_KBD_READ_CHAR:   return sc_kbd_read_char(a1);
     case SYS_KLOG_READ:       return sc_klog_read(a1, a2, a3);
     case SYS_NET_SOCKET:      return sc_net_socket(a1);

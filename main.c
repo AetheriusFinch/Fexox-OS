@@ -17,6 +17,7 @@ extern "C" {
 #include "Framebuffer.h"
 #include "ui_extra.h"
 #include "Storage.h"
+#include "BootSplash.h"
 #include "PS2Mouse.h"
 #include "USB.h"           
 #include "Network/net.h"   
@@ -123,6 +124,7 @@ static int vga_col;
 
 static void kprint(const char *str) {
     dbg_puts(str);
+    if (splash_enabled()) splash_log(str);          /* keep it for the error log screen */
     while (*str) {
         if (*str == '\n') {
             vga_row++;
@@ -161,6 +163,7 @@ static bool g_ui_desktop_shown = false;
 
 static void kout(const char *str) {
     if (g_ui_desktop_shown) { dbg_puts(str); return; }
+    if (splash_enabled()) { splash_log(str); return; }       /* boot splash: text is collected, shown on error */
     if (fb_get_mode() == FB_MODE_LINEAR)
         fbcon_puts(str);
     else
@@ -177,7 +180,7 @@ static void kout_dec(const char *label, uint64_t v) {
     out[o] = '\0';
     kout(label); kout(out); kout("\n");
 }
- 
+/* kout + copy into the diagnostic ring (partial pieces are joined until '\n') */
 static char g_klog_line[96]; static int g_klog_len;
 static void klog(const char *s) {
     kout(s);
@@ -200,9 +203,13 @@ static void kout_hex16(uint16_t v) {
 
 
 #ifndef FEXOX_OS_BOOT_MARKERS
-#define FEXOX_OS_BOOT_MARKERS 1
+#define FEXOX_OS_BOOT_MARKERS 0      /* 1 = draw "stage N" boot marks over the desktop (debugging only) */
+#endif
+#ifndef FEXOX_OS_STATUS_TEXT
+#define FEXOX_OS_STATUS_TEXT 1       /* network + USB storage status in the taskbar */
 #endif
 static void boot_mark(const char *s) {
+    if (splash_active() || splash_error_mode()) { splash_log(s); splash_log("\n"); return; }
 #if FEXOX_OS_BOOT_MARKERS
     if (fb_get_mode() != FB_MODE_LINEAR) return;
     int32_t y = (int32_t)fb_height() - 130;
@@ -237,11 +244,6 @@ static char *dbg_i(char *d, int64_t v) {
     if (v < 0) { *d++ = '-'; v = -v; }
     return dbg_u(d, (uint64_t)v);
 }
-static void dbg_line(int32_t y, const char *text) {
-    fb_draw_string(10, y, "                                                                                ", FB_WHITE, FB_BLACK);
-    fb_draw_string(10, y, text, FB_WHITE, FB_BLACK);
-    fb_flip_rect(10, y, 80 * FB_FONT_W, FB_FONT_H);
-}
 
  
 
@@ -251,98 +253,34 @@ static void dbg_line(int32_t y, const char *text) {
 
 
 
+/* online / offline for the taskbar network icon.  net_is_connected() is used when the network code
+   provides it; otherwise the status text decides: an IPv4 address other than 0.x means "online". */
+extern int net_is_connected(void) __attribute__((weak));
+static int net_text_has_ip(const char *s) {
+    char prev = ' ';
+    for (; *s; prev = *s, s++) {
+        if (*s < '0' || *s > '9' || (prev >= '0' && prev <= '9') || prev == '.') continue;
+        unsigned v[4]; int n = 0; const char *p = s;
+        while (n < 4) {
+            unsigned x = 0; int dg = 0;
+            while (*p >= '0' && *p <= '9' && dg < 4) { x = x * 10u + (unsigned)(*p - '0'); p++; dg++; }
+            if (!dg || x > 255u) break;
+            v[n++] = x;
+            if (n < 4) { if (*p != '.') break; p++; }
+        }
+        if (n == 4 && v[0] != 0u && !(v[0] == 255u && v[1] == 255u)) return 1;
+    }
+    return 0;
+}
 void fexox_os_isr_heartbeat(void) {
-#if FEXOX_OS_BOOT_MARKERS
+#if FEXOX_OS_STATUS_TEXT
     static uint32_t ticks = 0;
     if ((++ticks % 100u) != 0) return;
     if (fb_get_mode() != FB_MODE_LINEAR) return;
-    int32_t y0 = (int32_t)fb_height() - 130 + 18;
-    if (y0 < 0) return;
-
-    char b[256]; char *d;
-
-    d = dbg_s(b, "ISR ticks: "); d = dbg_u(d, ticks);
-    {
-         
-
-
-
-        static const char hx[] = "0123456789ABCDEF";
-        uint32_t kok = 0, kfail = 0, kkeys = 0; uint8_t rep[8] = {0};
-        char kmode = '?';
-        if (usb_hid_get_kbd_stats(&kok, &kfail, &kkeys, rep, &kmode)) {
-            d = dbg_s(d, "  kbd["); *d++ = kmode; d = dbg_s(d, "] ok="); d = dbg_u(d, kok);
-            d = dbg_s(d, " f="); d = dbg_u(d, kfail);
-            d = dbg_s(d, " k="); d = dbg_u(d, kkeys);
-            d = dbg_s(d, " r=");
-            for (int i = 0; i < 8; i++) { *d++ = hx[rep[i] >> 4]; *d++ = hx[rep[i] & 15]; if (i < 7) *d++ = ' '; }
-        } else {
-            d = dbg_s(d, "  kbd: none");
-        }
-    }
-    *d = '\0';
-    dbg_line(y0, b);
-
-    uint32_t me = 0, mr = 0; int mrc = 0; uint64_t mlba = 0;
-    usb_msc_get_stats(&me, &mr, &mrc, &mlba);
-    d = dbg_s(b, "msc err="); d = dbg_u(d, me);
-    d = dbg_s(d, " recovered="); d = dbg_u(d, mr);
-    d = dbg_s(d, " last_rc="); d = dbg_i(d, mrc);
-    d = dbg_s(d, " lba="); d = dbg_u(d, mlba); *d = '\0';
-    dbg_line(y0 + 18, b);
-
-    uint32_t kf = 0; uint64_t ks = 0, ku = 0;
-    kmalloc_get_diag(&kf, &ks, &ku);
-    
-
-    d = dbg_s(b, kf ? "heap FAIL" : "heap OK");
-    d = dbg_s(d, " fails="); d = dbg_u(d, kf);
-    d = dbg_s(d, " last_fail="); if (kf) d = dbg_u(d, ks); else d = dbg_s(d, "none");
-    d = dbg_s(d, " used="); d = dbg_u(d, ku / 1024u); d = dbg_s(d, "K");
-    d = dbg_s(d, " wp="); d = dbg_i(d, fexox_os_dbg_wp_reason);
-    d = dbg_s(d, "/"); d = dbg_i(d, fexox_os_dbg_wp_rc);
-    d = dbg_s(d, " spawn="); d = dbg_i(d, fexox_os_dbg_spawn_rc); *d = '\0';
-    dbg_line(y0 + 36, b);
-
-    net_status_text(b, sizeof(b));
-    dbg_line(y0 + 54, b);
-
-     
-
-
-
-
-
-
-
-
-    {
-        const usb_stats_t *us = usb_get_stats();
-        d = dbg_s(b, "usb hc="); d = dbg_u(d, us->hcds);
-        d = dbg_s(d, " dev="); d = dbg_u(d, us->devices);
-        d = dbg_s(d, " hub="); d = dbg_u(d, us->hubs);
-        d = dbg_s(d, " hid="); d = dbg_u(d, us->hid);
-        d = dbg_s(d, " msc="); d = dbg_u(d, us->msc);
-        d = dbg_s(d, " split="); d = dbg_u(d, us->split_skipped);
-        d = dbg_s(d, " fail="); d = dbg_u(d, us->enum_fail);
-        d = dbg_s(d, " st="); d = dbg_u(d, us->fail_step);
-        d = dbg_s(d, " rc="); d = dbg_i(d, us->fail_rc);
-         
-
-
-
-        {
-            extern void ehci_int_dbg(uint32_t out[5]);
-            uint32_t ei[5]; ehci_int_dbg(ei);
-            d = dbg_s(d, " | ei c="); d = dbg_u(d, ei[0]);
-            d = dbg_s(d, " p="); d = dbg_u(d, ei[1]);
-            d = dbg_s(d, " d="); d = dbg_u(d, ei[2]);
-            d = dbg_s(d, " h="); d = dbg_u(d, ei[3]);
-            d = dbg_s(d, " t="); d = dbg_u(d, ei[4]);
-        }
-        *d = '\0';
-        dbg_line(y0 + 72, b);
-    }
+    int up;
+    if (net_is_connected) up = net_is_connected() ? 1 : 0;
+    else { char t[96]; net_status_text(t, sizeof(t)); up = net_text_has_ip(t); }
+    ui_set_net_state(up);
 #endif
 }
 
@@ -374,7 +312,7 @@ static int ps2_controller_present(void) {
 
 
 
- 
+/* Volume discovery / mounting lives in Storage.c (FHFS root, FAT32 for removable media). */
 
 typedef struct __attribute__((packed)) {
     uint32_t reserved0;
@@ -877,8 +815,10 @@ void kernel_entry(BOOT_INFO *info) {
 
 
 
-        fbcon_init(0, 0, fb_width(), fb_height(), FB_WHITE, FB_DARK_BLUE);
-        fbcon_puts("=== Fexox OS Kernel ===\n");
+        if (splash_init() != 0) {            /* no splash (odd framebuffer): old blue console */
+            fbcon_init(0, 0, fb_width(), fb_height(), FB_WHITE, FB_DARK_BLUE);
+            fbcon_puts("=== Fexox OS Kernel ===\n");
+        }
         DBG_MSG("KR", "13b fb linear OK");
     } else {
          
@@ -929,6 +869,7 @@ void kernel_entry(BOOT_INFO *info) {
 
 
     __asm__ volatile ("sti" ::: "memory");
+    splash_attach_timer();                 /* smooth boot animation from the 100 Hz timer */
 
     DBG_MSG("KR", "20 vfs_init...");
     ret = vfs_init();
@@ -939,7 +880,7 @@ void kernel_entry(BOOT_INFO *info) {
     kout("[OK] vfs\n");
 
      
-     
+    /* fhfs_register()/fat32_register() are called inside storage_init() */
 
      
 
@@ -1082,8 +1023,10 @@ void kernel_entry(BOOT_INFO *info) {
 
 
     {
-         
+        /* FHFS is the system root; FAT32 volumes (USB flash, boot ESP) go to /boot and /mnt/<dev>. */
         int mounted = storage_init(klog);
+        if (mounted && splash_active())                         /* black screen + UI/Load.png */
+            if (!splash_set_image("/UI/Load.png")) (void)splash_set_image("/boot/UI/Load.png");
         if (mounted) {
              
             int dfd = vfs_open("/", O_DIRECTORY);
@@ -1149,7 +1092,7 @@ void kernel_entry(BOOT_INFO *info) {
                 usb_delay_ms(pg);
 
                 fbcon_clear(); kout("=== DIAG 4/5: USB event log, older part ===\n");
-                usbdiag_dump(kout, USBDIAG_VIEW_USB, 52);           
+                usbdiag_dump(kout, USBDIAG_VIEW_USB, 52);          /* 52 newest; first lines = older */
                 usb_delay_ms(pg);
 
                 fbcon_clear(); kout("=== DIAG 5/5: storage / mount log ===\n");
@@ -1161,6 +1104,11 @@ void kernel_entry(BOOT_INFO *info) {
     }
 
 skip_fs:;
+    /* an error screen (no root fs, ERR/FAIL lines ...) stays up for a while before the desktop */
+#ifndef FEXOX_SPLASH_ERROR_HOLD_MS
+#define FEXOX_SPLASH_ERROR_HOLD_MS 20000u
+#endif
+    splash_hold_errors(FEXOX_SPLASH_ERROR_HOLD_MS);
 
      
 
@@ -1174,6 +1122,8 @@ skip_fs:;
      
     DBG_MSG("KR", "25 ui_draw_desktop...");
     ui_draw_desktop();
+    splash_finish();                       /* the desktop has been flipped to the screen */
+    fb_refresh_screen();                   /* wipe a splash frame that the timer may have drawn in between */
     DBG_MSG("KR", "25 ui ok");
     g_ui_desktop_shown = true;   
     boot_mark("stage 1: desktop drawn");

@@ -869,8 +869,26 @@ void interrupt_disable(void) { cli(); }
 uint64_t timer_isr_c(uint64_t frame_rsp) {
     apic_send_eoi(TIMER_VECTOR);
     __atomic_fetch_add(&g_timer_ticks, 1, __ATOMIC_RELAXED);
-    if (g_sched_tick) return g_sched_tick(frame_rsp);
-    return frame_rsp;
+    if (!g_sched_tick) return frame_rsp;
+    uint64_t next_rsp = g_sched_tick(frame_rsp);
+
+    /* DEBUG: check the frame iretq is about to pop (15 GPRs + dummy err = 128 bytes, then
+       RIP, CS, RFLAGS, RSP, SS).  A bad selector here is the #GP seen in the panic log. */
+    {
+        const uint64_t *f = (const uint64_t *)(uintptr_t)next_rsp;
+        uint64_t cs = f[17], ss = f[20];
+        int ok = (cs == 0x08 && ss == 0x10) || (cs == 0x2B && ss == 0x23);
+        if (!ok) {
+            extern uint32_t sched_current_tid_dbg(void);
+            dbg_puts("\n[ISR] BAD IRET FRAME before iretq\n");
+            DBG_VAL("ISR", "tid", sched_current_tid_dbg());
+            DBG_VAL("ISR", "frame rsp", next_rsp);
+            DBG_VAL("ISR", "old frame rsp", frame_rsp);
+            for (int i = 16; i < 21; i++) DBG_VAL("ISR", "  rip/cs/rflags/rsp/ss", f[i]);
+            DBG_PANIC("ISR", "corrupt iretq frame");
+        }
+    }
+    return next_rsp;
 }
 
 int interrupt_init(uint64_t ioapic_phys_addr, uint32_t timer_freq_hz) {

@@ -53,6 +53,15 @@
 #define SYS_KBD_READ_CHAR 605   
 #define SYS_KLOG_READ     880   
 
+/* display control (FexoxDriverDisplay) */
+#define SYS_DISPLAY_GET   530   /* a1 = sc_display_info_t *                         -> 0 / -errno */
+#define SYS_DISPLAY_SET   531   /* a1 = const sc_display_mode_t *                   -> 0 / -errno */
+#define SYS_DISPLAY_WAIT  532   /* a1 = known generation, a2 = timeout ms (0 = poll) -> new generation, 0 = timeout */
+
+/* file-manager helpers */
+#define SYS_MOUNT_INFO    534   /* a1 = index, a2 = sc_mount_info_t *               -> 0 / -ENOENT past the end */
+#define SYS_IMAGE_LOAD    535   /* a1 = path, a2 = sc_image_req_t *                  -> 0 / -errno */
+
 #define SYS_NET_SOCKET    700
 #define SYS_NET_CONNECT   701
 #define SYS_NET_SEND      702
@@ -135,7 +144,7 @@
 #define SYS_DUP3          292
 #define SYS_PIPE2         293
 
- 
+/* POSIX file API for FexoxHybridFS (links, ownership, times, xattr, statfs, credentials) */
 #define SYS_STATX              332
 #define SYS_SYNCFS             306
 #define SYS_FCHMODAT2          452
@@ -179,7 +188,7 @@
 #define SYS_SETFSGID           123
 #define SYS_FALLOCATE          285
 #define SYS_FHFS_SNAPSHOT      520
- 
+/* custom: cmd 1 create, 2 delete, 3 list, 4 mount-readonly (root only) */
 #define SYS_PRLIMIT64     302
 #define SYS_RENAMEAT2     316
 #define SYS_FACCESSAT2    439
@@ -450,6 +459,52 @@ typedef struct {
     uint32_t w, h;
     uint32_t redraw_gen;
 } sc_win_rect_t;
+
+/* Display state.  `generation` changes on every resolution / rotation / filter change: an app
+   keeps the value it saw, polls SYS_DISPLAY_GET (or sleeps in SYS_DISPLAY_WAIT) and relayouts
+   when it changes.  The framebuffer pointer from SYS_GET_FRAMEBUFFER stays valid (fixed pitch,
+   the mapping covers `max_w` x `max_h`); only width / height change. */
+#define SC_DISPLAY_F_FDD     1u     /* run-time mode changes are available */
+#define SC_ROT_0   0
+#define SC_ROT_90  1                /* clockwise */
+#define SC_ROT_180 2
+#define SC_ROT_270 3
+#define SC_DISPLAY_KEEP 0xFFFFFFFFu /* sc_display_mode_t field: leave unchanged */
+typedef struct {
+    uint32_t version;               /* 1 */
+    uint32_t generation;
+    uint32_t width, height;         /* logical (what apps draw on) */
+    uint32_t phys_w, phys_h;        /* real screen */
+    uint32_t max_w, max_h;          /* largest logical size */
+    uint32_t pitch;                 /* bytes per row of the logical surface (constant) */
+    uint32_t rotation;              /* SC_ROT_* */
+    uint32_t filter;                /* 0 nearest, 1 bilinear */
+    uint32_t fit;                   /* 0 letterbox, 1 stretch */
+    uint32_t flags;                 /* SC_DISPLAY_F_* */
+    uint32_t reserved[4];
+} sc_display_info_t;
+typedef struct {
+    uint32_t width, height, rotation, filter, fit;      /* SC_DISPLAY_KEEP = unchanged */
+} sc_display_mode_t;
+
+typedef struct {
+    char     path[128];             /* mount point, e.g. "/" or "/mnt/uda" */
+    char     dev[32];               /* block device, e.g. "vdap2" */
+    char     fs[16];                /* "fhfs", "fat32" */
+    uint64_t dev_bytes;             /* size of the block device */
+    uint64_t total_bytes;           /* file system size (FHFS), 0 = unknown */
+    uint64_t free_bytes;            /* free space (FHFS), 0 = unknown */
+    uint32_t flags;                 /* 1 = read-only */
+    uint32_t pad;
+} sc_mount_info_t;
+
+/* Decodes a PNG or JPEG into RGBA (8 bit) and shrinks it to fit cap_w x cap_h (never enlarges).
+   `pixels` is a user buffer of at least cap_w * cap_h * 4 bytes. */
+typedef struct {
+    uint64_t pixels;
+    uint32_t cap_w, cap_h;
+    uint32_t out_w, out_h;
+} sc_image_req_t;
 
  
 
