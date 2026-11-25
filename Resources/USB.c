@@ -5,6 +5,7 @@
 #include "USB.h"
 #include "Network/net.h"
 #include "debug_out.h"
+#include "UsbDiag.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -85,7 +86,10 @@ uint64_t usb_tsc_per_ms(void) {
 
 void usb_delay_ms(uint32_t ms) {
     uint64_t target = usb_rdtsc() + usb_tsc_per_ms() * ms;
-    while (usb_rdtsc() < target) __asm__ volatile ("pause" ::: "memory");
+    while (usb_rdtsc() < target) {
+        __asm__ volatile ("pause" ::: "memory");
+        if (fexox_os_idle_hook) fexox_os_idle_hook();      /* boot splash animation */
+    }
 }
 
  
@@ -138,6 +142,21 @@ static int usb_ctrl(usb_hcd_t *hcd, uint8_t addr, uint8_t speed, uint8_t maxp0,
 
 
 
+
+/* Control transfer with retries: real devices (card readers, cheap flash
+   drives) often fail the first request after SET_ADDRESS / reset. */
+static int usb_ctrl_retry(usb_hcd_t *hcd, uint8_t addr, uint8_t speed, uint8_t maxp0,
+                          uint8_t bmRequestType, uint8_t bRequest,
+                          uint16_t wValue, uint16_t wIndex,
+                          void *data, uint16_t wLength) {
+    int r = -1;
+    for (int attempt = 0; attempt < 4 && r != 0; attempt++) {
+        if (attempt) usb_delay_ms(20u * (uint32_t)attempt);
+        r = usb_ctrl(hcd, addr, speed, maxp0, bmRequestType, bRequest,
+                     wValue, wIndex, data, wLength);
+    }
+    return r;
+}
 
 static const char *usb_class_name(uint8_t cls) {
     switch (cls) {
@@ -316,7 +335,13 @@ static void usb_enumerate_device(usb_hcd_t *hcd, uint8_t port, uint8_t speed,
 
 
 #define USB_HOTPLUG_MAX_PORTS 16
-typedef struct { bool occupied; uint8_t addr; } hotplug_port_t;
+typedef struct { bool occupied; uint8_t addr; uint8_t fails; uint64_t next_try_ms; } hotplug_port_t;
+
+static uint64_t usb_now_ms(void) {
+    uint32_t lo, hi; __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t per = usb_tsc_per_ms(); if (!per) per = 3000000ULL;
+    return (((uint64_t)hi << 32) | lo) / per;
+}
 static hotplug_port_t g_hotplug[USB_MAX_HCDS][USB_HOTPLUG_MAX_PORTS];
 
  
@@ -574,7 +599,7 @@ static void usb_enumerate_device(usb_hcd_t *hcd, uint8_t port, uint8_t speed,
     usb_delay_ms(10);    
 
     memset(&dd, 0, sizeof(dd));
-    r = usb_ctrl(hcd, next_addr, speed, maxp0,
+    r = usb_ctrl_retry(hcd, next_addr, speed, maxp0,
                  USB_REQ_DIR_D2H | USB_REQ_TYPE_STANDARD | USB_REQ_RECIP_DEVICE,
                  USB_REQ_GET_DESCRIPTOR, (USB_DESC_DEVICE << 8), 0,
                  &dd, sizeof(dd));
@@ -588,7 +613,7 @@ static void usb_enumerate_device(usb_hcd_t *hcd, uint8_t port, uint8_t speed,
 
     usb_config_desc_t cd_hdr;
     memset(&cd_hdr, 0, sizeof(cd_hdr));
-    if (usb_ctrl(hcd, next_addr, speed, maxp0,
+    if (usb_ctrl_retry(hcd, next_addr, speed, maxp0,
                  USB_REQ_DIR_D2H | USB_REQ_TYPE_STANDARD | USB_REQ_RECIP_DEVICE,
                  USB_REQ_GET_DESCRIPTOR, (USB_DESC_CONFIGURATION << 8), 0,
                  &cd_hdr, sizeof(cd_hdr)) != 0) {
@@ -612,7 +637,7 @@ static void usb_enumerate_device(usb_hcd_t *hcd, uint8_t port, uint8_t speed,
     }
     memset(cfg_buf, 0, total);
 
-    if (usb_ctrl(hcd, next_addr, speed, maxp0,
+    if (usb_ctrl_retry(hcd, next_addr, speed, maxp0,
                  USB_REQ_DIR_D2H | USB_REQ_TYPE_STANDARD | USB_REQ_RECIP_DEVICE,
                  USB_REQ_GET_DESCRIPTOR, (USB_DESC_CONFIGURATION << 8), 0,
                  cfg_buf, total) != 0) {
@@ -732,15 +757,24 @@ void usb_hotplug_poll(void) {
             bool connected = false;
             if (!hcd->ops->port_connected(hcd, p, &connected)) continue;    
 
+            if (!connected) { hp->fails = 0; hp->next_try_ms = 0; }
             if (!hp->occupied && connected) {
+                /* Back-off: resetting a port every poll keeps a slow flash drive from ever
+                   finishing link training.  Try again after 1 s, 2 s, 3 s ... (max 8 tries). */
+                uint64_t now = usb_now_ms();
+                if (hp->fails >= 8 || now < hp->next_try_ms) continue;
                 uint8_t speed = USB_SPEED_FULL;
-                if (!hcd->ops->port_reset(hcd, p, &speed)) continue;        
+                if (!hcd->ops->port_reset(hcd, p, &speed)) {
+                    hp->fails++;
+                    hp->next_try_ms = now + 1000ull * hp->fails;
+                    continue;
+                }
                 uint8_t addr;
                 if (!usb_alloc_addr(&addr)) { DBG_MSG("USB", "hotplug: out of USB addresses"); continue; }
                 DBG_VAL("USB", "hotplug: device connected, root port", p);
                 usb_enumerate_device(hcd, p, speed, addr, 0, 0, 0);
                 hp->occupied = true;
-                hp->addr = addr;
+                hp->addr = addr; hp->fails = 0;
             } else if (hp->occupied && !connected) {
                 DBG_VAL("USB", "hotplug: device disconnected, root port", p);
                 usbnet_detach(hcd, hp->addr);       

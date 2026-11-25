@@ -15,6 +15,7 @@ extern void *memcpy(void *dst, const void *src, size_t n);
  
 
 extern void    ui_set_mouse_pos(int32_t x, int32_t y);
+extern void    fdd_rotate_delta(int32_t *dx, int32_t *dy);
 extern void    ui_get_mouse_pos(int32_t *out_x, int32_t *out_y);
 extern uint32_t fb_width(void);
 extern uint32_t fb_height(void);
@@ -392,10 +393,11 @@ static void usb_hid_handle_mouse_report(usb_hid_dev_t *d, const uint8_t report[8
     d->last_buttons = buttons;
 
     if (dx != 0 || dy != 0) {
-        int32_t x, y;
+        int32_t x, y, ddx = dx, ddy = dy;
+        fdd_rotate_delta(&ddx, &ddy);            /* FexoxDriverDisplay: follow screen rotation */
         ui_get_mouse_pos(&x, &y);
-        x += dx;
-        y += dy;
+        x += ddx;
+        y += ddy;
         int32_t maxw = (int32_t)fb_width()  - 1;
         int32_t maxh = (int32_t)fb_height() - 1;
         if (x < 0) x = 0; if (y < 0) y = 0;

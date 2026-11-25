@@ -4,6 +4,7 @@
 #include "USB.h"
 #include "VFS.h"
 #include "debug_out.h"
+#include "UsbDiag.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -55,6 +56,7 @@ typedef struct {
     uint64_t   sector_count;
     uint32_t   sector_size;
 
+    bool       no_flush;     /* SYNCHRONIZE CACHE not supported by this device */
     blkdev_t   blkdev;
 } usb_msc_dev_t;
 
@@ -206,12 +208,27 @@ static int usb_msc_blkdev_write(blkdev_t *dev, uint64_t lba, uint32_t count, con
     return VFS_OK;
 }
 
+/* SYNCHRONIZE CACHE(10): needed so that FHFS can order its commit (data -> uberblock). */
+static int usb_msc_blkdev_flush(blkdev_t *dev) {
+    usb_msc_dev_t *d = (usb_msc_dev_t *)dev->priv;
+    if (dev->readonly || d->no_flush) return VFS_OK;
+    uint8_t cb[10];
+    memset(cb, 0, sizeof(cb));
+    cb[0] = 0x35;
+    int r = msc_command(d, cb, 10, NULL, 0, false);
+    if (r == -20) { msc_request_sense(d); d->no_flush = true; return VFS_OK; }   /* not supported */
+    if (r != 0)   { msc_reset_recovery(d); r = msc_command(d, cb, 10, NULL, 0, false); }
+    if (r != 0)   { d->no_flush = true; DBG_VAL("USBMSC", "SYNCHRONIZE CACHE failed, rc", (uint64_t)(int64_t)r); }
+    return VFS_OK;
+}
+
 static void usb_msc_blkdev_destroy(blkdev_t *dev) { (void)dev; }
 
 static blkdev_ops_t g_usb_msc_ops = {
     .read_sectors  = usb_msc_blkdev_read,
     .write_sectors = usb_msc_blkdev_write,
     .destroy       = usb_msc_blkdev_destroy,
+    .flush         = usb_msc_blkdev_flush,
 };
 
  

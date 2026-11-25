@@ -4,6 +4,7 @@
 
 #include "USB.h"
 #include "debug_out.h"
+#include "UsbDiag.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <stdbool.h>
@@ -17,6 +18,10 @@ typedef uint64_t phys_addr_t;
 extern phys_addr_t pmm_alloc_frames_range(uint64_t count, uint64_t align,
                                            uint64_t min_phys, uint64_t max_phys);
 extern void usb_register_hcd(usb_hcd_t *hcd);
+
+/* completion code of the last failed transfer (0xFFFF = timeout) */
+static uint32_t g_xhci_last_cc;
+uint32_t xhci_get_last_cc(void) { return g_xhci_last_cc; }
 
 #define XHCI_DIRECT_MAP 0xFFFF880000000000ULL
 #define XHCI_DMA_MIN    0x100000ULL
@@ -54,6 +59,9 @@ extern void usb_register_hcd(usb_hcd_t *hcd);
 #define XHCI_CMD_CONFIGURE_ENDPOINT 12u
 #define XHCI_CMD_STOP_ENDPOINT 15u
 #define XHCI_CMD_RESET_ENDPOINT 14u
+#define XHCI_CMD_SET_TR_DEQUEUE 16u
+#define XHCI_CMD_EVALUATE_CONTEXT 13u
+#define XHCI_CONTROL_TIMEOUT_MS 2000u
 #define XHCI_EVENT_TRANSFER 32u
 #define XHCI_EVENT_COMMAND 33u
 #define XHCI_SETUP_STAGE 2u
@@ -367,7 +375,15 @@ static inline uint32_t *xhci_context(xhci_controller_t *ctrl,
 
 static bool xhci_wait_transfer(xhci_controller_t *ctrl, uint8_t slot_id,
                                uint8_t endpoint_id, uint32_t *residual) {
-    for (uint32_t i = 0; i < XHCI_TRANSFER_LIMIT; i++) {
+    /* Timeout by TSC (real ms), not by loop count: PAUSE takes 10..140 cycles
+       depending on the CPU, so a counter gives wildly different timeouts. */
+    uint64_t per_ms = usb_tsc_per_ms();
+    if (!per_ms) per_ms = 3000000ULL;
+    uint32_t lo, hi;
+    __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t deadline = (((uint64_t)hi << 32) | lo) + per_ms * XHCI_CONTROL_TIMEOUT_MS;
+
+    for (;;) {
         xhci_trb_t *event = xhci_next_event(ctrl);
         if (event) {
             uint32_t type = (event->control >> 10) & 0x3Fu;
@@ -384,10 +400,18 @@ static bool xhci_wait_transfer(xhci_controller_t *ctrl, uint8_t slot_id,
                 continue;
             if (residual)
                 *residual = remaining;
-            return code == XHCI_CC_SUCCESS || code == XHCI_CC_SHORT_PACKET;
+            if (code == XHCI_CC_SUCCESS || code == XHCI_CC_SHORT_PACKET)
+                return true;
+            g_xhci_last_cc = code;
+            DBG_VAL("XHCI", "transfer error, completion code", code);
+            return false;
         }
+        __asm__ volatile ("rdtsc" : "=a"(lo), "=d"(hi));
+        if ((((uint64_t)hi << 32) | lo) > deadline)
+            break;
         __asm__ volatile ("pause" ::: "memory");
     }
+    g_xhci_last_cc = 0xFFFFu;
     DBG_VAL("XHCI", "transfer timeout, slot", slot_id);
     return false;
 }
@@ -461,6 +485,7 @@ static bool xhci_address_device(xhci_controller_t *ctrl, uint8_t port,
         return false;
     }
 
+    usb_delay_ms(10);          /* SET_ADDRESS recovery time (USB 2.0: 2 ms) */
     ctrl->address_slot[0] = slot_id;
     *slot_id_out = slot_id;
     return true;
@@ -519,6 +544,76 @@ static bool xhci_ensure_endpoint(xhci_controller_t *ctrl, uint8_t slot_id,
     slot->endpoint_packet[endpoint_id] = max_packet;
     (void)ep_num;
     return true;
+}
+
+/* Throw away whatever events are still in the event ring. */
+static void xhci_drain_events(xhci_controller_t *ctrl) {
+    uint32_t idle = 0, total = 0;
+    while (idle < 100000u && total < XHCI_RING_TRBS) {
+        xhci_trb_t *event = xhci_next_event(ctrl);
+        if (event) {
+            uint32_t type = (event->control >> 10) & 0x3Fu;
+            if (type == XHCI_EVENT_TRANSFER)
+                xhci_stash_int_event(ctrl, (uint8_t)(event->control >> 24),
+                                     (uint8_t)((event->control >> 16) & 0x1Fu),
+                                     (uint8_t)(event->status >> 24),
+                                     event->status & 0xFFFFFFu);
+            xhci_consume_event(ctrl);
+            idle = 0; total++;
+        } else {
+            idle++;
+            __asm__ volatile ("pause" ::: "memory");
+        }
+    }
+}
+
+/* After a stalled / timed-out transfer the endpoint is Halted or still
+   running a dead TD: every following transfer fails.  Stop -> Reset ->
+   move the dequeue pointer to the current enqueue position. */
+static void xhci_ep_recover(xhci_controller_t *ctrl, uint8_t slot_id, uint8_t ep_id) {
+    xhci_slot_t *slot = &ctrl->slots[slot_id];
+    xhci_ring_t *ring = slot->endpoint_rings[ep_id];
+    if (!ring) return;
+    uint32_t ctl = XHCI_TRB_SLOT(slot_id) | XHCI_TRB_EP(ep_id);
+    (void)xhci_command(ctrl, 0, 0, XHCI_TRB_TYPE(XHCI_CMD_STOP_ENDPOINT) | ctl, NULL);
+    (void)xhci_command(ctrl, 0, 0, XHCI_TRB_TYPE(XHCI_CMD_RESET_ENDPOINT) | ctl, NULL);
+    uint64_t deq = ring->phys + (uint64_t)ring->enqueue * sizeof(xhci_trb_t);
+    (void)xhci_command(ctrl, deq | ring->cycle, 0,
+                       XHCI_TRB_TYPE(XHCI_CMD_SET_TR_DEQUEUE) | ctl, NULL);
+    xhci_drain_events(ctrl);
+}
+
+/* The EP0 max packet size was a guess from the port speed (8 for LS/FS).
+   Many FS devices really use 64: with 8 in the context the controller sees
+   Babble on every transfer bigger than 8 bytes.  After the first 8 bytes of
+   the device descriptor we know the real value -> Evaluate Context. */
+static void xhci_fix_ep0_maxp(xhci_controller_t *ctrl, uint8_t slot_id,
+                              xhci_slot_t *slot, uint8_t b_maxp0) {
+    uint16_t maxp;
+    if (slot->speed_id >= 4u) {
+        if (b_maxp0 < 9u || b_maxp0 > 10u) return;
+        maxp = (uint16_t)(1u << b_maxp0);
+    } else {
+        if (b_maxp0 != 8u && b_maxp0 != 16u && b_maxp0 != 32u && b_maxp0 != 64u) return;
+        if (slot->speed_id == 3u && b_maxp0 != 64u) return;
+        maxp = b_maxp0;
+    }
+    if (maxp == slot->endpoint_packet[1]) return;
+
+    uint32_t *out_ep0 = xhci_context(ctrl, slot->output_context, 1);
+    memset(slot->input_context, 0, XHCI_PAGE_SIZE);
+    slot->input_context[1] = (1u << 1);                       /* A1 = EP0 only */
+    uint32_t *in_ep0 = xhci_context(ctrl, slot->input_context, 2);
+    memcpy(in_ep0, out_ep0, ctrl->context_words * sizeof(uint32_t));
+    in_ep0[1] = (in_ep0[1] & 0xFFFFu) | ((uint32_t)maxp << 16);
+
+    if (xhci_command(ctrl, slot->input_context_phys, 0,
+            XHCI_TRB_TYPE(XHCI_CMD_EVALUATE_CONTEXT) | XHCI_TRB_SLOT(slot_id), NULL)) {
+        slot->endpoint_packet[1] = maxp;
+        slot->ep0_packet = maxp;
+    } else {
+        DBG_VAL("XHCI", "Evaluate Context (EP0 maxpacket) failed", maxp);
+    }
 }
 
 static int xhci_control_transfer(usb_hcd_t *hcd, uint8_t dev_addr,
@@ -592,12 +687,16 @@ static int xhci_control_transfer(usb_hcd_t *hcd, uint8_t dev_addr,
 
     uint32_t residual = 0;
     if (!xhci_wait_transfer(ctrl, slot_id, 1, &residual)) {
+        xhci_ep_recover(ctrl, slot_id, 1);
         xhci_irq_restore(flags);
         return -1;
     }
     if (len && (setup->bmRequestType & 0x80u)) {
         uint32_t transferred = residual <= len ? len - residual : 0;
         memcpy(bytes, ctrl->scratch, transferred);
+        /* GET_DESCRIPTOR(DEVICE): byte 7 = bMaxPacketSize0 */
+        if (setup->bRequest == 6 && (setup->wValue >> 8) == 1 && transferred >= 8)
+            xhci_fix_ep0_maxp(ctrl, slot_id, slot, bytes[7]);
     }
     xhci_irq_restore(flags);
     return 0;
@@ -645,6 +744,7 @@ static int xhci_bulk_transfer(usb_hcd_t *hcd, uint8_t dev_addr,
 
     uint32_t residual = 0;
     if (!xhci_wait_transfer(ctrl, slot_id, endpoint_id, &residual)) {
+        xhci_ep_recover(ctrl, slot_id, endpoint_id);
         xhci_irq_restore(flags);
         return -1;
     }
@@ -1124,4 +1224,94 @@ void xhci_pci_scan(void) {
         }
     }
     DBG_VAL("XHCI", "controllers initialized", (uint64_t)g_xhci_count);
+}
+
+/* diagnostics: raw PORTSC of root port `port` of the first xHCI controller (0xFFFFFFFF = n/a) */
+uint32_t xhci_diag_portsc(uint8_t port) {
+    if (g_xhci_count < 1 || port >= g_xhci[0].num_ports) return 0xFFFFFFFFu;
+    return xhci_port_read(&g_xhci[0], port);
+}
+uint8_t xhci_diag_nports(void) { return g_xhci_count ? (uint8_t)g_xhci[0].num_ports : 0; }
+
+/* ------------------------------------------------------------------ */
+/* on-screen diagnostics: decoded controller state + every root port    */
+/* ------------------------------------------------------------------ */
+static char *dg_s(char *d, const char *s) { while (*s) *d++ = *s++; return d; }
+static char *dg_h(char *d, uint64_t v, int digits) {
+    for (int i = digits - 1; i >= 0; i--) *d++ = "0123456789ABCDEF"[(v >> (i * 4)) & 15];
+    return d;
+}
+static char *dg_u(char *d, uint32_t v) {
+    char t[11]; int n = 0; if (!v) t[n++] = '0'; while (v) { t[n++] = (char)('0' + v % 10); v /= 10; }
+    while (n) *d++ = t[--n];
+    return d;
+}
+
+void xhci_diag_dump(void (*out)(const char *)) {
+    if (g_xhci_count < 1) { out("  no xHCI controller\n"); return; }
+    xhci_controller_t *c = &g_xhci[0];
+    char b[100], *d;
+
+    uint32_t ver = xhci_mmio_read32(c, 0x00) >> 16;
+    uint32_t hcs1 = xhci_mmio_read32(c, 0x04), hcs2 = xhci_mmio_read32(c, 0x08);
+    uint32_t hcc1 = xhci_mmio_read32(c, 0x10);
+    uint32_t cmd = xhci_op_read32(c, 0), sts = xhci_op_read32(c, 4);
+
+    d = dg_s(b, "xHCI v"); d = dg_h(d, ver, 4);
+    d = dg_s(d, " ports="); d = dg_u(d, (hcs1 >> 24) & 0xFF);
+    d = dg_s(d, " slots="); d = dg_u(d, hcs1 & 0xFF);
+    d = dg_s(d, " ctx64="); d = dg_u(d, (hcc1 >> 2) & 1);
+    d = dg_s(d, " scratch="); d = dg_u(d, ((hcs2 >> 21) & 0x1F) << 5 | ((hcs2 >> 27) & 0x1F));
+    d = dg_s(d, "\n"); *d = 0; out(b);
+
+    d = dg_s(b, "USBCMD="); d = dg_h(d, cmd, 8);
+    d = dg_s(d, (cmd & 1) ? " RUN" : " STOP");
+    d = dg_s(d, "  USBSTS="); d = dg_h(d, sts, 8);
+    if (sts & (1u << 0))  d = dg_s(d, " HCH(halted)");
+    if (sts & (1u << 2))  d = dg_s(d, " HSE(HOST-ERROR)");
+    if (sts & (1u << 3))  d = dg_s(d, " EINT");
+    if (sts & (1u << 4))  d = dg_s(d, " PCD");
+    if (sts & (1u << 11)) d = dg_s(d, " CNR(not-ready)");
+    if (sts & (1u << 12)) d = dg_s(d, " HCE(FATAL)");
+    d = dg_s(d, "\n"); *d = 0; out(b);
+
+    /* which root ports are USB2 and which are USB3 (Supported Protocol capabilities) */
+    uint8_t ptype[64]; for (int i = 0; i < 64; i++) ptype[i] = 0;
+    uint32_t cap = ((hcc1 >> 16) & 0xFFFFu) * 4u;
+    for (int guard = 0; cap && guard < 32; guard++) {
+        uint32_t v = xhci_mmio_read32(c, cap);
+        if ((v & 0xFF) == 2) {
+            uint32_t major = v >> 24, dw2 = xhci_mmio_read32(c, cap + 8);
+            uint32_t first = dw2 & 0xFF, cnt = (dw2 >> 8) & 0xFF;
+            for (uint32_t k = 0; k < cnt; k++) if (first + k >= 1 && first + k <= 64) ptype[first + k - 1] = (uint8_t)major;
+        }
+        uint32_t nx = (v >> 8) & 0xFF;
+        if (!nx) break;
+        cap += nx * 4u;
+    }
+
+    static const char *const pls[16] = { "U0", "U1", "U2", "U3(susp)", "Disabled", "RxDetect", "Inactive", "Polling",
+                                         "Recovery", "HotReset", "Compliance", "Test", "?12", "?13", "?14", "Resume" };
+    static const char *const spd[8]  = { "-", "FS", "LS", "HS", "SS", "SS+", "?6", "?7" };
+    out("port type PORTSC   flags\n");
+    for (uint32_t p = 0; p < c->num_ports && p < 24; p++) {
+        uint32_t ps = xhci_port_read(c, (uint8_t)p);
+        d = dg_s(b, p < 9 ? " P" : "P"); d = dg_u(d, p + 1);
+        d = dg_s(d, ptype[p] == 3 ? "  USB3 " : ptype[p] == 2 ? "  USB2 " : "  ???? ");
+        d = dg_h(d, ps, 8); d = dg_s(d, " ");
+        d = dg_s(d, (ps & (1u << 0)) ? "CCS " : "-no-device- ");
+        if (ps & (1u << 1))  d = dg_s(d, "PED ");
+        if (ps & (1u << 3))  d = dg_s(d, "OVERCURRENT ");
+        if (ps & (1u << 4))  d = dg_s(d, "PR ");
+        if (!(ps & (1u << 9))) d = dg_s(d, "NO-POWER ");
+        d = dg_s(d, pls[(ps >> 5) & 15]); d = dg_s(d, " ");
+        if (ps & (1u << 0)) d = dg_s(d, spd[(ps >> 10) & 7]);
+        if (ps & (1u << 17)) d = dg_s(d, " +CSC");
+        if (ps & (1u << 19)) d = dg_s(d, " +WRC");
+        if (ps & (1u << 20)) d = dg_s(d, " +OCC");
+        if (ps & (1u << 21)) d = dg_s(d, " +PRC");
+        if (ps & (1u << 22)) d = dg_s(d, " +PLC");
+        if (ps & (1u << 23)) d = dg_s(d, " +CEC");
+        d = dg_s(d, "\n"); *d = 0; out(b);
+    }
 }

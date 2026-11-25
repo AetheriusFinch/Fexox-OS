@@ -15,6 +15,7 @@
 #define FX_SYS_WIN_GET_RECT    603
 #define FX_SYS_INPUT_POLL      604
 #define FX_SYS_KBD_READ_CHAR   605
+#define FX_SYS_DISPLAY_GET     530
 
 typedef struct {
     uint64_t phys_addr, virt_addr;
@@ -24,6 +25,8 @@ typedef struct {
 
 typedef struct { int32_t x, y; uint32_t w, h, redraw_gen; } fx_rect_t;
 typedef struct { int32_t x, y; uint8_t buttons; }          fx_input_t;
+typedef struct { uint32_t version, generation, width, height, phys_w, phys_h, max_w, max_h, pitch,
+                 rotation, filter, fit, flags, reserved[4]; } fx_display_t;
 
                                                                                 
 #define WIN_W      240
@@ -290,11 +293,18 @@ int main(void) {
     bool prev_lmb = false;
     int32_t last_x = g_rect.x, last_y = g_rect.y;
     uint32_t last_gen = g_rect.redraw_gen;
+    fx_display_t di; uint32_t last_disp_gen = 0;
+    if (syscall(FX_SYS_DISPLAY_GET, &di) == 0) last_disp_gen = di.generation;
     draw_all(hover, pressed);
 
     for (;;) {
         if (syscall(FX_SYS_WIN_GET_RECT, win, &g_rect) < 0) break;                           
         bool dirty = false;
+        if (syscall(FX_SYS_DISPLAY_GET, &di) == 0 && di.generation != last_disp_gen) {   /* resolution / rotation changed */
+            last_disp_gen = di.generation;
+            g_fb.width = di.width; g_fb.height = di.height;
+            dirty = true;
+        }
         if (g_rect.x != last_x || g_rect.y != last_y || g_rect.redraw_gen != last_gen) {
             last_x = g_rect.x; last_y = g_rect.y; last_gen = g_rect.redraw_gen;
             dirty = true;                                                                             
