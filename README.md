@@ -13,3 +13,4 @@ Fexox OS исходный код / Source Code
 -Системных вызовов: 175 (Стараются придерживаться стандартам POSIX) 
 
 About Developer: известен под ником/псевдонимом Aetherius Finch, Tobias Forester!ПРОШЛЫЙ АККАУНТ BREAKFASTKITCHEN6249 был забанен за "неполадки в аккаунте" НОВЫЙ: u/Content_Grass4077!!!. !ИСПОЛЬЗУЕТСЯ БИБЛИОТЕКА LIBC MUSL ПОД РАЗРЕШИТЕЛЬНОЙ ЛИЦЕНЗИЕЙ MIT, АВТОР БИБЛИОТЕКИ: Rich Felker!
+<img width="1201" height="794" alt="fexox_alpha_4" src="https://github.com/user-attachments/assets/e95cac91-c870-4159-a8ce-da9c0e7c3249" />
